@@ -3,6 +3,7 @@
 ## Author: Daseeki
 ## Category: Bags & Inventory
 ## X-License: MIT
+## X-Curse-Project-ID: 1592410
 ## SavedVariables: DaseekiBagsAccount, DaseekiBagsSets
 ## OptionalDeps: Daseeki-Core
 ## Interface: 11507, 11508
