@@ -1,0 +1,8 @@
+<Bindings>
+	<Binding name="DASEEKIBAGS_TOGGLE">
+		_G['Daseeki-Bags'].Frames:Toggle('inventory')
+	</Binding>
+	<Binding name="DASEEKIBAGS_BANK_TOGGLE">
+		_G['Daseeki-Bags'].Frames:Toggle('bank')
+	</Binding>
+</Bindings>

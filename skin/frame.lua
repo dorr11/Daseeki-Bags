@@ -1,0 +1,292 @@
+--[[
+	The Daseeki-Bags frame design.
+	All Rights Reserved
+--]]
+
+local ADDON, Addon = ...
+local Frame = Addon.Frame
+Frame.Font, Frame.FontH = GameFontNormalLeft, GameFontHighlightLeft
+Frame.MoneySpacing = 2
+
+
+--[[ Construct ]]--
+
+function Frame:New(params)
+	local f = self:Super(Frame):New(UIParent)
+	tinsert(UISpecialFrames, f:GetName())
+	MergeTable(f, params)
+
+	f.rules, f.wait = {}, 0
+	f.profile = f:GetBaseProfile()
+	f.MenuButtons = {}
+	f.SearchBar = Addon.SearchBar(f)
+	f.Title = Addon.Title(f, f.Title)
+	f.CloseButton:SetScript('OnClick', function() Addon.Frames:Hide(f.id) end)
+
+	return f
+end
+
+function Frame:RegisterEvents()
+	self:RegisterFrameSignal('BAG_FRAME_TOGGLED', 'Layout')
+end
+
+
+--[[ Update ]]--
+
+function Frame:Layout()
+	self.wait = self.wait + 1
+	if self.wait == 1 then -- making sure an infinite loop can never happen, just in case
+		self.margin = self.skin.margin or 0
+		self.inset = self.skin.inset or 0
+
+		local _, side = self:PlaceSidebar()
+		local width = 44 + self:PlaceMenuButtons()
+						+ self:PlaceOptionsToggle() + self:PlaceFindButton() + self:PlaceTitle()
+				
+		local function grow(height, stack, w,h)
+			width = max(width, w)
+			return stack and (height + h) or max(height, h)
+		end			
+		
+		local main = 0
+		main = grow(main, true, self:PlaceBagGroup())
+		main = grow(main, true, self:PlaceItemGroup())
+
+		local foot = 0
+		foot = grow(foot, true, self:PlaceMoney())
+		foot = grow(foot, true, self:PlaceCurrencies(width))
+		foot = grow(foot, false, self:PlaceBroker())
+			
+		self:PlaceSearchBar()
+		self:PlaceFooter(foot)
+		self:SetSize(max(156, width) + 16, max(main+foot, side) + 30)
+
+		if self.wait == 1 then
+			self.wait = 0
+			self.skin('layout')
+		else
+			self.wait = 0
+			self:Layout()
+		end
+	end
+end
+
+
+--[[ Top Menu ]]--
+
+function Frame:PlaceMenuButtons()
+	for i, button in pairs(self.MenuButtons) do
+		button:Hide()
+	end
+
+	local buttons = { self:HasOfflineSelector() and self:GetWidget('OfflineSelector') }
+	tAppendAll(buttons, self:GetExtraButtons())
+	tinsert(buttons, self:HasSortButton() and self:GetWidget('SortButton'))
+	tinsert(buttons, self:HasSearchToggle() and self:GetWidget('SearchToggle'))
+	self.MenuButtons = tFilter(buttons, function(v) return v end, true)
+
+	for i, button in ipairs(self.MenuButtons) do
+		button:SetPoint('TOPLEFT', self, 'TOPLEFT', i*24-16, -8)
+		button:Show()
+	end
+
+	return 24 * #self.MenuButtons, 20
+end
+
+function Frame:PlaceSearchBar()
+	self.SearchBar:ClearAllPoints()
+	local anchor = self:HasOptionsToggle() and self.OptionsToggle or self.CloseButton
+	local xOffset = self:HasFindButton() and -30 or -2
+	self.SearchBar:SetPoint('RIGHT', anchor, 'LEFT', xOffset, 0)
+	self.SearchBar:SetHeight(28)
+
+	if #self.MenuButtons > 0 then
+		self.SearchBar:SetPoint('LEFT', self.MenuButtons[#self.MenuButtons], 'RIGHT', 2, 0)
+	else
+		self.SearchBar:SetPoint('TOPLEFT', self, 'TOPLEFT', 8, -8)
+	end
+end
+
+function Frame:PlaceFindButton()
+	return self:PlaceWidget('FindButton', self:HasFindButton() and function(btn)
+		local anchor = self:HasOptionsToggle() and self.OptionsToggle or self.CloseButton
+		btn:SetPoint('TOPRIGHT', anchor, 'TOPLEFT', -2, 0)
+	end)
+end
+
+function Frame:PlaceOptionsToggle()
+	return self:PlaceWidget('OptionsToggle', self:HasOptionsToggle() and function(toggle)
+		toggle:SetPoint('TOPRIGHT', self, 'TOPRIGHT', -32, -8)
+	end)
+end
+
+function Frame:PlaceTitle()
+	local title = self.Title
+	local w = 0
+
+	title:ClearAllPoints()
+	local titleAnchor = self:HasOptionsToggle() and self.OptionsToggle or self.CloseButton
+	local titleXOffset = self:HasFindButton() and -26 or -4
+	title:SetPoint('RIGHT', titleAnchor, 'LEFT', titleXOffset, 0)
+	title:SetHeight(20)
+
+	if #self.MenuButtons > 0 then
+		title:SetPoint('LEFT', self.MenuButtons[#self.MenuButtons], 'RIGHT', 4, 0)
+		w = title:GetTextWidth() / 2 + 4
+	else
+		title:SetPoint('TOPLEFT', self, 'TOPLEFT', 8, -8)
+		w = title:GetTextWidth() + 8
+	end
+
+	return w, 20
+end
+
+function Frame:HasOptionsToggle()
+	return self.profile.options
+end
+
+function Frame:HasOfflineSelector()
+	return not self:GetOwner().isguild
+end
+
+function Frame:HasSearchToggle()
+	return self.profile.search
+end
+
+function Frame:HasSortButton()
+	return self.profile.sort
+end
+
+function Frame:HasFindButton()
+	return not self:GetOwner().isguild
+end
+
+
+--[[ Main Grid ]]--
+
+function Frame:PlaceItemGroup()
+	local group = self:GetWidget('ItemGroup', self.Bags)
+	local anchor = self:AreBagsShown() and self.BagGroup
+				or #self.MenuButtons > 0 and self.MenuButtons[1]
+				or self.Title
+	local inset = anchor ~= self.BagGroup and self.inset or 0
+
+	group:SetScript('OnSizeChanged', function() self:Layout() end)
+	group:SetPoint('TOPLEFT', anchor, 'BOTTOMLEFT', inset, -4-inset)
+	return group:GetWidth() - 2 + (self.inset or 0) * 2, group:GetHeight() + 6
+end
+
+function Frame:PlaceBagGroup()
+	return self:PlaceWidget('BagGroup', self:AreBagsShown() and function(bags)
+		local scale = self.profile.bagScale or 1
+		bags:SetScale(scale)
+
+		if #self.MenuButtons > 0 then
+			bags:SetPoint('TOPLEFT', self.MenuButtons[1], 'BOTTOMLEFT', self.inset, -4-self.inset)
+		else
+			bags:SetPoint('TOPLEFT', self.Title, 'BOTTOMLEFT', self.inset, -4-self.inset)
+		end
+
+		return bags:GetWidth() * scale + self.inset*2, bags:GetHeight() * scale + 4
+	end)
+end
+
+
+--[[ Sidebar ]]--
+
+function Frame:PlaceSidebar()
+	return self:PlaceWidget('TabGroup', 'sidebar', self:HasSidebar() and function(filters)
+		filters:SetScript('OnSizeChanged', function() self:Layout() end)
+
+		if self.id == 'inventory' then
+			filters:SetPoint('TOPRIGHT', self, 'TOPLEFT', 4-self.margin,-33)
+		else
+			filters:SetPoint('TOPLEFT', self, 'TOPRIGHT', self.margin,-33)
+		end
+	end)
+end
+
+function Frame:HasSidebar()
+	return self.profile.sidebar
+end
+
+
+--[[ Bottom Displays ]]--
+
+function Frame:PlaceFooter(size)
+	self.Footer:SetPoint('BOTTOMLEFT', self.inset, 4-self.inset)
+	self.Footer:SetPoint('BOTTOMRIGHT', -self.inset, 4-self.inset)
+	self.Footer:SetHeight(size)
+end
+
+function Frame:PlaceMoney()
+	return self:PlaceWidget('MoneyFrame', self:HasMoney() and function(money)
+		money:SetPoint('TOPRIGHT', self.Footer, self.MoneySpacing, 0)
+	end)
+end
+
+function Frame:PlaceCurrencies(width)
+	return self:PlaceWidget('CurrencyTracker', 'NumberFontNormal', self:HasCurrencies() and function(tracker)
+		local wide = self:HasMoney() and tracker:GetWidth() > (width - self.MoneyFrame:GetWidth() - (self:HasBroker() and 48 or 2))
+		if wide then
+			tracker:SetPoint('BOTTOMRIGHT', self.Footer, -4,2)
+		else
+			tracker:SetPoint('TOPLEFT', self.Footer, 6,0)
+		end
+
+		tracker:SetScript('OnSizeChanged', function() self:Layout() end)
+		return not wide and self:HasMoney() and 0
+	end)
+end
+
+function Frame:PlaceBroker()
+	return self:PlaceWidget('SlotCount', self:HasBroker() and function(slots)
+		local right = self:HasMoney() and
+		              {'RIGHT', self.MoneyFrame, 'LEFT', -8, 0} or
+		              {'RIGHT', self.Footer, 'RIGHT', -4, 0}
+		local left = self:HasCurrencies() and self.CurrencyTracker:GetPoint(1) == 'TOPLEFT' and
+		              {'TOPLEFT', self.CurrencyTracker, 'TOPRIGHT', -2, 1} or
+		              {'TOPLEFT', self.Footer, 'TOPLEFT', 4, 0}
+
+		slots:SetPoint(unpack(right))
+		slots:SetPoint(unpack(left))
+
+		return 48, 24
+	end)
+end
+
+function Frame:HasMoney()
+	return self.profile.money
+end
+
+function Frame:HasCurrencies()
+	return self.profile.currency
+end
+
+function Frame:HasBroker()
+	return self.profile.broker
+end
+
+
+--[[ Utilities ]]--
+
+function Frame:PlaceWidget(key, ...)
+    local widget = rawget(self, key)
+	local setup = select(-1, ...)
+    if setup then
+        widget = widget or self:GetWidget(key, ...)
+        widget:ClearAllPoints()
+        widget:Show()
+
+        local width, height = setup(widget)
+        if not width then
+            width, height = widget:GetSize()
+        end
+
+        return width, height or width
+    elseif widget then
+        widget:Hide()
+    end
+    
+    return 0, 0
+end

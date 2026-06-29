@@ -1,0 +1,19 @@
+<Ui xmlns="http://www.blizzard.com/wow/ui/">
+	<Include file="core\core.xml"/>
+	<Include file="config\config.xml"/>
+	<Include file="frames\inventory\inventory.xml"/>
+	<Include file="frames\bank\bank.xml"/>
+
+	<Include file="skin\templates.xml"/>
+	<Script file="skin\title.lua"/>
+	<Script file="skin\optionsButton.lua"/>
+	<Script file="skin\searchToggle.lua"/>
+	<Script file="skin\searchBar.lua"/>
+	<Script file="skin\findButton.lua"/>
+	<Script file="skin\searchResults.lua"/>
+	<Script file="skin\others.lua"/>
+	<Script file="skin\frame.lua"/>
+	<Script file="skin\skins.lua"/>
+	<Script file="skin\defaults.lua"/>
+	<Script file="skin\config.lua"/>
+</Ui>

@@ -1,0 +1,8 @@
+## Title: MutexDelay
+## Notes: Delay and lock method calls in Lua.
+## Interface: 120005, 50503, 40402, 30404, 20505, 11508
+## Author: Jaliborc (João Cardoso)
+## Category: Libraries
+## Dependencies: LibStub
+
+MutexDelay-1.0.lua

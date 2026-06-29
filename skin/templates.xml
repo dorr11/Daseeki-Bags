@@ -1,0 +1,149 @@
+<Ui>
+	<!-- Components -->
+	<Frame name="DaseekiBagsFrameTemplate" virtual="true" movable="true" toplevel="true" enableMouse="true" clampedToScreen="true">
+		<Frames>
+			<Button parentKey="CloseButton" inherits="UIPanelCloseButtonNoScripts"/>
+			<Frame parentKey="Footer"/>
+		</Frames>
+	</Frame>
+
+	<Button name="DaseekiBagsButtonTemplate" registerForClicks="anyUp" virtual="true">
+		<Size x="20" y="20"/>
+		<Layers>
+			<Layer level="BACKGROUND" textureSubLevel="0">
+				<Texture parentKey="Bg">
+					<Color r="0" g="0" b="0"/>
+					<Anchors>
+						<Anchor point="BOTTOMRIGHT" x="-1" y="1"/>
+						<Anchor point="TOPLEFT" x="1" y="-1"/>
+					</Anchors>
+				</Texture>
+			</Layer>
+			<Layer level="BACKGROUND" textureSubLevel="1">
+				<Texture parentKey="Icon"/>
+			</Layer>
+		</Layers>
+		<NormalTexture parentKey="Border" file="Interface\Buttons\UI-Quickslot2">
+			<Size x="34" y="34"/>
+			<Anchors>
+				<Anchor point="CENTER"/>
+			</Anchors>
+		</NormalTexture>
+		<HighlightTexture file="Interface\Buttons\ButtonHilight-Square" alphaMode="ADD"/>
+		<PushedTexture file="Interface\Buttons\UI-Quickslot-Depress"/>
+	</Button>
+	<CheckButton name="DaseekiBagsCheckButtonTemplate" inherits="DaseekiBagsButtonTemplate" virtual="true">
+		<CheckedTexture file="Interface\Buttons\CheckButtonHilight" alphaMode="ADD"/>
+	</CheckButton>
+
+	<CheckButton name="DaseekiBagsTabTemplate" inherits="DaseekiBagsCheckButtonTemplate" virtual="true">
+		<Size x="37" y="37"/>
+		<NormalTexture file="Interface\Buttons\UI-Quickslot2">
+			<Size x="63" y="63"/>
+			<Anchors>
+				<Anchor point="CENTER" x="0" y="-1"/>
+			</Anchors>
+		</NormalTexture>
+	</CheckButton>
+
+	<Button name="DaseekiBagsOfflineSelectorTemplate" inherits="DaseekiBagsButtonTemplate" virtual="true"/>
+	<Button name="DaseekiBagsDepositButtonTemplate" inherits="DaseekiBagsButtonTemplate" virtual="true">
+		<Scripts>
+			<OnLoad>
+				self.Icon:SetTexture(1455684)
+				self.Icon:SetTexCoord(0, 1, 1, 0)
+			</OnLoad>
+		</Scripts>
+	</Button>
+
+	<CheckButton name="DaseekiBagsBagToggleTemplate" inherits="DaseekiBagsCheckButtonTemplate" virtual="true">
+		<Scripts>
+			<OnLoad>
+				self.Icon:SetTexture(130716)
+			</OnLoad>
+		</Scripts>
+	</CheckButton>
+	<CheckButton name="DaseekiBagsLogToggleTemplate" inherits="DaseekiBagsCheckButtonTemplate" virtual="true"/>
+	<CheckButton name="DaseekiBagsSortButtonTemplate" inherits="DaseekiBagsCheckButtonTemplate" virtual="true">
+		<Scripts>
+			<OnLoad>
+				self.Icon:SetTexture('Interface/Addons/Daseeki-Bags/Art/Broom')
+			</OnLoad>
+		</Scripts>
+	</CheckButton>
+
+	<!-- Skins -->
+	<Frame name="DaseekiBagsDialogSkinTemplate" inherits="DialogBorderNoCenterTemplate" virtual="true">
+		<Layers>
+			<Layer level="BACKGROUND" textureSubLevel="-5">
+				<Texture parentKey="Center">
+					<Anchors>
+						<Anchor point="TOPRIGHT" x="-7" y="-7"/>
+						<Anchor point="BOTTOMLEFT" x="7" y="7"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+				</Texture>
+			</Layer>
+		</Layers>
+	</Frame>
+	<Frame name="DaseekiBagsInsetSkinTemplate" inherits="InsetFrameTemplate2" virtual="true">
+		<Layers>
+			<Layer level="BACKGROUND" textureSubLevel="-5">
+				<Texture parentKey="Center">
+					<Anchors>
+						<Anchor point="TOPRIGHT" x="-1" y="-1"/>
+						<Anchor point="BOTTOMLEFT" x="1" y="1"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+				</Texture>
+			</Layer>
+		</Layers>
+	</Frame>
+	<Frame name="DaseekiBagsOnePixelTemplate" virtual="true">
+		<Layers>
+			<Layer level="BACKGROUND">
+				<Texture parentKey="Center">
+					<Anchors>
+						<Anchor point="TOPRIGHT" x="-1" y="-1"/>
+						<Anchor point="BOTTOMLEFT" x="1" y="1"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+				</Texture>		
+			</Layer>
+			<Layer level="BORDER">
+				<Texture parentKey="TopEdge">
+					<Anchors>
+						<Anchor point="TOPLEFT"/>
+						<Anchor point="TOPRIGHT"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+					<Size x="1" y="1"/>
+				</Texture>
+				<Texture parentKey="LeftEdge">
+					<Anchors>
+						<Anchor point="TOPLEFT"/>
+						<Anchor point="BOTTOMLEFT"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+					<Size x="1" y="1"/>
+				</Texture>
+				<Texture parentKey="RightEdge">
+					<Anchors>
+						<Anchor point="TOPRIGHT"/>
+						<Anchor point="BOTTOMRIGHT"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+					<Size x="1" y="1"/>
+				</Texture>
+				<Texture parentKey="BottomEdge">
+					<Anchors>
+						<Anchor point="BOTTOMLEFT"/>
+						<Anchor point="BOTTOMRIGHT"/>
+					</Anchors>
+					<Color r="1" g="1" b="1" a="1"/>
+					<Size x="1" y="1"/>
+				</Texture>
+			</Layer>
+		</Layers>
+	</Frame>
+</Ui>

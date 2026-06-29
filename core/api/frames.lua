@@ -1,0 +1,104 @@
+--[[
+	Manages frame creation and display.
+	All Rights Reserved
+--]]
+
+local ADDON, Addon = ...
+local Frames = Addon:NewModule('Frames')
+Frames.Registry = {
+	{id = 'inventory', name = INVENTORY_TOOLTIP, icon = 130716},
+	{id = 'bank', name = BANK, icon = 'Interface/Addons/Daseeki-Bags/art/achievement-guildperk-mobilebanking'},
+{id = 'vault', name = VOID_STORAGE, icon = 1711338, addon = VoidStorage_LoadUI and ADDON..'_VoidStorage' or false},
+}
+
+
+--[[ Frame Control ]]--
+
+function Frames:Update()
+	self:SendSignal('UPDATE_ALL')
+end
+
+function Frames:Toggle(id, owner)
+	return not self:IsShown(id) and self:Show(id, owner) or self:Hide(id)
+end
+
+function Frames:Show(id, owner)
+	local frame = self:New(id)
+	if frame then
+		frame:SetOwner(owner)
+		frame:Show()
+	end
+	return frame
+end
+
+function Frames:Hide(id)
+	local frame = self:Get(id)
+	if frame[0] then
+		frame:Hide()
+	end
+	return frame
+end
+
+function Frames:IsShown(id)
+	local frame = self:Get(id)
+	return frame[0] and frame:IsShown()
+end
+
+
+--[[ Bag Control ]]--
+
+function Frames:ToggleBag(frame, bag)
+	if self:HasBag(frame, bag) then
+		return self:Toggle(frame)
+	end
+end
+
+function Frames:ShowBag(frame, bag)
+	if self:HasBag(frame, bag) then
+		return self:Show(frame)
+	end
+end
+
+function Frames:HideBag(frame, bag)
+	if self:HasBag(frame, bag) then
+		return self:Hide(frame)
+	end
+end
+
+function Frames:HasBag(frame, bag)
+	return not (Addon.sets.displayBlizzard and Addon.player[bag].hidden) and self:IsEnabled(frame)
+end
+
+
+--[[ Registry ]]--
+
+function Frames:New(id)
+	if self:IsEnabled(id) then
+		local frame, i = self:Get(id)
+		if not frame[0] and (not frame.addon or AddOnUtil.LoadAddOn(frame.addon)) then
+			frame = Addon[id:gsub('^.', id.upper)]:New(frame)
+	 		self.Registry[i] = frame
+			return frame
+		end
+
+		return frame
+ 	end
+end
+
+function Frames:Get(id)
+	local i, frame = FindInTableIf(self.Registry, function(frame) return frame.id == id end)
+	return frame, i
+end
+
+function Frames:Iterate()
+	return ipairs(self.Registry)
+end
+
+function Frames:IsEnabled(id)
+	local addon = self:Get(id).addon
+	if addon then
+		return AddOnUtil.IsAddOnEnabledForCurrentCharacter(addon)
+	else
+		return addon ~= false and Addon.player.profile[id].enabled
+	end
+end
