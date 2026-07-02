@@ -354,7 +354,7 @@ local function EnsureJoinLeaveListener()
 end
 
 
--- Expose roster for /bgn mesh status display
+-- Expose roster for /dbg mesh status display
 function MeshSync._GetRoster() return _channelRoster end
 
 

@@ -7,6 +7,6 @@
 ## SavedVariables: DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
 ## OptionalDeps: Daseeki-Core
 ## Interface: 11507, 11508
-## Version: 1.1.0
+## Version: 1.1.1
 
 main.xml

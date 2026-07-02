@@ -25,7 +25,7 @@ end
 function Slash:OnLoad()
 	SlashCmdList[ADDON] = self.OnSlashCommand
 	_G['SLASH_'..ADDON..'1'] = '/' .. ADDON
-	_G['SLASH_'..ADDON..'2'] = '/bgn'
+	_G['SLASH_'..ADDON..'2'] = '/dbg'
 end
 
 function Slash.OnSlashCommand(cmd)
@@ -71,7 +71,7 @@ function Slash:MeshTestSend()
 	print(tag .. ' Mesh: forcing gold push now...')
 	if Addon.MeshSync then
 		Addon.MeshSync:PushAll()
-		print(tag .. ' Mesh: full account snapshot sent (if channel was joined). Watch for "Remote owners" appearing on the other account via /bgn mesh.')
+		print(tag .. ' Mesh: full account snapshot sent (if channel was joined). Watch for "Remote owners" appearing on the other account via /dbg mesh.')
 	else
 		print(tag .. ' Mesh: MeshSync module not found.')
 	end
@@ -121,7 +121,7 @@ function Slash:PrintMeshStatus()
 		end
 	end
 	if remotes == 0 then print('  Remote owners: none received yet') end
-	print('  (use /bgn mesh send to push gold, /bgn mesh clear to wipe remote data)')
+	print('  (use /dbg mesh send to push gold, /dbg mesh clear to wipe remote data)')
 end
 
 function Slash:MeshClear()

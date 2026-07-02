@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.1
+- Renamed the short chat command from `/bgn` to `/dbg` to avoid colliding with Bagnon. The full `/Daseeki-Bags` command is unchanged.
+
 ## 1.1.0
 - Added **Cross-Account Sync**: share data live between your own accounts while both are logged in, no guild/party/raid required.
   - Gold, per-character item counts, and tracked currencies now appear in their tooltips for characters on your other accounts, grouped under an "Other Accounts" section beneath your current account's characters.
