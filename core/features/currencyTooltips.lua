@@ -62,7 +62,9 @@ function TipCounts.OnID(tip, id)
 		
 		local info = C.GetCurrencyInfo(id)
 		local denominator = info.maxQuantity > 0 and SILVER:format('/' .. FormatLargeNumber(info.maxQuantity)) or ''
-		local left, right = {}, {}
+		-- This-account and other-account (mesh) characters shown in separate groups.
+		local mineL, mineR = {}, {}
+		local otherL, otherR = {}, {}
 		local total = 0
 
 		for i, owner in Addon.Owners:Iterate() do
@@ -78,8 +80,10 @@ function TipCounts.OnID(tip, id)
 					local color = owner:GetColorMarkup()
 					total = total + count
 
-					tinsert(left, owner:GetIconMarkup(12,0,0) ..' '.. color:format(owner.name))
-					tinsert(right, color:format(FormatLargeNumber(count)) .. denominator)
+					local L_ = owner.meshRemote and otherL or mineL
+					local R_ = owner.meshRemote and otherR or mineR
+					tinsert(L_, owner:GetIconMarkup(12,0,0) ..' '.. color:format(owner.name))
+					tinsert(R_, color:format(FormatLargeNumber(count)) .. denominator)
 				end
 			end
 		end
@@ -88,8 +92,17 @@ function TipCounts.OnID(tip, id)
 			tip:AddLine(format('|n%s: |cffffffff%s|r', TOTAL, FormatLargeNumber(total)))
 		end
 
-		for i, who in ipairs(left) do
-			tip:AddDoubleLine(who, right[i])
+		for i, who in ipairs(mineL) do
+			tip:AddDoubleLine(who, mineR[i])
+		end
+
+		if #otherL > 0 then
+			local Loc = LibStub('AceLocale-3.0'):GetLocale(ADDON)
+			tip:AddLine(' ')
+			tip:AddLine('|A:questlog-questtypeicon-account:0:0|a '.. LIGHTGRAY_FONT_COLOR:WrapTextInColorCode(Loc.OtherAccounts))
+			for i, who in ipairs(otherL) do
+				tip:AddDoubleLine(who, otherR[i])
+			end
 		end
 
 		if info.maxWeeklyQuantity > 0 then

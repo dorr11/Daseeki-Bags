@@ -29,6 +29,11 @@ local function aggregate(counts, bag)
 	end
 end
 
+-- Exposed for meshInventory (Phase 2 cross-account sync) so it aggregates item
+-- counts with the exact same parsing as the tooltips, staying consistent with
+-- Cacher:ParseItem's stored format.
+Addon.AggregateBag = aggregate
+
 local function find(bag, item)
 	local count = 0
 	
@@ -114,7 +119,10 @@ function TipCounts:AddOwners(tip, link)
 		local id = tonumber(link and C.GetItemInfoInstant(link) and link:match(':(%d+)')) -- workaround Blizzard craziness
 		if id and id ~= HEARTHSTONE_ITEM_ID then
 			local carrying = C.GetItemCount(id)
-			local left, right = {}, {}
+			-- This-account characters and other-account (mesh) characters are shown
+			-- in separate groups, mirroring the money tooltip.
+			local mineL, mineR = {}, {}
+			local otherL, otherR = {}, {}
 			local total = 0
 
 			for i, owner in Addon.Owners:Iterate() do
@@ -122,29 +130,37 @@ function TipCounts:AddOwners(tip, link)
 					local color = owner:GetColorMarkup()
 					local count, locations = 0
 
-					if owner.offline and not owner.counts then
-						self:CountItems(owner)
-					end
-
-					local equip, mail, bags, bank, vault
-
-					if not owner.offline then
-						mail = find(owner.mail, id)
-						equip = find(owner.equip, id)
-						vault = find(owner.vault, id)
-						bank = C.GetItemCount(id, true, nil, true) - carrying
-						bags = carrying - equip
+					if owner.meshRemote then
+						-- Remotes carry only an aggregated per-item count (no slot data).
+						local n = owner.itemCounts and owner.itemCounts[id]
+						if n and n > 0 then count, locations = n, color:format(n) end
 					else
-						bags, bank, vault = owner.counts.bags[id], owner.counts.bank[id], owner.counts.vault[id]
-						equip, mail = owner.counts.equip[id], owner.counts.mail[id]
+						if owner.offline and not owner.counts then
+							self:CountItems(owner)
+						end
+
+						local equip, mail, bags, bank, vault
+
+						if not owner.offline then
+							mail = find(owner.mail, id)
+							equip = find(owner.equip, id)
+							vault = find(owner.vault, id)
+							bank = C.GetItemCount(id, true, nil, true) - carrying
+							bags = carrying - equip
+						else
+							bags, bank, vault = owner.counts.bags[id], owner.counts.bank[id], owner.counts.vault[id]
+							equip, mail = owner.counts.equip[id], owner.counts.mail[id]
+						end
+
+						count, locations = self:Format(color, EQUIP_ICON, equip, frameIcon('inventory'), bags,
+							frameIcon('bank'), bank, frameIcon('vault'), vault, MAIL_ICON, mail)
 					end
 
-					count, locations = self:Format(color, EQUIP_ICON, equip, frameIcon('inventory'), bags,
-						frameIcon('bank'), bank, frameIcon('vault'), vault, MAIL_ICON, mail)
-
-					if count > 0 then
-						tinsert(left, owner:GetDisplayName(16))
-						tinsert(right, locations)
+					if count and count > 0 then
+						local L_ = owner.meshRemote and otherL or mineL
+						local R_ = owner.meshRemote and otherR or mineR
+						tinsert(L_, owner:GetDisplayName(16))
+						tinsert(R_, locations)
 						total = total + count
 					end
 				end
@@ -152,17 +168,25 @@ function TipCounts:AddOwners(tip, link)
 
 			local account = C.GetItemCount(id, nil, nil, nil, true) - carrying
 			if account > 0 then
-				tinsert(left, '|A:questlog-questtypeicon-account:0:0|a ' .. ACCOUNT_QUEST_LABEL)
-				tinsert(right, account)
+				tinsert(mineL, '|A:questlog-questtypeicon-account:0:0|a ' .. ACCOUNT_QUEST_LABEL)
+				tinsert(mineR, account)
 				total = total + account
 			end
 
-			if #left > 1 then
+			if (#mineL + #otherL) > 1 then
 				tip:AddLine(format('|n%s: |cffffffff%d|r', TOTAL, total))
 			end
 
-			for i, who in ipairs(left) do
-				tip:AddDoubleLine(who, right[i])
+			for i, who in ipairs(mineL) do
+				tip:AddDoubleLine(who, mineR[i])
+			end
+
+			if #otherL > 0 then
+				tip:AddLine(' ')
+				tip:AddLine('|A:questlog-questtypeicon-account:0:0|a '.. LIGHTGRAY_FONT_COLOR:WrapTextInColorCode(L.OtherAccounts))
+				for i, who in ipairs(otherL) do
+					tip:AddDoubleLine(who, otherR[i])
+				end
 			end
 
 			tip.__hasCounters = not C_TooltipInfo

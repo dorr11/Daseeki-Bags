@@ -10,15 +10,16 @@ local function Location(bag)
 	return bag > Addon.NumBags and 'bank' or 'inventory', bag
 end
 
-local Parent = ContainerFrameContainer or UIParent
 local Panels = {
 	BankFrame = 'bank',
 	VoidStorageFrame = 'vault'
 }
 
+local PanelParent = UIParent
+
 function Overrides:OnLoad()
 	self:RegisterEvent('CVAR_UPDATE', self.Delay, 'OnCVar')
-	self.Disabled = CreateFrame('Frame', nil, Parent)
+	self.Disabled = CreateFrame('Frame', nil, PanelParent)
 	self.Disabled:SetAllPoints()
 	self.Disabled:Hide()
 
@@ -46,12 +47,15 @@ function Overrides:OnLoad()
 	end
 
 	for i = 1, NUM_CONTAINER_FRAMES do
-		hooksecurefunc(_G['ContainerFrame' .. i], 'SetID', function(frame, bag)
-			if InCombatLockdown() then return end
-			local disabled = Addon.Frames:HasBag(Location(bag))
-			local wanted = disabled and self.Disabled or Parent
-			if frame:GetParent() ~= wanted then
-				frame:SetParent(wanted)
+		local frame = _G['ContainerFrame' .. i]
+		hooksecurefunc(frame, 'SetID', function(frame, bag)
+			if Addon.Frames:HasBag(Location(bag)) then
+				frame:Hide()
+			end
+		end)
+		frame:SetScript('OnShow', function(frame)
+			if Addon.Frames:HasBag(Location(frame:GetID())) then
+				frame:Hide()
 			end
 		end)
 	end
@@ -78,14 +82,11 @@ function Overrides:OnLoad()
 
 	hooksecurefunc('ShowUIPanel', function(panel)
 		local frame = panel and Panels[panel:GetName()]
-		if frame and not InCombatLockdown() then
+		if frame then
 			local enabled = Addon.Frames:Show(frame)
 			panel.__onhide = panel.__onhide or panel:GetScript('OnHide')
 			panel:SetScript('OnHide', not enabled and panel.__onhide or nil)
-			local wanted = enabled and self.Disabled or UIParent
-			if panel:GetParent() ~= wanted then
-				panel:SetParent(wanted)
-			end
+			panel:SetParent(enabled and self.Disabled or PanelParent)
 		end
 	end)
 

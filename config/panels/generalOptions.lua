@@ -204,6 +204,38 @@ function General:Populate()
 		end
 	)
 
+	self:AddSectionHeader(L.MeshSync)
+	add2Col(80, function()
+		local tokenStatus = (Addon.sets.meshToken ~= '') and L.MeshTokenActive:format(Addon.sets.meshToken) or L.MeshTokenNone
+		self.row:Add('Header', tokenStatus, 'GameFontDisable', true)
+		self.row:Add('GrayButton', L.MeshTokenSet):SetCall('OnClick', function()
+			StaticPopupDialogs['DASEEKI_BAGS_MESH_TOKEN'] = {
+				text = L.MeshTokenPrompt, button1 = OKAY, button2 = CANCEL,
+				hasEditBox = true, timeout = 0, whileDead = true, hideOnEscape = true,
+				OnAccept = function(dialog)
+					Addon.sets.meshToken = strtrim(dialog.EditBox:GetText())
+					self:Update()
+				end,
+			}
+			StaticPopup_Show('DASEEKI_BAGS_MESH_TOKEN')
+		end)
+		local chanStatus = (Addon.sets.meshChannel ~= '') and L.MeshChannelActive:format(Addon.sets.meshChannel) or L.MeshChannelNone
+		self.row:Add('Header', chanStatus, 'GameFontDisable', true)
+		self.row:Add('GrayButton', L.MeshChannelSet):SetCall('OnClick', function()
+			StaticPopupDialogs['DASEEKI_BAGS_MESH_CHANNEL'] = {
+				text = L.MeshChannelPrompt, button1 = OKAY, button2 = CANCEL,
+				hasEditBox = true, timeout = 0, whileDead = true, hideOnEscape = true,
+				OnAccept = function(dialog)
+					Addon.sets.meshChannel = strtrim(dialog.EditBox:GetText())
+					self:Update()
+				end,
+			}
+			StaticPopup_Show('DASEEKI_BAGS_MESH_CHANNEL')
+		end)
+	end, function()
+		self.row:Add('Header', L.MeshTokenTip, 'GameFontDisable', true)
+	end)
+
 	self.sets = Addon.sets
 end
 

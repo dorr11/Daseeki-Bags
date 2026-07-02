@@ -21,6 +21,7 @@ function Settings:OnLoad()
 		resetPlayer = true, flashFind = true,
 		countItems = true, countCurrency = true,
 		moneyTooltipFaction = false, moneyTooltipMinGold = 0,
+		meshToken = '', meshChannel = '',
 		depositAccount = true, depositReagents = true,
 		display = {
 			banker = true, accountBanker = true, characterBanker = true, voidStorageBanker = true,

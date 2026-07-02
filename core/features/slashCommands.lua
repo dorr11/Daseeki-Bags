@@ -38,6 +38,12 @@ function Slash.OnSlashCommand(cmd)
 		Addon.Frames:Toggle('vault')
 	elseif cmd == 'version' then
 		print('|cff33ff99' .. ADDON .. '|r version ' .. LibStub('C_Everywhere').AddOns.GetAddOnMetadata(ADDON, 'version'))
+	elseif cmd == 'mesh' then
+		Slash:PrintMeshStatus()
+	elseif cmd == 'mesh send' then
+		Slash:MeshTestSend()
+	elseif cmd == 'mesh clear' then
+		Slash:MeshClear()
 	elseif cmd == 'config' or cmd == 'options' then
 		Addon:ShowOptions()
 	elseif cmd == 'reset' then
@@ -57,6 +63,76 @@ function Slash:ResetSettings()
 			wipe(Addon.sets)
 			ReloadUI()
 		end
+	}
+end
+
+function Slash:MeshTestSend()
+	local tag = '|cff33ff99' .. ADDON .. '|r'
+	print(tag .. ' Mesh: forcing gold push now...')
+	if Addon.MeshSync then
+		Addon.MeshSync:PushAll()
+		print(tag .. ' Mesh: full account snapshot sent (if channel was joined). Watch for "Remote owners" appearing on the other account via /bgn mesh.')
+	else
+		print(tag .. ' Mesh: MeshSync module not found.')
+	end
+end
+
+function Slash:PrintMeshStatus()
+	local tag = '|cff33ff99' .. ADDON .. '|r'
+	local token = Addon.sets and Addon.sets.meshToken
+	print(tag .. ' Cross-Account Sync status:')
+	print('  Token: ' .. (token and token ~= '' and ('|cff00ff00' .. token .. '|r') or '|cffff0000not set|r'))
+	local ch = Addon.sets and Addon.sets.meshChannel
+	local chanName = token and token ~= '' and ((ch and ch ~= '') and ch or ('DBagSync' .. token)) or nil
+	local chanNum = chanName and GetChannelName(chanName) or nil
+	if chanName then
+		local label = (ch and ch ~= '') and '' or ' (auto)'
+		if chanNum and chanNum > 0 then
+			local members = GetNumChannelMembers(chanNum) or 0
+			print('  Channel: ' .. chanName .. label .. ' — |cff00ff00joined (#' .. chanNum .. ', ' .. members .. ' API members)|r')
+		else
+			print('  Channel: ' .. chanName .. label .. ' — |cffff0000not in channel|r')
+		end
+	else
+		print('  Channel: |cffff0000set a token first|r')
+	end
+	local rosterCount = 0
+	if Addon.MeshSync and Addon.MeshSync._GetRoster then
+		for name in pairs(Addon.MeshSync._GetRoster()) do
+			rosterCount = rosterCount + 1
+			print('  Live roster: |cff00ff00' .. name .. '|r')
+		end
+	end
+	if rosterCount == 0 then print('  Live roster: |cffff8800empty (waiting for JOIN events or API poll)|r') end
+	local invOk = Addon.MeshTransport and Addon.MeshTransport:IsAvailable()
+	print('  Item/Currency sync: ' .. (invOk and '|cff00ff00enabled|r' or '|cffff0000disabled (LibSerialize/LibDeflate missing)|r'))
+	local remotes = 0
+	for _, owner in Addon.Owners:Iterate() do
+		if owner.meshRemote then
+			remotes = remotes + 1
+			local c = owner.cache or {}
+			local copper = c.money
+			local items = 0
+			if c.itemCounts then for _ in pairs(c.itemCounts) do items = items + 1 end end
+			print(format('  Remote: %s-%s = %s | %d items | rev %s',
+				owner.name, owner.realm,
+				copper and GetMoneyString(copper) or 'no gold',
+				items, tostring(c.rev or '-')))
+		end
+	end
+	if remotes == 0 then print('  Remote owners: none received yet') end
+	print('  (use /bgn mesh send to push gold, /bgn mesh clear to wipe remote data)')
+end
+
+function Slash:MeshClear()
+	local tag = '|cff33ff99' .. ADDON .. '|r'
+	LibStub('Sushi-3.2').Popup {
+		text = 'Wipe all cross-account (mesh) data received from other accounts? Your own characters are unaffected.',
+		button1 = OKAY, button2 = CANCEL, whileDead = 1, hideOnEscape = 1,
+		OnAccept = function()
+			wipe(DaseekiBagsMesh)
+			print(tag .. ' Mesh: remote data cleared. Reload to fully reset in-memory owners.')
+		end,
 	}
 end
 

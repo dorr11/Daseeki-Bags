@@ -9,4 +9,7 @@
 	<Script file="itemFinder.lua"/>
 	<Script file="antiMoneyTaint.lua"/>
 	<Script file="slashCommands.lua"/>
+	<Script file="meshSync.lua"/>
+	<Script file="meshTransport.lua"/>
+	<Script file="meshInventory.lua"/>
 </Ui>

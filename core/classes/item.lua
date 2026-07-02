@@ -253,8 +253,10 @@ end
 
 function Item:ShowTooltip()
 	if self:GetRight() then -- prevents bug in blizzard code
-		(self:GetInventorySlot() and BankFrameItemButton_OnEnter or
-			ContainerFrameItemButtonMixin and ContainerFrameItemButtonMixin.OnUpdate or ContainerFrameItemButton_OnEnter)(self)
+		securecall(
+			self:GetInventorySlot() and BankFrameItemButton_OnEnter or
+			ContainerFrameItemButtonMixin and ContainerFrameItemButtonMixin.OnUpdate or ContainerFrameItemButton_OnEnter,
+			self)
 	end
 end
 

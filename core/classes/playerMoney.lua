@@ -89,38 +89,51 @@ function Money:OnEnter()
 	GameTooltip:SetOwner(self:GetTipAnchor())
 	GameTooltip:SetText(MONEY, 1,1,1)
 
-	local liquid = {}
+	-- Partition into this-account (local) and other-account (remote) characters
+	local mine, others = {}, {}
 	for _, owner in Addon.Owners:Iterate() do
 		local money = owner:GetMoney()
 		if money and money > 0
 		   and money >= (Addon.sets.moneyTooltipMinGold or 0) * 10000
 		   and (not Addon.sets.moneyTooltipFaction or owner.faction == Addon.player.faction) then
-			tinsert(liquid, {owner = owner, money = money})
+			tinsert(owner.meshRemote and others or mine, {owner = owner, money = money})
 		end
 	end
 
-	sort(liquid, function(a, b)
-		return (a.money or 0) > (b.money or 0)
-	end)
+	local function byMoney(a, b) return (a.money or 0) > (b.money or 0) end
+	sort(mine, byMoney)
+	sort(others, byMoney)
 
-	local total, overflow = 0, 0
-	for i, entry in ipairs(liquid) do
-		local owner, money = entry.owner, entry.money or 0
-		if i <= 10 or owner.favorite then
-			local coins = GetMoneyString(money, true, true)
-			local icon = owner:GetIconMarkup(12,0,0)
-			local color = owner:GetColor(owner)
-
-			GameTooltip:AddDoubleLine(icon .. ' ' .. owner.name, coins, color.r, color.g, color.b, color.r, color.g, color.b)
-		else
-			overflow = overflow + money
+	local total = 0
+	-- Render up to 5 characters per group, then sum the rest into a single "Others" line.
+	local function renderGroup(list)
+		local shown, overflow = 0, 0
+		for _, entry in ipairs(list) do
+			local owner, money = entry.owner, entry.money or 0
+			if shown < 5 or owner.favorite then
+				local coins = GetMoneyString(money, true, true)
+				local icon = owner:GetIconMarkup(12,0,0)
+				local color = owner:GetColor(owner)
+				GameTooltip:AddDoubleLine(icon .. ' ' .. owner.name, coins, color.r, color.g, color.b, color.r, color.g, color.b)
+				shown = shown + 1
+			else
+				overflow = overflow + money
+			end
+			total = total + money
 		end
-
-		total = total + money
+		if overflow > 0 then
+			GameTooltip:AddDoubleLine('|TInterface/Icons/INV_Misc_QuestionMark:0:0|t '..L.Others, GetMoneyString(overflow, true, true))
+		end
 	end
 
-	if overflow > 0 then
-		GameTooltip:AddDoubleLine('|TInterface/Icons/INV_Misc_QuestionMark:0:0|t '..L.Others, GetMoneyString(overflow, true, true))
+	renderGroup(mine)
+	if #others > 0 then
+		if #mine > 0 then
+			-- small break separating this account from other accounts
+			GameTooltip:AddLine(' ')
+		end
+		GameTooltip:AddLine('|A:questlog-questtypeicon-account:0:0|a '.. LIGHTGRAY_FONT_COLOR:WrapTextInColorCode(L.OtherAccounts))
+		renderGroup(others)
 	end
 
 	local account = (C.Bank.FetchDepositedMoney or nop)(2) or 0
