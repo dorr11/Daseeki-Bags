@@ -233,8 +233,8 @@ function MeshSync:TryPopulateRosterFromAPI()
     if not chanName then return end
     local chanNum = GetChannelName(chanName)
     if not chanNum or chanNum == 0 then return end
-    local count = GetNumChannelMembers(chanNum)
-    if count == 0 then return end  -- not ready yet
+    local count = GetNumChannelMembers(chanNum) or 0
+    if count == 0 then return end  -- not ready (or roster not yet delivered by server)
     local self_ = SelfKey()
     for i = 1, count do
         local memberName = GetChannelRosterInfo(chanNum, i)

@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.1.2
+- Fixed a Lua error in the cross-account sync roster poll when the server hadn't yet delivered the channel member list (`'for' limit must be a number`).
+
 ## 1.1.1
 - Renamed the short chat command from `/bgn` to `/dbg` to avoid colliding with Bagnon. The full `/Daseeki-Bags` command is unchanged.
 
