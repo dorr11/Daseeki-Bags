@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.3
+- Keyring now caches live during play (and reliably on login) instead of only at an unreliable login snapshot, so keys stay current and sync across accounts. Existing characters need to be logged in once to refresh their keyring.
+- Hardened cross-account item counts: zero/stale entries are dropped on receive and any legacy zero counts are scrubbed on load.
+- Added `/dbg mesh item <id>` to list which characters (local and other-account) hold a given item.
+
 ## 1.1.2
 - Fixed a Lua error in the cross-account sync roster poll when the server hadn't yet delivered the channel member list (`'for' limit must be a number`).
 

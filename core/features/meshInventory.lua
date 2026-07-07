@@ -87,6 +87,18 @@ local function BackfillLocal()
     end
 end
 
+-- Keep only positive integer counts; drop zero/negative/nil so stale or removed
+-- entries never persist in a stored map. Returns the same table (mutated in place).
+local function SanitizeCounts(t)
+    if type(t) ~= 'table' then return {} end
+    for id, cnt in pairs(t) do
+        if type(id) ~= 'number' or type(cnt) ~= 'number' or cnt <= 0 then
+            t[id] = nil
+        end
+    end
+    return t
+end
+
 -- Flat numeric-keyed currency copy (drops the 'tracked' array key).
 local function CurrencyMap(cache)
     local m = {}
@@ -256,8 +268,8 @@ function MeshInventory:OnSnapshot(tbl, sender)
 
     local owner = Addon.Owners:NewRemote(name, realm)
     local c = owner.cache
-    c.itemCounts = tbl.ic or {}
-    c.currency   = tbl.cur or {}
+    c.itemCounts = SanitizeCounts(tbl.ic or {})
+    c.currency   = SanitizeCounts(tbl.cur or {})
     if tbl.trk then c.currency.tracked = tbl.trk end
     c.rev = tbl.rev
     c.ts  = tbl.ts or time()
@@ -285,11 +297,11 @@ function MeshInventory:OnDelta(tbl, sender)
     local c = owner.cache
     c.itemCounts = c.itemCounts or {}
     for id, cnt in pairs(tbl.ic or {}) do
-        c.itemCounts[id] = (cnt == 0) and nil or cnt
+        c.itemCounts[id] = (type(cnt) ~= 'number' or cnt <= 0) and nil or cnt
     end
     c.currency = c.currency or {}
     for id, qty in pairs(tbl.cur or {}) do
-        c.currency[id] = (qty == 0) and nil or qty
+        c.currency[id] = (type(qty) ~= 'number' or qty <= 0) and nil or qty
     end
     if tbl.trk then c.currency.tracked = tbl.trk end
     c.rev = tbl.rev
@@ -309,6 +321,17 @@ function MeshInventory:OnLoad()
     Addon.MeshTransport:SetReceiver(function(msgType, tbl, sender)
         MeshInventory:OnReceive(msgType, tbl, sender)
     end)
+
+    -- One-time scrub of any stale zero/invalid counts left by earlier builds.
+    if DaseekiBagsMesh then
+        for _, byId in pairs(DaseekiBagsMesh) do
+            if type(byId) == 'table' then
+                for _, c in pairs(byId) do
+                    if type(c) == 'table' and c.itemCounts then SanitizeCounts(c.itemCounts) end
+                end
+            end
+        end
+    end
 
     -- Recompute the current character's map when its inventory/currency changes.
     self:RegisterSignal('BAGS_UPDATED', 'MarkDirty')

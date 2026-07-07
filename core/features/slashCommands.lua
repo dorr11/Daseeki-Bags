@@ -44,6 +44,8 @@ function Slash.OnSlashCommand(cmd)
 		Slash:MeshTestSend()
 	elseif cmd == 'mesh clear' then
 		Slash:MeshClear()
+	elseif cmd:match('^mesh item %d+$') then
+		Slash:MeshItem(tonumber(cmd:match('(%d+)$')))
 	elseif cmd == 'config' or cmd == 'options' then
 		Addon:ShowOptions()
 	elseif cmd == 'reset' then
@@ -122,6 +124,32 @@ function Slash:PrintMeshStatus()
 	end
 	if remotes == 0 then print('  Remote owners: none received yet') end
 	print('  (use /dbg mesh send to push gold, /dbg mesh clear to wipe remote data)')
+end
+
+-- Debug: dump what every owner reports for a given itemID (in-memory truth).
+function Slash:MeshItem(id)
+	local tag = '|cff33ff99' .. ADDON .. '|r'
+	print(format('%s Owners holding item %d:', tag, id))
+	local any = false
+	for _, owner in Addon.Owners:Iterate() do
+		local kind, count
+		if owner.meshRemote then
+			kind = 'REMOTE'
+			count = owner.itemCounts and owner.itemCounts[id]
+		elseif owner.isguild then
+			kind = 'guild'
+		else
+			kind = owner.offline and 'local-offline' or 'local-online'
+		end
+		if count and count > 0 then
+			any = true
+			local fac = owner.faction or '?'
+			print(format('  %s-%s [%s, %s] = %d', owner.name, owner.realm or '?', kind, fac, count))
+		end
+	end
+	if not any then print('  (no REMOTE owner reports this item in itemCounts)') end
+	print(format('  faction filter is %s; your faction = %s',
+		Addon.sets.moneyTooltipFaction and '|cffff8800ON|r' or 'off', Addon.player.faction or '?'))
 end
 
 function Slash:MeshClear()

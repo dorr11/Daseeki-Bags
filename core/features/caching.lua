@@ -92,7 +92,11 @@ end
 
 function Cacher:BAGS_UPDATED(bags)
 	for bag in pairs(bags) do
-		if bag >= BACKPACK_CONTAINER and bag <= Addon.NumBags and (bag ~= KEYRING_CONTAINER or HasKey and HasKey()) then
+		-- The keyring (KEYRING_CONTAINER = -2) fails the range check below, so it was
+		-- previously only saved at login. Handle it explicitly so keys cache live.
+		if KEYRING_CONTAINER and bag == KEYRING_CONTAINER then
+			self:SaveBag(bag)
+		elseif bag >= BACKPACK_CONTAINER and bag <= Addon.NumBags then
 			self:SaveBag(bag)
 		end
 	end
@@ -146,12 +150,16 @@ function Cacher:MAIL_SEND_SUCCESS()
 
 		for _, owner in Addon.Owners:Iterate() do
 			if not owner.isguild and owner.realm == pending.realm and owner.name:lower() == pending.recipient then
-				local i = math.ceil(#owner.cache.mail / ATTACHMENTS_MAX_RECEIVE) * ATTACHMENTS_MAX_RECEIVE
 				local mail = owner.cache.mail or {}
+				local i = math.ceil(#mail / ATTACHMENTS_MAX_RECEIVE) * ATTACHMENTS_MAX_RECEIVE
 
-				for _, item in ipairs(pending.items) do
-					i = i + 1
-					mail[i] = item
+				-- pending stores attachments in its array part (possibly sparse)
+				for j = 1, ATTACHMENTS_MAX_RECEIVE do
+					local item = pending[j]
+					if item then
+						i = i + 1
+						mail[i] = item
+					end
 				end
 
 				self.pendingMail = nil
