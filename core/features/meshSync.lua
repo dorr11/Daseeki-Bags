@@ -241,7 +241,13 @@ function MeshSync:TryPopulateRosterFromAPI()
         local norm = NormalizeName(memberName)
         if norm and norm ~= self_ and not _channelRoster[norm] then
             _channelRoster[norm] = true
-            self:PushAllTo(norm)  -- full account snapshot on discovery
+            self:PushAllTo(norm)  -- full account snapshot (gold) on discovery
+            -- Also advertise the item/currency manifest — this discovery path (both
+            -- accounts already online) previously only pushed gold, so item/keyring
+            -- changes never propagated here.
+            if Addon.MeshInventory then
+                C_Timer.After(0.4, function() Addon.MeshInventory:SendManifestTo(norm) end)
+            end
         end
     end
 end

@@ -239,7 +239,9 @@ function MeshInventory:OnManifest(tbl, sender)
         if name and realm and not IsSelf(name, realm) then
             local stored = DaseekiBagsMesh and DaseekiBagsMesh[realm] and DaseekiBagsMesh[realm][name]
             local storedRev = stored and stored.rev or 0
-            if (not stored or not stored.itemCounts or storedRev < rev)
+            -- Re-sync on ANY rev mismatch (not just when behind) so a diverged/stale
+            -- stored rev — e.g. a phantom higher value — heals instead of sticking.
+            if (not stored or not stored.itemCounts or storedRev ~= rev)
                and not (_snapReqPending[key] and (GetTime() - _snapReqPending[key] < SNAP_REQ_TTL)) then
                 want[#want + 1] = key
                 _snapReqPending[key] = GetTime()
@@ -347,5 +349,13 @@ function MeshInventory:OnLoad()
     C_Timer.After(INITIAL_RECOMPUTE, function()
         BackfillLocal()
         MeshInventory:Recompute(false)
+        -- Now that our rev is finalized, (re)advertise manifests to every known peer.
+        -- This closes the race where a peer was discovered (and manifested) before the
+        -- initial recompute bumped our rev, leaving them one step behind.
+        if Addon.MeshSync and Addon.MeshSync._GetRoster then
+            for target in pairs(Addon.MeshSync._GetRoster()) do
+                MeshInventory:SendManifestTo(target)
+            end
+        end
     end)
 end
