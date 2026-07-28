@@ -15,6 +15,14 @@
 local ADDON, Addon = ...
 local MeshInventory = Addon:NewModule('MeshInventory')
 
+-- Wave N5: stand the DBAG item/currency sync down when the suite mesh
+-- (Daseeki.Sync v2 / Nexus) is present — SyncBridge publishes/consumes the
+-- aggregated snapshot through Nexus now.
+local function SuiteSyncActive()
+    local S = _G.Daseeki and _G.Daseeki.Sync
+    return (S and S.RegisterNamespace and S.MarkDirty and S.Get) and true or false
+end
+
 -- Message-type codes (payload's first byte after transport decode)
 local MSG_MANIFEST = 0x40
 local MSG_SNAP_REQ = 0x41
@@ -316,6 +324,9 @@ end
 --[[ Lifecycle ]]--
 
 function MeshInventory:OnLoad()
+    if SuiteSyncActive() then
+        return  -- SyncBridge/Nexus owns cross-account item + currency sync now
+    end
     if not Addon.MeshTransport or not Addon.MeshTransport:IsAvailable() then
         return  -- LibSerialize/LibDeflate missing; gold sync (Phase 1) still works
     end

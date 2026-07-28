@@ -9,6 +9,15 @@
 local ADDON, Addon = ...
 local MeshSync = Addon:NewModule('MeshSync')
 
+-- Wave N5: when the suite mesh (Daseeki.Sync v2 / Nexus) is present, SyncBridge
+-- owns cross-account transport and this bespoke DBAG mesh stands its TRANSPORT
+-- down (persistence/read-cache below is still kept). MarkDirty is the v2-only
+-- marker, so this is safe regardless of Nexus/Bags merge order.
+local function SuiteSyncActive()
+    local S = _G.Daseeki and _G.Daseeki.Sync
+    return (S and S.RegisterNamespace and S.MarkDirty and S.Get) and true or false
+end
+
 local PREFIX            = 'DBAG'
 local MSG_GOLD          = 'G'
 local PUSH_DEBOUNCE_SEC = 4
@@ -393,6 +402,11 @@ function MeshSync:OnLoad()
     DaseekiBagsMesh = DaseekiBagsMesh or {}
     _remoteCache = DaseekiBagsMesh
     self:RestorePersisted()
+
+    -- Suite mesh present: keep the persisted remote read-cache (restored above so
+    -- last-known cross-account data still shows on login) but do NOT start the
+    -- DBAG transport — SyncBridge/Nexus carries cross-account sync now.
+    if SuiteSyncActive() then return end
 
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
 
