@@ -206,6 +206,11 @@ end)
 
 ns:RegisterEvent("PLAYER_LOGIN", function()
     ns.state.loggedIn = true
+    -- Items must know the self character before any IsLive gate runs, so alt and
+    -- remote owners render read-only from the first paint.
+    if ns.Items and ns.Items.SetSelf and UnitName and GetRealmName then
+        ns:SafeCall(function() ns.Items.SetSelf(UnitName("player") .. "-" .. GetRealmName()) end)
+    end
     if ns.Capture and ns.Capture.OnLogin then ns:SafeCall(ns.Capture.OnLogin) end
     if ns.Frame   and ns.Frame.OnLogin   then ns:SafeCall(ns.Frame.OnLogin)   end
     ns:Fire("LOGIN")
