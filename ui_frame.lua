@@ -141,6 +141,95 @@ function Frame.CarriedContainerOrder(owner, opts)
 end
 
 ----------------------------------------------------------------------
+-- PURE: bag-slot STRIP enumeration + button-state matrix (bag management)
+--
+-- The toggle strip is also the bag-slot MANAGER (1.x parity, frames/inventory bag
+-- behavior fact). Two facts drive it:
+--   * For the LIVE self owner the strip lists EVERY real inventory bag slot
+--     1..NumBagSlots — INCLUDING empty ones — so a newly-looted bigger bag has a
+--     slot to be dropped onto (the owner's miss: an empty slot had no button, so
+--     there was no way to equip). Backpack (0) and keyring (-2) frame it as pure
+--     toggles (never equippable, BRAND_SPEC intent).
+--   * For a CACHED/remote alt you can't equip anything, so the strip stays the old
+--     owned-container toggle list (management disabled).
+----------------------------------------------------------------------
+
+-- Ordered strip entries: { cid, role="backpack"|"bag"|"keyring", manageable=bool }.
+--   opts = { live=bool, showKeyring=bool, numBagSlots=<n> (test override) }
+function Frame.StripSlots(owner, opts)
+    opts = opts or {}
+    local live        = opts.live and true or false
+    local showKeyring = (opts.showKeyring ~= false)
+    local n           = opts.numBagSlots or Store.NumBagSlots()
+    local slots = {}
+    slots[#slots + 1] = { cid = Store.BACKPACK_CONTAINER, role = "backpack", manageable = false }
+    if live then
+        -- Every equip slot, empty or not — the manager needs a target for each.
+        for s = 1, n do slots[#slots + 1] = { cid = s, role = "bag", manageable = true } end
+    else
+        -- Cached alt: only the bags they actually own, toggle-only (no equip target).
+        local ids = {}
+        if owner and type(owner.containers) == "table" then
+            for s = 1, n do if owner.containers[s] then ids[#ids + 1] = s end end
+        end
+        table.sort(ids)
+        for _, s in ipairs(ids) do slots[#slots + 1] = { cid = s, role = "bag", manageable = false } end
+    end
+    if showKeyring then slots[#slots + 1] = { cid = Store.KEYRING_CONTAINER, role = "keyring", manageable = false } end
+    return slots
+end
+
+-- Decide how a strip button presents + behaves given live facts. Pure so the whole
+-- equipped/empty/toggled × cursor × combat matrix is harness-locked.
+--   ctx = { role, manageable, equipped, toggledOff, cursorBag, inCombat }
+-- returns {
+--   manageable, role, equipped, toggledOff,
+--   showPlus,     -- faint "+" equip affordance (empty manageable slot; hover/drag only)
+--   clickAction,  -- "equip" | "toggle" | "none" | "blocked-combat"
+--   dragAction,   -- "pickup" | "blocked-combat" | nil   (only when a bag is equipped)
+--   dropAction,   -- "equip"  | "blocked-combat" | nil   (only on a manageable slot)
+-- }
+-- Rules: management is gated to manageable (numbered, live-self) slots. A bag on the
+-- cursor turns a click/drop into an EQUIP/REPLACE; combat downgrades every equip/pickup
+-- to "blocked-combat" (bag equip is protected in combat — we defer with a message).
+-- Backpack/keyring/cached bags are pure toggles.
+function Frame.StripButtonState(ctx)
+    ctx = ctx or {}
+    local manageable = ctx.manageable and true or false
+    local equipped   = ctx.equipped and true or false
+    local cursorBag  = ctx.cursorBag and true or false
+    local inCombat   = ctx.inCombat and true or false
+
+    local clickAction, dragAction, dropAction
+    if manageable then
+        dropAction = inCombat and "blocked-combat" or "equip"
+        if cursorBag then
+            clickAction = inCombat and "blocked-combat" or "equip"
+        elseif equipped then
+            clickAction = "toggle"           -- hide/show this bag's items in the grid
+        else
+            clickAction = "none"             -- empty slot, nothing on cursor: inert click
+        end
+        if equipped then
+            dragAction = inCombat and "blocked-combat" or "pickup"
+        end
+    else
+        clickAction = "toggle"               -- backpack / keyring / cached bag
+    end
+
+    return {
+        manageable  = manageable,
+        role        = ctx.role,
+        equipped    = equipped,
+        toggledOff  = ctx.toggledOff and true or false,
+        showPlus    = manageable and not equipped,
+        clickAction = clickAction,
+        dragAction  = dragAction,
+        dropAction  = dropAction,
+    }
+end
+
+----------------------------------------------------------------------
 -- PURE: entry-list construction
 --
 -- One entry per slot index 1..container.size, INCLUDING empty slots (data=nil)
@@ -609,26 +698,142 @@ function Frame.Ensure()
     return win
 end
 
--- Rebuild the bag-slot toggle strip for the viewed owner (one small button per
--- carried container; click hides/shows that container's slots).
+----------------------------------------------------------------------
+-- Bag-slot MANAGEMENT (frame layer; every WoW API guarded on _G).
+--
+-- Insecure + hardware-event-driven (OnClick / OnReceiveDrag / OnDragStart) — the
+-- taint-safe surface (bags are NOT part of the secure action system on Classic Era;
+-- 1.x-proven, frames/inventory bag behavior fact). The cursor ops PutItemInBag /
+-- PickupBagFromSlot require a hardware event, which those handlers supply; NO protected
+-- op on any secure frame runs here, and equip/pickup are combat-gated (bag equip is
+-- protected in combat — we defer with a plain message). Catalog-verified against
+-- wow-api-catalog/1.15.9.68808: C_Container.ContainerIDToInventoryID, PutItemInBag,
+-- PickupBagFromSlot, GetInventoryItemLink, IsInventoryItemLocked, CursorHasItem,
+-- InCombatLockdown.
+----------------------------------------------------------------------
+
+-- The inventory (equip) slot for a carried bag container (1..N), else nil.
+local function bagInventorySlot(cid)
+    if type(cid) ~= "number" or cid < 1 then return nil end
+    local CC = _G.C_Container
+    if CC and CC.ContainerIDToInventoryID then return CC.ContainerIDToInventoryID(cid) end
+    if _G.ContainerIDToInventoryID then return _G.ContainerIDToInventoryID(cid) end
+    return nil
+end
+
+-- Live "is a bag equipped in this inventory slot" (authoritative even before capture
+-- re-snapshots the store on the next BAG_UPDATE).
+local function bagEquippedLink(slot)
+    if slot and _G.GetInventoryItemLink then return _G.GetInventoryItemLink("player", slot) end
+    return nil
+end
+
+local function cursorHasBag()
+    return (_G.CursorHasItem and _G.CursorHasItem()) and true or false
+end
+
+local function stripInCombat()
+    return (_G.InCombatLockdown and _G.InCombatLockdown()) and true or false
+end
+
+-- Plain deferred-in-combat notice (no error spam; one concise line + a soft decline cue).
+function Frame.NotifyBagCombatBlocked()
+    if ns and ns.Print then ns:Print("Can't equip or swap bags while in combat — try again after combat.") end
+    if _G.PlaySound and _G.SOUNDKIT then _G.PlaySound(_G.SOUNDKIT.IG_PLAYER_INVITE_DECLINE or 847) end
+end
+
+-- Live facts -> resolved strip state for a button.
+local function stripStateNow(b)
+    local db = Store.db
+    return Frame.StripButtonState({
+        role       = b._role,
+        manageable = b._manageable,
+        equipped   = (b._slot ~= nil) and (bagEquippedLink(b._slot) ~= nil) or false,
+        toggledOff = (db and db.hiddenBags and db.hiddenBags[b._cid]) and true or false,
+        cursorBag  = cursorHasBag(),
+        inCombat   = stripInCombat(),
+    })
+end
+
+-- Execute a resolved action (from Frame.StripButtonState) for one strip button.
+local function runStripAction(action, cid, slot)
+    if action == "toggle" then
+        local db = Store.db
+        if db then
+            db.hiddenBags = db.hiddenBags or {}
+            db.hiddenBags[cid] = (not db.hiddenBags[cid]) or nil
+            Frame.Rebuild()
+        end
+    elseif action == "equip" then
+        if slot and _G.PutItemInBag then _G.PutItemInBag(slot) end   -- equips/replaces the cursor bag (native swap)
+    elseif action == "pickup" then
+        if slot and _G.PickupBagFromSlot then
+            if _G.PlaySound and _G.SOUNDKIT then _G.PlaySound(_G.SOUNDKIT.IG_BACKPACK_OPEN or 862) end
+            _G.PickupBagFromSlot(slot)
+        end
+    elseif action == "blocked-combat" then
+        Frame.NotifyBagCombatBlocked()
+    end
+    -- "none"/nil => inert
+end
+
+-- Strip tooltip: the equipped bag (name/size via SetInventoryItem) or "No bag equipped",
+-- plus the context instruction. Quiet by default; the affordance copy appears on hover.
+local function stripTooltip(b)
+    local GT = _G.GameTooltip
+    if not GT then return end
+    GT:SetOwner(b, "ANCHOR_RIGHT")
+    GT:ClearLines()
+    local st = stripStateNow(b)
+    if b._role == "backpack" then
+        GT:SetText("Backpack", UI.Color("text"))
+        GT:AddLine(st.toggledOff and "Click to show its items" or "Click to hide its items", UI.Color("muted"))
+    elseif b._role == "keyring" then
+        GT:SetText("Keyring", UI.Color("text"))
+        GT:AddLine(st.toggledOff and "Click to show its keys" or "Click to hide its keys", UI.Color("muted"))
+    elseif st.manageable then
+        if st.equipped then
+            if b._slot and GT.SetInventoryItem then GT:SetInventoryItem("player", b._slot) end
+            GT:AddLine(st.cursorBag and "Click to replace this bag"
+                or "Drag out to unequip · Left-click to hide/show its items", UI.Color("muted"))
+        else
+            GT:SetText("No bag equipped", UI.Color("text"))
+            GT:AddLine(st.cursorBag and "Click to equip the bag on your cursor"
+                or "Drag a bag here to equip it", UI.Color("muted"))
+        end
+    else
+        -- cached alt bag: its own tooltip when a link is cached.
+        local owner = Frame.ViewedOwner()
+        local c = owner and owner.containers and owner.containers[b._cid]
+        if c and c.link and GT.SetHyperlink then GT:SetHyperlink(c.link)
+        else GT:SetText("Bag " .. tostring(b._cid), UI.Color("text")) end
+    end
+    GT:Show()
+end
+
+-- Rebuild the bag-slot strip for the viewed owner. For the LIVE self it is the bag
+-- MANAGER (every equip slot 1..N incl. empty ones — drag/drop or click-with-cursor to
+-- equip/replace, drag-out to unequip). For a cached alt it is the old toggle-only list.
 function Frame.RebuildStrip()
     local win = Frame.window
     if not win or not UI then return end
     local owner = Frame.ViewedOwner()
     local db = Store.db
     local hidden = (db and db.hiddenBags) or {}
+    local live = (ns.Items and ns.Items.IsLive and ns.Items.IsLive(owner)) and true or false
 
     for _, b in ipairs(win._stripButtons) do b:Hide() end
 
-    -- ALL carried containers (ignore the hidden filter here — the strip needs to
-    -- show hidden ones too so they can be toggled back on).
-    local order = Frame.CarriedContainerOrder(owner, { showKeyring = Frame.KeyringEnabled() })
+    local slots = Frame.StripSlots(owner, { live = live, showKeyring = Frame.KeyringEnabled() })
     local x, SIZE, GAP = 0, Frame.STRIP_H, 4
-    for i, cid in ipairs(order) do
+    for i, entry in ipairs(slots) do
+        local cid = entry.cid
         local b = win._stripButtons[i]
         if not b then
             b = _G.CreateFrame("Button", nil, win.strip, "BackdropTemplate")
             b:SetSize(SIZE, SIZE)
+            b:RegisterForClicks("LeftButtonUp")
+            b:RegisterForDrag("LeftButton")
             local fs = b:CreateFontString(nil, "OVERLAY")
             fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
             fs:SetPoint("CENTER", b, "CENTER", 0, 0)
@@ -640,36 +845,78 @@ function Frame.RebuildStrip()
             ul:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 2, 1)
             ul:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 1)
             b._underline = ul
-            -- State-driven skin, registered ONCE (theme-reactive; re-run each rebuild
-            -- via b._applySkin() so pooled buttons never leak theme callbacks).
+            -- Faint "+" equip affordance for an empty slot — hover/drag only, NOT standing
+            -- decoration (BRAND_SPEC quiet-until-needed). Overlays the number when shown.
+            local plus = b:CreateFontString(nil, "OVERLAY")
+            plus:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+            plus:SetPoint("CENTER", b, "CENTER", 0, 0)
+            plus:SetText("+")
+            plus:Hide()
+            b._plus = plus
             b._applySkin = function()
                 local on = b._on and true or false
                 b:SetBackdrop(UI.FLAT_BACKDROP)
-                -- shown = calm raised parchment; hidden = recessed idle well.
+                -- shown bag = calm raised parchment; hidden/empty = recessed idle well.
                 b:SetBackdropColor(UI.Color(on and "raised" or "inset"))
                 b:SetBackdropBorderColor(UI.Color(on and "border" or "controlBorder"))
                 b._fs:SetTextColor(UI.Color(on and "text" or "faint"))
                 b._underline:SetColorTexture(UI.Color("bronze"))
                 b._underline:SetShown(on)
+                b._plus:SetTextColor(UI.Color("bronze"))
             end
             UI.Skin(b, function() if b._applySkin then b._applySkin() end end)
+            -- Hover: contextual tooltip + reveal the equip "+" on an empty slot.
+            b:SetScript("OnEnter", function(self)
+                stripTooltip(self)
+                local st = stripStateNow(self)
+                self._plus:SetShown(st.showPlus)
+                self._fs:SetShown(not st.showPlus)   -- "+" replaces the number while hovering an empty slot
+            end)
+            b:SetScript("OnLeave", function(self)
+                if _G.GameTooltip then _G.GameTooltip:Hide() end
+                self._plus:Hide()
+                self._fs:Show()
+            end)
+            -- Left-click: equip (cursor bag) / toggle (shown bag) / inert (empty) — combat-gated.
+            b:SetScript("OnClick", function(self)
+                local st = stripStateNow(self)
+                runStripAction(st.clickAction, self._cid, self._slot)
+            end)
+            -- Drop a bag onto the slot: equip/replace (native content swap), combat-gated.
+            b:SetScript("OnReceiveDrag", function(self)
+                local st = stripStateNow(self)
+                runStripAction(st.dropAction, self._cid, self._slot)
+            end)
+            -- Drag the equipped bag off the slot to unequip/swap, combat-gated.
+            b:SetScript("OnDragStart", function(self)
+                local st = stripStateNow(self)
+                runStripAction(st.dragAction, self._cid, self._slot)
+            end)
             win._stripButtons[i] = b
         end
-        b._cid = cid
+        b._cid        = cid
+        b._role       = entry.role
+        b._manageable = entry.manageable and true or false
+        b._slot       = entry.manageable and bagInventorySlot(cid) or nil
         b:ClearAllPoints()
         b:SetPoint("LEFT", win.strip, "LEFT", x, 0)
         x = x + SIZE + GAP
-        -- label: backpack "B", keyring "K", carried bags by number
+        -- label: backpack "B", keyring "K", carried bags by slot number
         local lbl = (cid == Store.BACKPACK_CONTAINER and "B")
                  or (cid == Store.KEYRING_CONTAINER  and "K")
                  or tostring(cid)
         b._fs:SetText(lbl)
-        b._on = not hidden[cid]
+        b._fs:Show()
+        b._plus:Hide()
+        -- "shown" (underline/raised) only when a bag actually occupies the slot and isn't hidden.
+        local equipped = b._manageable and (bagEquippedLink(b._slot) ~= nil)
+                      or (not b._manageable and owner and owner.containers and owner.containers[cid] ~= nil)
+        b._on = equipped and not hidden[cid]
         b._applySkin()
-        b:SetScript("OnClick", function(self)
-            db.hiddenBags[self._cid] = (not db.hiddenBags[self._cid]) or nil
-            Frame.Rebuild()
-        end)
+        -- Lock feedback: a bag mid-pickup desaturates (IsInventoryItemLocked).
+        if b._slot and _G.IsInventoryItemLocked and _G.IsInventoryItemLocked(b._slot) then
+            b._fs:SetTextColor(UI.Color("faint"))
+        end
         b:Show()
     end
 end
@@ -950,9 +1197,22 @@ end
 -- Login wiring (called by a future core.lua). Idempotent + guarded.
 ----------------------------------------------------------------------
 
+-- One frame drives the strip's live refresh: PLAYER_REGEN_ENABLED re-enables equip and
+-- clears the combat-blocked state; ITEM_LOCK_CHANGED reflects a bag mid-pickup/equip.
+-- (BAG_UPDATE already flows through capture -> BAGS_CAPTURED -> RequestRefresh.)
+function Frame.EnsureStripEvents()
+    if Frame._stripEvt or not _G.CreateFrame then return end
+    local f = _G.CreateFrame("Frame")
+    f:RegisterEvent("PLAYER_REGEN_ENABLED")
+    f:RegisterEvent("ITEM_LOCK_CHANGED")
+    f:SetScript("OnEvent", function() Frame.RequestRefresh() end)
+    Frame._stripEvt = f
+end
+
 function Frame.OnLogin()
     if Store and Store.db then Frame.ApplyDefaults(Store.db) end
     Frame.HookBagToggles()
+    Frame.EnsureStripEvents()
     -- Subscribe to W1 capture's store-updated event (capture.lua fires
     -- ns:Fire("BAGS_CAPTURED", nameRealm, owner)). The subscribe side is provided
     -- by core.lua's message bus; guard until it exists.  ⚠ CONTRACT FRICTION:
@@ -1181,6 +1441,83 @@ local function testEffectiveMode(fails)
     ck(Frame.EffectiveMode() == "split", "split is unaffected by the categories flag")
 end
 
+-- STRIP SLOT ENUMERATION (bag-manager fix): the LIVE self strip lists every equip slot
+-- 1..N — including EMPTY ones — so a newly-looted bag has a target (the owner's miss).
+-- A cached alt lists only owned bags, toggle-only.
+local function testStripSlots(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local o = fixtureOwner()   -- owns bags 1 and 2 (of a 4-slot inventory)
+
+    -- LIVE self: all 4 bag slots present + manageable, plus backpack/keyring toggles.
+    local live = Frame.StripSlots(o, { live = true, showKeyring = true, numBagSlots = 4 })
+    ck(#live == 6, "live strip = backpack + 4 bag slots + keyring, got " .. #live)
+    ck(live[1].cid == 0 and live[1].role == "backpack" and live[1].manageable == false, "backpack first, pure toggle")
+    ck(live[6].cid == Store.KEYRING_CONTAINER and live[6].role == "keyring" and live[6].manageable == false, "keyring last, pure toggle")
+    local bagCount, manageable = 0, 0
+    for i = 2, 5 do
+        ck(live[i].cid == i - 1 and live[i].role == "bag", "bag slot " .. (i - 1) .. " enumerated")
+        bagCount = bagCount + 1
+        if live[i].manageable then manageable = manageable + 1 end
+    end
+    ck(bagCount == 4 and manageable == 4, "all 4 bag slots present AND manageable (empty slots 3,4 included)")
+
+    -- keyring off drops the keyring entry.
+    local noKey = Frame.StripSlots(o, { live = true, showKeyring = false, numBagSlots = 4 })
+    ck(#noKey == 5 and noKey[#noKey].role == "bag", "showKeyring=false -> no keyring entry")
+
+    -- CACHED alt: only owned bags (1,2), none manageable.
+    local cached = Frame.StripSlots(o, { live = false, showKeyring = true, numBagSlots = 4 })
+    ck(#cached == 4, "cached strip = backpack + owned bags(1,2) + keyring, got " .. #cached)
+    ck(cached[2].cid == 1 and cached[3].cid == 2, "cached lists only owned bags, sorted")
+    for _, e in ipairs(cached) do ck(e.manageable == false, "cached entries are all toggle-only") end
+end
+
+-- STRIP BUTTON STATE MATRIX: equipped / empty / toggled × cursor-bag × combat, plus the
+-- backpack/keyring pure-toggle guarantee. Locks the equip/pickup/drop/toggle dispatch.
+local function testStripButtonState(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local S = Frame.StripButtonState
+
+    -- Empty manageable slot: shows the "+" affordance; a bare click is inert; a bag on
+    -- the cursor makes click AND drop equip; nothing to drag out.
+    local empty = S({ role = "bag", manageable = true, equipped = false })
+    ck(empty.showPlus == true, "empty slot shows the + equip affordance")
+    ck(empty.clickAction == "none", "empty slot, no cursor -> inert click")
+    ck(empty.dropAction == "equip", "empty slot -> drop equips")
+    ck(empty.dragAction == nil, "empty slot -> nothing to drag out")
+    local emptyCursor = S({ role = "bag", manageable = true, equipped = false, cursorBag = true })
+    ck(emptyCursor.clickAction == "equip", "empty slot + cursor bag -> click equips")
+
+    -- Equipped manageable slot: no "+"; bare click toggles hide/show; cursor bag replaces;
+    -- drag out picks up the equipped bag.
+    local eq = S({ role = "bag", manageable = true, equipped = true })
+    ck(eq.showPlus == false, "equipped slot has no + affordance")
+    ck(eq.clickAction == "toggle", "equipped slot, no cursor -> click toggles hide/show")
+    ck(eq.dragAction == "pickup", "equipped slot -> drag picks up the bag")
+    local eqCursor = S({ role = "bag", manageable = true, equipped = true, cursorBag = true })
+    ck(eqCursor.clickAction == "equip", "equipped slot + cursor bag -> click replaces")
+
+    -- COMBAT downgrades every equip/pickup to blocked-combat (deferred, not attempted).
+    local combatEmpty = S({ role = "bag", manageable = true, equipped = false, cursorBag = true, inCombat = true })
+    ck(combatEmpty.clickAction == "blocked-combat" and combatEmpty.dropAction == "blocked-combat",
+        "combat: equip/drop deferred (blocked)")
+    local combatEq = S({ role = "bag", manageable = true, equipped = true, inCombat = true })
+    ck(combatEq.dragAction == "blocked-combat", "combat: pickup deferred (blocked)")
+    ck(combatEq.clickAction == "toggle", "combat still allows the (non-protected) hide/show toggle")
+
+    -- Backpack + keyring are PURE toggles regardless of cursor/equip (never equippable).
+    for _, role in ipairs({ "backpack", "keyring" }) do
+        local t = S({ role = role, manageable = false, equipped = true, cursorBag = true })
+        ck(t.clickAction == "toggle", role .. " is a pure toggle even with a bag on the cursor")
+        ck(t.showPlus == false and t.dragAction == nil and t.dropAction == nil, role .. " exposes no equip affordance")
+    end
+
+    -- Cached alt bag: manageable=false -> toggle-only, no equip/drag/plus.
+    local cachedBag = S({ role = "bag", manageable = false, equipped = true, cursorBag = true })
+    ck(cachedBag.clickAction == "toggle" and cachedBag.dropAction == nil and cachedBag.showPlus == false,
+        "cached alt bag is toggle-only")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "container order",     fn = testContainerOrder },
@@ -1193,6 +1530,8 @@ function Frame.RunSelfTests(verbose)
         { name = "keyring dynamic size", fn = testKeyringDynamicSize },
         { name = "category section size", fn = testCategorySectionSize },
         { name = "effective mode",       fn = testEffectiveMode },
+        { name = "strip slots",          fn = testStripSlots },
+        { name = "strip button state",   fn = testStripButtonState },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
