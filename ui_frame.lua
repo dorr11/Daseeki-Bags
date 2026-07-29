@@ -322,8 +322,13 @@ function Frame.Ensure()
     UI.Skin(win, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
         self:SetBackdropColor(UI.Color("ground"))
-        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        -- Dark edge under the bronze keyline; borderLite was the beta's bright-rim
+        -- culprit (§1), so the visible frame edge is the aged keyline, not this.
+        self:SetBackdropBorderColor(UI.Color("border"))
     end)
+    -- Field Ledger material (BRAND_SPEC §4): grain substrate + aged-edge vignette +
+    -- ONE bronze keyline. Guarded — a Core without the Phase-0 kit simply skips it.
+    if UI.PaintLedgerGround then UI.PaintLedgerGround(win) end
     -- ESC closes it (FrameXML special-frame list; proven by Daseeki-Core hub).
     if _G.UISpecialFrames then table.insert(_G.UISpecialFrames, WINDOW_NAME) end
 
@@ -341,9 +346,19 @@ function Frame.Ensure()
     tbBg:SetPoint("BOTTOMRIGHT", titleBar, "BOTTOMRIGHT", -1, 0)
     UI.Skin(tbBg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
+    -- Maker's mark — the ONE diamond on this window (BRAND_SPEC §4/§5), titlebar
+    -- only. Bank/keyring (W3) each get their own single mark.
+    local mark
+    if UI.MakerMark then
+        mark = UI.MakerMark(titleBar, { size = 18 })
+        mark:SetPoint("LEFT", titleBar, "LEFT", 8, 0)
+        win.makerMark = mark
+    end
+
     local title = titleBar:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.header)
-    title:SetPoint("LEFT", titleBar, "LEFT", 10, 0)
+    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)   -- MORPHEUS wordmark (§3)
+    if mark then title:SetPoint("LEFT", mark, "RIGHT", 8, 0)
+    else         title:SetPoint("LEFT", titleBar, "LEFT", 10, 0) end
     title:SetText("Bags")
     win.title = title
 
@@ -358,11 +373,19 @@ function Frame.Ensure()
     closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
     closeBtn:SetScript("OnClick", function() Frame.Close() end)
 
-    local titleRule = win:CreateTexture(nil, "ARTWORK")
-    titleRule:SetHeight(1)
+    -- One entry-head hairline under the titlebar (§3), pixel-snapped when the
+    -- Phase-0 kit is present so it stays crisp at 720p; plain texture otherwise.
+    local titleRule
+    if UI.Hairline then
+        titleRule = UI.Hairline(win, { token = "borderLite", layer = "ARTWORK" })
+    else
+        titleRule = win:CreateTexture(nil, "ARTWORK")
+        titleRule:SetHeight(1)
+        UI.Skin(titleRule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+    end
     titleRule:SetPoint("TOPLEFT", win, "TOPLEFT", 1, -TITLE_H)
     titleRule:SetPoint("TOPRIGHT", win, "TOPRIGHT", -1, -TITLE_H)
-    UI.Skin(titleRule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
+    win.titleRule = titleRule
 
     -- ── Toolbar: layout toggle + owner stub + search placeholder ──────────────
     local toolbar = _G.CreateFrame("Frame", nil, win)
@@ -403,9 +426,9 @@ function Frame.Ensure()
     end)
     search:SetScript("OnEnterPressed",  function(self) self:ClearFocus() end)
     local searchHint = search:CreateFontString(nil, "ARTWORK")
-    searchHint:SetFontObject(UI.fonts.small)
+    searchHint:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
     searchHint:SetPoint("LEFT", search, "LEFT", 0, 0)
-    searchHint:SetText("Search…")
+    searchHint:SetText("Search")                                       -- plain copy (§6)
     UI.Skin(searchHint, function(self) self:SetTextColor(UI.Color("faint")) end)
     -- W4: as-you-type -> debounced dim filter across BOTH layouts (ns.Search).
     search:SetScript("OnTextChanged", function(self)
@@ -433,6 +456,15 @@ function Frame.Ensure()
     win.strip = strip
     win._stripButtons = {}
 
+    -- One section hairline separating the toggle strip from the grid (§3/§9 budget:
+    -- titlebar + strip = two rules total).
+    if UI.Hairline then
+        local stripRule = UI.Hairline(win, { token = "border", layer = "ARTWORK" })
+        stripRule:SetPoint("TOPLEFT", strip, "BOTTOMLEFT", 0, -math.floor(Frame.VGAP / 2))
+        stripRule:SetPoint("TOPRIGHT", strip, "BOTTOMRIGHT", 0, -math.floor(Frame.VGAP / 2))
+        win.stripRule = stripRule
+    end
+
     -- ── Content host (the grid area) ──────────────────────────────────────────
     local content = _G.CreateFrame("Frame", nil, win)
     content:SetPoint("TOPLEFT", strip, "BOTTOMLEFT", 0, -Frame.VGAP)
@@ -445,9 +477,11 @@ function Frame.Ensure()
     money:SetSize(160, Frame.MONEY_H)
     money:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
     local moneyFS = money:CreateFontString(nil, "OVERLAY")
-    moneyFS:SetFontObject(UI.fonts.body)
+    moneyFS:SetFontObject(UI.fonts.numeral or UI.fonts.body)   -- ARIALN numerals (§3)
     moneyFS:SetPoint("RIGHT", money, "RIGHT", 0, 0)
     moneyFS:SetJustifyH("RIGHT")
+    -- Warm cream, not bright white — "gold is sacred" but rendered on-brand (§2/§3).
+    UI.Skin(moneyFS, function(self) self:SetTextColor(UI.Color("text")) end)
     money:SetScript("OnEnter", function(self)
         _G.GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         _G.GameTooltip:AddLine("Gold", UI.Color("text"))
@@ -489,9 +523,29 @@ function Frame.RebuildStrip()
             b = _G.CreateFrame("Button", nil, win.strip, "BackdropTemplate")
             b:SetSize(SIZE, SIZE)
             local fs = b:CreateFontString(nil, "OVERLAY")
-            fs:SetFontObject(UI.fonts.small)
+            fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
             fs:SetPoint("CENTER", b, "CENTER", 0, 0)
             b._fs = fs
+            -- Thin bronze underline, shown ONLY in the active (bag-shown) state — the
+            -- quiet marker that replaces the crimson accent wash (§3, attention inversion).
+            local ul = b:CreateTexture(nil, "OVERLAY")
+            ul:SetHeight(1)
+            ul:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 2, 1)
+            ul:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 1)
+            b._underline = ul
+            -- State-driven skin, registered ONCE (theme-reactive; re-run each rebuild
+            -- via b._applySkin() so pooled buttons never leak theme callbacks).
+            b._applySkin = function()
+                local on = b._on and true or false
+                b:SetBackdrop(UI.FLAT_BACKDROP)
+                -- shown = calm raised parchment; hidden = recessed idle well.
+                b:SetBackdropColor(UI.Color(on and "raised" or "inset"))
+                b:SetBackdropBorderColor(UI.Color(on and "border" or "controlBorder"))
+                b._fs:SetTextColor(UI.Color(on and "text" or "faint"))
+                b._underline:SetColorTexture(UI.Color("bronze"))
+                b._underline:SetShown(on)
+            end
+            UI.Skin(b, function() if b._applySkin then b._applySkin() end end)
             win._stripButtons[i] = b
         end
         b._cid = cid
@@ -503,12 +557,8 @@ function Frame.RebuildStrip()
                  or (cid == Store.KEYRING_CONTAINER  and "K")
                  or tostring(cid)
         b._fs:SetText(lbl)
-        local on = not hidden[cid]
-        UI.Skin(b, function(self)
-            self:SetBackdrop(UI.FLAT_BACKDROP)
-            self:SetBackdropColor(UI.Color(on and "accent" or "control", on and 0.28 or 1))
-            self:SetBackdropBorderColor(UI.Color(on and "accent" or "controlBorder"))
-        end)
+        b._on = not hidden[cid]
+        b._applySkin()
         b:SetScript("OnClick", function(self)
             db.hiddenBags[self._cid] = (not db.hiddenBags[self._cid]) or nil
             Frame.Rebuild()
@@ -633,6 +683,18 @@ end
 
 function Frame.IsShown()
     return Frame.window and Frame.window:IsShown() and true or false
+end
+
+-- Set the search box text (published surface for ns.Features Alt-click flash-find).
+-- SetText fires the box's OnTextChanged, which drives ns.Search; the highlight is
+-- the visible "flash". No-op before the window exists / headless.
+function Frame.SetSearch(text)
+    local win = Frame.window
+    if not win or not win.searchBox then return end
+    text = text or ""
+    win.searchBox:SetText(text)
+    if win.searchBox.HighlightText then win.searchBox:HighlightText() end
+    if win.searchBox.SetCursorPosition then win.searchBox:SetCursorPosition(#text) end
 end
 
 -- Live combined<->split switch (D3): persist + rebuild, no reload.

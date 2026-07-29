@@ -28,7 +28,10 @@ migrate.lua
 borders.lua
 ui_items.lua
 ui_frame.lua
-# --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
+# --- W4 (search / sort / options / features) --- pure engines + DaseekiUI page ---
 search.lua
 sort.lua
 options.lua
+# features.lua: tooltip cross-char counts, event auto-display, Alt-click flash-find
+# (self-wires on the core bus; consumes ns.Store / ns.Frame / ns.Search surfaces).
+features.lua

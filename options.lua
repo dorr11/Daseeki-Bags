@@ -142,6 +142,41 @@ function Options.Build(flow)
         end,
     })
     sorting:Hint("Or click the Sort button in the bag window's toolbar. Bank sorting arrives with the bank view.")
+
+    -- ── Auto-open ───────────────────────────────────────────────────────────────
+    -- Open the bags automatically at these interactions and close them after —
+    -- the ns.Features auto-display set (audit §1.5). All default ON, matching 1.x.
+    -- Reads/writes DaseekiBags2DB.autoDisplay.* (defaults applied by Features on
+    -- STORE_READY); a missing/true sub-key = enabled, only explicit false disables.
+    local auto = flow:AddSection("Auto-open")
+    auto:Hint("Show the bags automatically at the merchant, bank and mailbox — and hide them again after.")
+
+    local function adGet(key)
+        local db = DB(); local ad = db and db.autoDisplay
+        return not ad or ad[key] ~= false
+    end
+    local function adSet(key, v)
+        local db = DB(); if not db then return end
+        if type(db.autoDisplay) ~= "table" then db.autoDisplay = {} end
+        db.autoDisplay[key] = v and true or false
+    end
+
+    register(auto:Checkbox({
+        label = "At the merchant", tooltip = "Open the bags when you talk to a vendor.",
+        get = function() return adGet("merchant") end, set = function(v) adSet("merchant", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "At the bank", tooltip = "Open the bags when you open the bank.",
+        get = function() return adGet("bank") end, set = function(v) adSet("bank", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "At the mailbox", tooltip = "Open the bags when you open the mail.",
+        get = function() return adGet("mail") end, set = function(v) adSet("mail", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "Close when combat starts", tooltip = "Hide the bags when you enter combat.",
+        get = function() return adGet("combatClose") end, set = function(v) adSet("combatClose", v) end,
+    }).Refresh)
 end
 
 ----------------------------------------------------------------------
