@@ -87,11 +87,10 @@ end
 -- core.lua loads FIRST — it provides the ns runtime the other files consume at
 -- load time (ns:RegisterSelfTest, ns:RegisterEvent, ns:On/Fire). It is headless-
 -- safe (CreateFrame / SlashCmdList / geterrorhandler are all guarded).
--- W2 adds ui_frame.lua (window side). Its self-tests are PURE (no CreateFrame at
--- file scope; every frame call is guarded inside an in-game-only function), so it
--- loads and self-tests cleanly under the headless stub. The sibling's ui_items.lua
--- / borders.lua are appended by their own harness edit (hand-merged by the owner).
-local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua", "ui_frame.lua" }
+-- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
+-- attach borders at paint), then ui_frame last (it consumes ns.Items).
+local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua",
+                    "borders.lua", "ui_items.lua", "ui_frame.lua" }
 for _, f in ipairs(TOC_ORDER) do loadAddon(f) end
 
 -- core.lua's Print prefixes chat color-escape codes; re-point it to the captured
