@@ -396,15 +396,34 @@ function Frame.Ensure()
     search:SetPoint("BOTTOMRIGHT", searchWrap, "BOTTOMRIGHT", -6, 0)
     search:SetAutoFocus(false)
     search:SetFontObject(UI.fonts.body)
-    search:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+    search:SetScript("OnEscapePressed", function(self)
+        self:SetText("")                                   -- clear + restore all items
+        if ns.Search then ns.Search.SetQuery("") end
+        self:ClearFocus()
+    end)
     search:SetScript("OnEnterPressed",  function(self) self:ClearFocus() end)
     local searchHint = search:CreateFontString(nil, "ARTWORK")
     searchHint:SetFontObject(UI.fonts.small)
     searchHint:SetPoint("LEFT", search, "LEFT", 0, 0)
     searchHint:SetText("Search…")
     UI.Skin(searchHint, function(self) self:SetTextColor(UI.Color("faint")) end)
-    search:SetScript("OnTextChanged", function(self) searchHint:SetShown(self:GetText() == "") end)
+    -- W4: as-you-type -> debounced dim filter across BOTH layouts (ns.Search).
+    search:SetScript("OnTextChanged", function(self)
+        local text = self:GetText()
+        searchHint:SetShown(text == "")
+        if ns.Search then ns.Search.SetQuery(text) end
+    end)
     win.searchBox = search
+
+    -- Sort button (W4): arrange the carried bags via the sort engine (ns.Sort).
+    local sortBtn = UI.MakeButton(toolbar, {
+        text = "Sort", width = 52,
+        onClick = function()
+            if ns.Sort and ns.Sort.Run then ns.Sort.Run(ns.Sort.CarriedBagIDs()) end
+        end,
+    })
+    sortBtn:SetPoint("RIGHT", searchWrap, "LEFT", -6, 0)
+    win.sortBtn = sortBtn
 
     -- ── Bag-slot toggle strip (show/hide a container's slots) ─────────────────
     local strip = _G.CreateFrame("Frame", nil, win)
@@ -516,6 +535,17 @@ local function releaseGroupsFrom(win, fromIndex)
     end
 end
 
+-- W4 wiring: iterate every live item button across BOTH layouts (all pooled
+-- ns.Items groups). The search controller uses this to dim non-matching slots.
+function Frame.ForEachButton(fn)
+    local win = Frame.window
+    if not win or not win._groups then return end
+    for _, g in ipairs(win._groups) do
+        local btns = g and g._buttons
+        if btns then for i = 1, #btns do fn(btns[i]) end end
+    end
+end
+
 -- The core repaint: derive entry lists for the active layout, feed ns.Items,
 -- position the group(s), and size the window to the pure math. Degrades to a
 -- chrome-only window when ns.Items is absent (sibling not merged yet).
@@ -575,6 +605,9 @@ function Frame.Rebuild()
     -- Window self-size (pure math => never zero-sized).
     local sz = Frame.ComputeWindowSize(owner, layout, opts)
     win:SetSize(sz.width, sz.height)
+
+    -- W4: re-apply the active search dim to the freshly-painted buttons.
+    if ns.Search and ns.Search.Reapply then ns.Search.Reapply() end
 end
 
 ----------------------------------------------------------------------

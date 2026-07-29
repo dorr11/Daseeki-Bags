@@ -90,7 +90,8 @@ end
 -- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
 -- attach borders at paint), then ui_frame last (it consumes ns.Items).
 local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua",
-                    "borders.lua", "ui_items.lua", "ui_frame.lua" }
+                    "borders.lua", "ui_items.lua", "ui_frame.lua",
+                    "search.lua", "sort.lua", "options.lua" }
 for _, f in ipairs(TOC_ORDER) do loadAddon(f) end
 
 -- core.lua's Print prefixes chat color-escape codes; re-point it to the captured

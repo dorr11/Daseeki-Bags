@@ -28,3 +28,7 @@ migrate.lua       # one-time read-only conversion of the 1.x SV
 borders.lua       # quality borders (loads before ui_items; buttons attach at paint)
 ui_items.lua      # item buttons + grid groups (ns.Items contract)
 ui_frame.lua      # the inventory window (consumes ns.Items; DaseekiUI-skinned)
+# --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
+search.lua        # D4 owned search matcher + live dim controller (both layouts)
+sort.lua          # sort engine: pure move planner + throttled, verified executor
+options.lua       # DaseekiUI settings page (Core-gated) + additive qualityBorders default
