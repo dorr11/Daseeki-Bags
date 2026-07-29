@@ -108,6 +108,14 @@ function Options.Build(flow)
         set = function(v) local db = DB(); if db then db.showKeyring = v and true or false end regrid() end,
     }).Refresh)
 
+    -- ── Categories ──────────────────────────────────────────────────────────────
+    -- The simplified custom-categories editor (BAGS2 GAP §6.4-6.5, D1-KEEP). A
+    -- category is a saved SEARCH QUERY; the combined view groups items into labelled
+    -- sections by first-match-wins. SPLIT layout is unaffected. All the reorder / add /
+    -- delete / rename / enable LOGIC lives in the pure rules2 engine (unit-tested); this
+    -- page is a thin DaseekiUI wiring over ns.Rules + a live "matches N" readout.
+    if ns.Rules then Options.BuildCategories(flow) end
+
     -- ── Grid ──────────────────────────────────────────────────────────────────
     local grid = flow:AddSection("Grid")
     grid:Hint("Slot size and spacing. Changes re-grid the open window instantly.")
@@ -177,6 +185,173 @@ function Options.Build(flow)
         label = "Close when combat starts", tooltip = "Hide the bags when you enter combat.",
         get = function() return adGet("combatClose") end, set = function(v) adSet("combatClose", v) end,
     }).Refresh)
+end
+
+----------------------------------------------------------------------
+-- Categories editor (list + inline editor; logic delegated to ns.Rules)
+--
+-- Master toggle + a selectable list of categories with an inline editor for the
+-- selected one (Enabled / Move Up / Move Down / Delete, Name, Query + a live
+-- "matches N items" readout). Add / Restore defaults below the list. Every button
+-- calls a PURE ns.Rules op then re-grids the bag window — no reload, no drag-drop
+-- builder, no per-category color (theme owns color): the "simplified" contract.
+----------------------------------------------------------------------
+
+local catSel = 1   -- selected category index (1-based into DB().categories)
+
+-- The viewed owner's combined entry list, for the live match count.
+local function viewedEntries()
+    if not (ns.Frame and ns.Frame.BuildCombinedEntries and ns.Frame.ViewedOwner) then return {} end
+    local owner = ns.Frame.ViewedOwner()
+    if not owner then return {} end
+    local db = DB()
+    return ns.Frame.BuildCombinedEntries(owner, { showKeyring = true, hidden = (db and db.hiddenBags) or {} })
+end
+
+local function catList()
+    local db = DB()
+    return (db and db.categories) or {}
+end
+
+local function selectedCat()
+    local list = catList()
+    return list[catSel]
+end
+
+function Options.BuildCategories(flow)
+    local UI = _G.DaseekiUI
+    local Rules = ns.Rules
+    local sec = flow:AddSection("Categories")
+    sec:Hint("Group items into labelled sections in the combined view. Categories start fresh in 2.0 (1.x custom rules are not imported). Split layout is unaffected.")
+
+    -- Master toggle: group vs flat grid. Re-grids live.
+    register(sec:Checkbox({
+        label = "Group items into categories",
+        tooltip = "When on, the combined view stacks labelled category sections. Turn off for one flat grid.",
+        get = function() local db = DB(); return Rules.Enabled(db) end,
+        set = function(v) local db = DB(); if db then db.categoriesEnabled = v and true or false end regrid() end,
+    }).Refresh)
+
+    -- References resolved as controls are created; the editor + list refresh together.
+    local list, nameField, queryField, enableBox, countHint
+
+    local function refreshEditor()
+        local c = selectedCat()
+        if nameField  and nameField.Refresh  then nameField.Refresh()  end
+        if queryField and queryField.Refresh then queryField.Refresh() end
+        if enableBox  and enableBox.Refresh  then enableBox.Refresh()  end
+        if countHint and countHint._label then
+            if c then
+                local n = Rules.LiveCountMatches(c.query or "", viewedEntries())
+                countHint._label:SetText("Matches " .. n .. " item" .. (n == 1 and "" or "s") .. " in your bags now.")
+            else
+                countHint._label:SetText("No category selected.")
+            end
+        end
+    end
+
+    local function refreshAllCats()
+        if list and list.Rebuild then list:Rebuild() end
+        refreshEditor()
+    end
+
+    -- Selectable category list (value = index). Disabled rows read as faint + "(off)".
+    list = sec:List({
+        height = 150,
+        selected = catSel,
+        items = function()
+            local out = {}
+            for i, c in ipairs(catList()) do
+                local on = c.enabled ~= false
+                out[#out + 1] = {
+                    text   = (on and "" or "(off)  ") .. (c.name or ("Category " .. i)),
+                    value  = i,
+                    status = on and "ok" or "faint",
+                }
+            end
+            if #out == 0 then out[#out + 1] = { header = true, text = "NO CATEGORIES — everything shows under \"Everything else\"" } end
+            return out
+        end,
+        onSelect = function(i) catSel = i; refreshEditor() end,
+    })
+
+    -- Add / Restore defaults.
+    local mgmt = sec:AddRow()
+    mgmt:Button({ text = "Add Category", width = 120, onClick = function()
+        local _, idx = Rules.Add(catList(), "New Category", "")
+        catSel = idx or catSel
+        if list and list.SetSelected then list:SetSelected(catSel) end
+        refreshAllCats(); regrid()
+    end })
+    mgmt:Button({ text = "Restore Defaults", width = 140, variant = "quiet", onClick = function()
+        local db = DB(); if not db then return end
+        Rules.RestoreDefaults(db)
+        catSel = 1
+        if list and list.SetSelected then list:SetSelected(catSel) end
+        refreshAllCats(); regrid()
+    end })
+
+    -- ── Inline editor for the selected category ────────────────────────────────
+    sec:Hint("Edit the selected category:")
+
+    local actions = sec:AddRow({ vAlign = "center" })
+    enableBox = actions:Checkbox({
+        label = "Enabled",
+        tooltip = "Uncheck to skip this category without deleting it.",
+        get = function() local c = selectedCat(); return c ~= nil and c.enabled ~= false end,
+        set = function(v)
+            local i = catSel
+            Rules.SetEnabled(catList(), i, v)
+            refreshAllCats(); regrid()
+        end,
+    })
+    actions:Button({ text = "Move Up", width = 90, onClick = function()
+        catSel = Rules.MoveUp(catList(), catSel)
+        if list and list.SetSelected then list:SetSelected(catSel) end
+        refreshAllCats(); regrid()
+    end })
+    actions:Button({ text = "Move Down", width = 100, onClick = function()
+        catSel = Rules.MoveDown(catList(), catSel)
+        if list and list.SetSelected then list:SetSelected(catSel) end
+        refreshAllCats(); regrid()
+    end })
+    actions:Button({ text = "Delete", width = 80, variant = "danger", onClick = function()
+        Rules.Delete(catList(), catSel)
+        if catSel > #catList() then catSel = math.max(1, #catList()) end
+        if list and list.SetSelected then list:SetSelected(catSel) end
+        refreshAllCats(); regrid()
+    end })
+
+    local nameRow = sec:AddRow({ vAlign = "center" })
+    nameRow:Label("Name")
+    nameField = nameRow:EditBox({
+        width = 220,
+        get = function() local c = selectedCat(); return c and c.name or "" end,
+        set = function(v)
+            local i = catSel
+            Rules.Rename(catList(), i, (v ~= "" and v) or "Category " .. i)
+            refreshAllCats()
+        end,
+    })
+    nameField._fillWidth = false
+
+    local queryRow = sec:AddRow({ vAlign = "center" })
+    queryRow:Label("Query")
+    queryField = queryRow:EditBox({
+        width = 300,
+        get = function() local c = selectedCat(); return c and c.query or "" end,
+        set = function(v)
+            Rules.SetQuery(catList(), catSel, v)
+            refreshEditor(); regrid()
+        end,
+    })
+    queryField._fillWidth = false
+
+    countHint = sec:Hint("Matches 0 items in your bags now.")
+    sec:Hint("Query = a search: t:consumable, q:>=3, slot:head, or item names. Specials: junk (grey items), new. Comma = OR (e.g. \"t:armor, t:weapon\"). First matching category wins, top to bottom.")
+
+    -- keep the whole editor in sync when the page (re)shows
+    register(refreshEditor)
 end
 
 ----------------------------------------------------------------------

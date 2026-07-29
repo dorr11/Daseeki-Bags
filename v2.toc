@@ -35,6 +35,11 @@ ui_owner.lua
 ui_bank.lua
 # --- W4 (search / sort / options / features) --- pure engines + DaseekiUI page ---
 search.lua
+# rules2: simplified custom-categories engine (a category = a saved search query;
+# reuses the search.lua matcher). Consumed by ui_frame (combined-view sections)
+# and options.lua (the editor). Loads after search.lua (its matcher) so the
+# self-tests can exercise the delegated grammar.
+rules2.lua
 sort.lua
 # ui_find: cross-character Find window (consumes ns.Search matcher, ns.Frame/ns.Bank)
 ui_find.lua

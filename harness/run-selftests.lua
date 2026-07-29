@@ -92,7 +92,7 @@ end
 local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua",
                     "borders.lua", "ui_items.lua", "ui_frame.lua",
                     "ui_owner.lua", "ui_bank.lua",
-                    "search.lua", "sort.lua", "ui_find.lua", "options.lua", "features.lua" }
+                    "search.lua", "rules2.lua", "sort.lua", "ui_find.lua", "options.lua", "features.lua" }
 for _, f in ipairs(TOC_ORDER) do loadAddon(f) end
 
 -- core.lua's Print prefixes chat color-escape codes; re-point it to the captured

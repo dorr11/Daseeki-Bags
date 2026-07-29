@@ -65,6 +65,11 @@ Frame.MONEY_H     = 20   -- bottom money bar
 Frame.VGAP        = 8     -- vertical gap between chrome bands
 Frame.GROUP_HDR_H = 16   -- small per-bag header (split layout)
 Frame.GROUP_GAP   = 8    -- vertical gap between split groups
+-- Category-section chrome (combined-with-categories, W4.5). Same footprint as the
+-- split group header/gap so the shared grid math stays identical; kept separate so
+-- the two can be tuned independently.
+Frame.SECTION_HDR_H = 16 -- microLabel + count header above each category section
+Frame.SECTION_GAP   = 8  -- vertical gap between category sections
 
 -- Settings accessors (guarded; the store owns the DB). These read the live
 -- DaseekiBags2DB when present, else the documented defaults — so the pure math
@@ -74,6 +79,25 @@ function Frame.ButtonSize()  local db = Store and Store.db; return (db and db.bu
 function Frame.Gap()         local db = Store and Store.db; return (db and db.gap)        or Frame.DEFAULT_GAP        end
 function Frame.Layout()      local db = Store and Store.db; return (db and db.layout)     or "combined"              end
 function Frame.ShowKeyring() local db = Store and Store.db; if db and db.showKeyring ~= nil then return db.showKeyring end return true end
+
+-- W4.5: the combined view groups items into category SECTIONS when the categories
+-- feature is on AND the rules2 engine is present. SPLIT is UNAFFECTED (bags are the
+-- sections there). The additive DB flag (default ON) is owned by rules2.ApplyDefaults;
+-- absence/nil reads as ON so behaviour is identical with or without a saved value.
+function Frame.CategoriesEnabled()
+    if not (ns.Rules and ns.Rules.SectionsForRender) then return false end
+    local db = Store and Store.db
+    if ns.Rules.Enabled then return ns.Rules.Enabled(db) end
+    return not (db and db.categoriesEnabled == false)
+end
+
+-- The effective render mode: "split" (unchanged), "categories" (combined + sections),
+-- or "combined" (the flat cid-ordered grid). Categories apply only to combined.
+function Frame.EffectiveMode()
+    if Frame.Layout() == "split" then return "split" end
+    if Frame.CategoriesEnabled() then return "categories" end
+    return "combined"
+end
 
 -- Additive-defaults hook: fills any W2 settings keys the W1 store didn't know
 -- about. Called from OnLogin after Store.Init(). Never clobbers existing values.
@@ -191,6 +215,20 @@ function Frame.ComputeContentSize(owner, layout, opts)
     local bs      = opts.buttonSize or Frame.ButtonSize()
     local gap     = opts.gap        or Frame.Gap()
     local bandW   = Frame.GridDims(0, columns, bs, gap).width  -- full-band width
+
+    -- Category sections (W4.5): when a prebuilt section list is supplied, size from
+    -- it — each section is a microLabel header band + its own grid, stacked. Empty
+    -- sections are already omitted by the builder (collapse). Takes precedence over
+    -- the layout branches so it composes with layout == "combined".
+    if opts.sections then
+        local h = 0
+        for i, s in ipairs(opts.sections) do
+            if i > 1 then h = h + Frame.SECTION_GAP end
+            local gd = Frame.GridDims(#s.entries, columns, bs, gap)
+            h = h + Frame.SECTION_HDR_H + gd.height
+        end
+        return { width = bandW, height = h }
+    end
 
     if layout == "split" then
         local groups = Frame.BuildSplitGroups(owner, opts)
@@ -654,6 +692,43 @@ local function releaseGroupsFrom(win, fromIndex)
     end
 end
 
+-- Acquire a pooled category-section header (microLabel name + muted count), a plain
+-- FontString band drawn by ui_frame — the item grid's own G:SetHeader is bag-specific
+-- (ui_items owns it, untouched here), so category headers live on the window side.
+local function acquireSectionHeader(win, index)
+    win._sectionHeaders = win._sectionHeaders or {}
+    local h = win._sectionHeaders[index]
+    if not h then
+        h = _G.CreateFrame("Frame", nil, win.content)
+        h:SetHeight(Frame.SECTION_HDR_H)
+        local name = h:CreateFontString(nil, "OVERLAY")
+        name:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
+        name:SetPoint("LEFT", h, "LEFT", 0, 0)
+        name:SetJustifyH("LEFT")
+        h._name = name
+        local count = h:CreateFontString(nil, "OVERLAY")
+        count:SetFontObject(UI.fonts.numeral or UI.fonts.small)     -- ARIALN numeral (§3)
+        count:SetPoint("RIGHT", h, "RIGHT", 0, 0)
+        count:SetJustifyH("RIGHT")
+        h._count = count
+        -- theme-reactive colors, registered once (attention inversion: calm muted)
+        UI.Skin(h, function()
+            h._name:SetTextColor(UI.Color("muted"))
+            h._count:SetTextColor(UI.Color("faint"))
+        end)
+        win._sectionHeaders[index] = h
+    end
+    return h
+end
+
+local function releaseSectionHeadersFrom(win, fromIndex)
+    if not win._sectionHeaders then return end
+    for i = fromIndex, #win._sectionHeaders do
+        local h = win._sectionHeaders[i]
+        if h then h:Hide() end
+    end
+end
+
 -- W4 wiring: iterate every live item button across BOTH layouts (all pooled
 -- ns.Items groups). The search controller uses this to dim non-matching slots.
 function Frame.ForEachButton(fn)
@@ -689,12 +764,52 @@ function Frame.Rebuild()
 
     Frame.RebuildStrip()
 
+    -- W4.5: in combined mode with categories on, bucket the combined entry list into
+    -- category sections up front. SPLIT is unaffected. When the engine yields sections
+    -- they drive both the pure size math (opts.sections) and the render loop below.
+    local mode = Frame.EffectiveMode()
+    local sections
+    if mode == "categories" then
+        local entries = Frame.BuildCombinedEntries(owner, opts)
+        sections = ns.Rules.SectionsForRender(entries, true)   -- includeFree => drop cells
+        opts.sections = sections
+    end
+
     -- Content sizing from the PURE math (never depends on the item frame).
     local content = Frame.ComputeContentSize(owner, layout, opts)
     win.content:SetSize(math.max(content.width, 1), math.max(content.height, 1))
 
     if ns.Items and ns.Items.CreateGroup then
-        if layout == "split" then
+        if mode == "categories" then
+            -- One pooled ns.Items group per category section, stacked vertically, each
+            -- under a window-drawn microLabel+count header. A section's entries are
+            -- mixed-cid (per-container identity preserved on every entry — D3 law); the
+            -- item grid parents each live button to its own cid holder internally, so a
+            -- single group renders items from many bags correctly. Empty sections are
+            -- already omitted by the builder (collapse).
+            local y = 0
+            for i, s in ipairs(sections) do
+                local g = acquireGroup(win, i)
+                if g.SetHeader then g:SetHeader(nil) end   -- clear any split bag-header on a reused group
+                g:SetGrid(cols, bs, gap)
+                g:ClearAllPoints()
+                g:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, -(y + Frame.SECTION_HDR_H))
+                g:ShowSlots(s.entries)
+                if g.Show then g:Show() end
+                -- window-drawn section header (name + count)
+                local hdr = acquireSectionHeader(win, i)
+                hdr:ClearAllPoints()
+                hdr:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, -y)
+                hdr:SetPoint("TOPRIGHT", win.content, "TOPRIGHT", 0, -y)
+                hdr._name:SetText(s.name)
+                hdr._count:SetText(tostring(s.count))
+                hdr:Show()
+                local gd = Frame.GridDims(#s.entries, cols, bs, gap)
+                y = y + Frame.SECTION_HDR_H + gd.height + Frame.SECTION_GAP
+            end
+            releaseGroupsFrom(win, #sections + 1)
+            releaseSectionHeadersFrom(win, #sections + 1)
+        elseif layout == "split" then
             local groups = Frame.BuildSplitGroups(owner, opts)
             local y = 0
             for i, grp in ipairs(groups) do
@@ -710,6 +825,7 @@ function Frame.Rebuild()
                 y = y + Frame.GROUP_HDR_H + gd.height + Frame.GROUP_GAP
             end
             releaseGroupsFrom(win, #groups + 1)
+            releaseSectionHeadersFrom(win, 1)   -- no category headers in split mode
         else
             local entries = Frame.BuildCombinedEntries(owner, opts)
             local g = acquireGroup(win, 1)
@@ -719,6 +835,7 @@ function Frame.Rebuild()
             g:ShowSlots(entries)
             if g.Show then g:Show() end
             releaseGroupsFrom(win, 2)
+            releaseSectionHeadersFrom(win, 1)   -- no category headers in flat combined mode
         end
     end
 
@@ -1020,6 +1137,50 @@ local function testKeyringDynamicSize(fails)
        #Frame.CarriedContainerOrder(o, { showKeyring = true }) - 1, "gate off drops the keyring container")
 end
 
+-- W4.5: category-section content/window sizing (pure). A prebuilt section list
+-- drives the size math the same way split groups do — one header band + grid per
+-- section, stacked, gaps between; empty sections are pre-collapsed by the builder.
+local function testCategorySectionSize(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function make(n) local t = {} for i = 1, n do t[i] = { cid = 0, slot = i, data = { id = i } } end return t end
+    local sections = {
+        { name = "Junk",        entries = make(2),  count = 2 },
+        { name = "Consumables", entries = make(9),  count = 9 },
+        { name = "Equipment",   entries = make(13), count = 13 },
+    }
+    local opts = { columns = 12, buttonSize = 37, gap = 4, sections = sections }
+    local function gh(n) return Frame.GridDims(n, 12, 37, 4).height end
+    local exp = Frame.SECTION_HDR_H + gh(2)
+              + Frame.SECTION_GAP + Frame.SECTION_HDR_H + gh(9)
+              + Frame.SECTION_GAP + Frame.SECTION_HDR_H + gh(13)
+    local cs = Frame.ComputeContentSize(nil, "combined", opts)
+    ck(cs.height == exp, "category content height = Σ(header+grid)+gaps, got " .. cs.height .. " exp " .. exp)
+    ck(cs.width == Frame.GridDims(0, 12, 37, 4).width, "category width = full band")
+    -- window adds chrome, stays non-zero and band-wide
+    local ws = Frame.ComputeWindowSize(nil, "combined", opts)
+    ck(ws.width == cs.width + Frame.PAD * 2, "category window width = band + 2*pad")
+    ck(ws.height > cs.height, "category window taller than content (chrome added)")
+    -- all-collapsed (no sections) => 0 content height, still a full-band width
+    local cs0 = Frame.ComputeContentSize(nil, "combined", { columns = 12, buttonSize = 37, gap = 4, sections = {} })
+    ck(cs0.height == 0 and cs0.width == Frame.GridDims(0, 12, 37, 4).width, "no visible sections -> 0 height, full band width")
+end
+
+-- W4.5: effective-mode gating — categories apply only to combined; split is
+-- UNAFFECTED; the master toggle flips combined between sections and the flat grid.
+local function testEffectiveMode(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    _G.DaseekiBags2DB = nil; _G.DaseekiBags2Data = nil; Store.Init()
+    if ns.Rules and ns.Rules.ApplyDefaults then ns.Rules.ApplyDefaults(Store.db) end
+    Store.db.layout = "combined"; Store.db.categoriesEnabled = true
+    ck(Frame.CategoriesEnabled() == true, "categories enabled when flag on + engine present")
+    ck(Frame.EffectiveMode() == "categories", "combined + categories on -> sections")
+    Store.db.categoriesEnabled = false
+    ck(Frame.CategoriesEnabled() == false, "master toggle off disables categories")
+    ck(Frame.EffectiveMode() == "combined", "combined + categories off -> flat grid returns")
+    Store.db.layout = "split"; Store.db.categoriesEnabled = true
+    ck(Frame.EffectiveMode() == "split", "split is unaffected by the categories flag")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "container order",     fn = testContainerOrder },
@@ -1030,6 +1191,8 @@ function Frame.RunSelfTests(verbose)
         { name = "apply defaults",      fn = testApplyDefaults },
         { name = "keyring gate",        fn = testKeyringGate },
         { name = "keyring dynamic size", fn = testKeyringDynamicSize },
+        { name = "category section size", fn = testCategorySectionSize },
+        { name = "effective mode",       fn = testEffectiveMode },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
