@@ -28,6 +28,8 @@ migrate.lua
 borders.lua
 ui_items.lua
 ui_frame.lua
+ui_owner.lua
+ui_bank.lua
 # --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
 search.lua
 # rules2 (W4.5): simplified custom-categories engine (a category = a saved search
@@ -38,4 +40,6 @@ search.lua
 # (its matcher), before options.lua (the editor consumes ns.Rules).
 rules2.lua
 sort.lua
+ui_find.lua
 options.lua
+features.lua
