@@ -7,11 +7,15 @@
 --     Sort.CanonicalStacks(total, max)      — a total's merged shape (fulls + remainder)
 --     Sort.CompareStacks(a, b)              — group order: class → subclass → name → quality↓
 --     Sort.Plan(state)                      — current layout -> { target, moves, stats }
+--     Sort.PartitionWaves(moves)            — ordered moves -> waves of slot-disjoint moves
 --
 --   EXECUTOR (in-game only; guarded on _G):
---     Sort.Run(cids, opts)                  — snapshot cids, plan, play moves throttled
---     one move per BAG_UPDATE-verified tick, abort-clean on combat / window close /
---     bank close. Accepts an explicit container-id SET so W3 reuses it for the bank.
+--     Sort.Run(cids, opts)                  — snapshot cids, plan, partition into waves,
+--     issue a whole wave of slot-disjoint moves per tick and wait on ITEM_LOCK_CHANGED /
+--     GetContainerItemInfo(isLocked) for the touched slots to settle before the next
+--     wave (report §3(b): ~1-3s full-bag sort, vs the old one-move-per-BAG_UPDATE tick).
+--     Abort-clean on combat / window close / bank close. Accepts an explicit container-id
+--     SET so W3 reuses it for the bank. No native sort exists on 1.15.9 (see below).
 --
 -- ── Why the planner cannot infinite-loop ──────────────────────────────────────
 -- Sorting runs in two bounded phases over a fixed set of free (unlocked) cells:
@@ -26,9 +30,12 @@
 -- strictly increasing index and aborts (never replans) on any drift — so nothing loops.
 --
 -- Catalog-verified (wow-api-catalog/1.15.9.68808): C_Container.GetContainerNumSlots,
--- GetContainerItemInfo, PickupContainerItem, SplitContainerItem, GetContainerNumFreeSlots;
--- C_Item.GetItemInfo / GetItemInfoInstant / GetItemFamily; ClearCursor; InCombatLockdown;
--- events BAG_UPDATE, PLAYER_REGEN_DISABLED, BANKFRAME_CLOSED.
+-- GetContainerItemInfo (isLocked field), PickupContainerItem, SplitContainerItem,
+-- GetContainerNumFreeSlots; C_Item.GetItemInfo / GetItemInfoInstant / GetItemFamily;
+-- ClearCursor; InCombatLockdown; events ITEM_LOCK_CHANGED (Event.Container.ItemLockChanged),
+-- PLAYER_REGEN_DISABLED, BANKFRAME_CLOSED. NO native sort exists: functions.txt has no
+-- SortBags / SortBankBags / C_Container.Sort* on 1.15.9 (only auction/calendar sorts),
+-- so the client planner IS the sort and the wave executor is the perf path (report §3b).
 
 local ADDON, ns = ...
 
@@ -243,6 +250,58 @@ function Sort.Plan(state)
 end
 
 ----------------------------------------------------------------------
+-- PURE: wave batching (the fast executor's schedule)
+--
+-- The planner emits an ORDERED move list whose correctness depends on order (Phase I
+-- merges, then a selection-sort in Phase II). Playing it back one-move-per-tick with a
+-- BAG_UPDATE wait is correct but slow (~0.15s × 100 moves = 15-30s). PartitionWaves
+-- groups the SAME ordered list into WAVES of mutually slot-disjoint moves so a whole
+-- wave can be issued in one tick without waiting between its moves:
+--   * Greedy sequential: walk the moves in order; a move joins the current wave iff
+--     none of its slots (source + dest) is already claimed by a move in that wave,
+--     else it opens a new wave.
+--   * This preserves the planner's order ACROSS waves — a move that conflicts with an
+--     earlier one always lands in a LATER wave, so it still runs after it.
+--   * Every move WITHIN a wave touches a disjoint slot set, so the moves commute and
+--     issuing them together (no inter-move wait) yields the same result as in order.
+-- Flattening the waves back therefore reproduces the original move sequence exactly.
+----------------------------------------------------------------------
+
+-- The container slots a single move touches (source + destination).
+function Sort.MoveSlots(m)
+    if m.op == "swap" then return { m.a, m.b } end
+    if m.op == "merge" or m.op == "split" then return { m.from, m.to } end
+    return {}
+end
+
+function Sort.PartitionWaves(moves)
+    local waves = {}
+    local cur, claimed
+    local function key(ref) return ref.cid .. ":" .. ref.slot end
+    local function newWave()
+        cur = { moves = {}, slots = {} }
+        claimed = {}
+        waves[#waves + 1] = cur
+    end
+    for _, m in ipairs(moves or {}) do
+        local slots = Sort.MoveSlots(m)
+        local conflict = false
+        if cur then
+            for _, ref in ipairs(slots) do
+                if claimed[key(ref)] then conflict = true; break end
+            end
+        end
+        if not cur or conflict then newWave() end
+        cur.moves[#cur.moves + 1] = m
+        for _, ref in ipairs(slots) do
+            claimed[key(ref)] = true
+            cur.slots[#cur.slots + 1] = ref
+        end
+    end
+    return waves
+end
+
+----------------------------------------------------------------------
 -- Container-id set helpers
 ----------------------------------------------------------------------
 
@@ -256,12 +315,22 @@ function Sort.CarriedBagIDs()
 end
 
 -- =====================================================================
--- EXECUTOR (in-game only) — throttled, verified, abort-clean.
--- Not headless-tested (no WoW API under the harness); exercised by Drew's live
--- pass. The planner it plays back IS exhaustively tested above.
+-- EXECUTOR (in-game only) — WAVE-BATCHED, lock-verified, abort-clean.
+--
+-- Catalog verdict (wow-api-catalog/1.15.9.68808): Classic Era 1.15.9 has NO native
+-- container sort — there is no C_Container.SortBags / SortBags / SortBankBags (grep of
+-- functions.txt finds only auction/calendar sorts). So the client-side planner remains
+-- the sort, and this executor is the perf path (report §3(b)): issue a whole wave of
+-- slot-disjoint moves per tick (Sort.PartitionWaves), then wait on ITEM_LOCK_CHANGED /
+-- GetContainerItemInfo(isLocked) for the touched slots to settle before the next wave —
+-- instead of one move per BAG_UPDATE tick. Target: a full-bag sort in ~1-3s.
+--
+-- Not headless-tested (no WoW API under the harness); exercised by Drew's live pass.
+-- The planner AND the wave partition it plays back ARE exhaustively tested above.
 -- =====================================================================
 
-Sort.THROTTLE = 0.15   -- seconds between verified moves (perf + taint-quiet)
+Sort.WAVE_THROTTLE    = 0.05   -- seconds between waves (~one frame; perf + taint-quiet)
+Sort.MAX_SETTLE_POLLS = 40     -- safety valve: force-advance a wave after 40×throttle (~2s)
 
 local function inCombat()
     return _G.InCombatLockdown and _G.InCombatLockdown()
@@ -376,7 +445,8 @@ end
 
 local function stopDriver()
     Sort._running = false
-    Sort._moves, Sort._i, Sort._token = nil, nil, nil
+    Sort._waiting = false
+    Sort._waves, Sort._w, Sort._gen, Sort._settlePolls, Sort._moveCount = nil, nil, nil, nil, nil
     if Sort._driver then Sort._driver:UnregisterAllEvents() end
     if _G.ClearCursor then _G.ClearCursor() end
 end
@@ -387,39 +457,70 @@ local function abort(reason)
     stopDriver()
 end
 
-local function advance()
-    if not Sort._running then return end
-    Sort._i = Sort._i + 1
-    if Sort._i > #Sort._moves then
-        if ns.Print then ns:Print("sort complete (" .. #Sort._moves .. " moves).") end
+-- Is a specific container slot still locked (mid-move, server not yet confirmed)?
+local function slotLocked(cid, slot)
+    local CC = _G.C_Container
+    if CC and CC.GetContainerItemInfo then
+        local info = CC.GetContainerItemInfo(cid, slot)
+        return info and info.isLocked and true or false
+    end
+    return false
+end
+
+-- Has every slot a wave touched settled (unlocked)? A no-op wave settles immediately.
+local function waveSettled(wave)
+    if not wave then return true end
+    for _, ref in ipairs(wave.slots) do
+        if slotLocked(ref.cid, ref.slot) then return false end
+    end
+    return true
+end
+
+-- Advance to the next wave (or finish). Bumps the generation so any in-flight settle
+-- poll for the wave just finished no-ops, and clears the waiting flag so a stray
+-- ITEM_LOCK_CHANGED can't double-advance.
+local function advanceWave()
+    if not Sort._running or not Sort._waiting then return end
+    Sort._waiting = false
+    Sort._gen = (Sort._gen or 0) + 1
+    Sort._w = Sort._w + 1
+    if Sort._w > #Sort._waves then
+        if ns.Print then ns:Print("sort complete (" .. (Sort._moveCount or 0) .. " moves in " .. #Sort._waves .. " waves).") end
         stopDriver()
         if ns.Frame and ns.Frame.RequestRefresh then ns.Frame.RequestRefresh() end
         return
     end
     local after = _G.C_Timer and _G.C_Timer.After
-    if after then after(Sort.THROTTLE, Sort._step) else Sort._step() end
+    if after then after(Sort.WAVE_THROTTLE, Sort._stepWave) else Sort._stepWave() end
 end
 
--- One verified tick: guard, issue the move, then wait for BAG_UPDATE (with a
--- fallback timeout so a no-op move still advances). A per-step token prevents the
--- event and the fallback from both advancing the same move.
-function Sort._step()
+-- Wait for the current wave's slots to unlock, then advance. Driven by a bounded
+-- poll (the safety valve) AND fast-pathed by ITEM_LOCK_CHANGED in the driver.
+local function pollSettle(gen)
+    if not Sort._running or not Sort._waiting or gen ~= Sort._gen then return end
+    if waveSettled(Sort._waves[Sort._w]) then return advanceWave() end
+    Sort._settlePolls = (Sort._settlePolls or 0) + 1
+    if Sort._settlePolls > Sort.MAX_SETTLE_POLLS then return advanceWave() end   -- don't hang
+    local after = _G.C_Timer and _G.C_Timer.After
+    if after then after(Sort.WAVE_THROTTLE, function() pollSettle(gen) end) else advanceWave() end
+end
+
+-- Issue one whole wave of slot-disjoint moves, then wait for it to settle.
+function Sort._stepWave()
     if not Sort._running then return end
     if inCombat() then return abort("entered combat") end
     if Sort._needsBank and not bankIsOpen() then return abort("bank closed") end
     if ns.Frame and ns.Frame.IsShown and not ns.Frame.IsShown() and not Sort._needsBank then
         return abort("window closed")
     end
-    local m = Sort._moves[Sort._i]
-    local token = (Sort._token or 0) + 1
-    Sort._token = token
-    if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
-    local function proceed()
-        if Sort._running and Sort._token == token then advance() end
+    local wave = Sort._waves[Sort._w]
+    for _, m in ipairs(wave.moves) do
+        if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
     end
-    Sort._proceed = proceed
-    local after = _G.C_Timer and _G.C_Timer.After
-    if after then after(Sort.THROTTLE * 4, proceed) end   -- fallback if no BAG_UPDATE
+    Sort._gen = (Sort._gen or 0) + 1
+    Sort._settlePolls = 0
+    Sort._waiting = true
+    pollSettle(Sort._gen)
 end
 
 local function ensureDriver()
@@ -428,9 +529,13 @@ local function ensureDriver()
     f:SetScript("OnEvent", function(_, event)
         if event == "PLAYER_REGEN_DISABLED" then abort("entered combat"); return end
         if event == "BANKFRAME_CLOSED" and Sort._needsBank then abort("bank closed"); return end
-        if event == "BAG_UPDATE" then
-            local p = Sort._proceed
-            if p then Sort._proceed = nil; p() end
+        if event == "ITEM_LOCK_CHANGED" then
+            -- Fast path: the moment the current wave's slots are all unlocked, advance
+            -- (the poll remains as the bounded fallback). advanceWave() clears _waiting
+            -- so a burst of lock events can't skip a wave.
+            if Sort._running and Sort._waiting and Sort._waves and waveSettled(Sort._waves[Sort._w]) then
+                advanceWave()
+            end
         end
     end)
     Sort._driver = f
@@ -469,14 +574,17 @@ function Sort.Run(cids, opts)
     end
 
     ensureDriver()
-    Sort._running   = true
-    Sort._moves     = plan.moves
-    Sort._i         = 1
-    Sort._needsBank = needsBank
-    Sort._driver:RegisterEvent("BAG_UPDATE")
+    Sort._running    = true
+    Sort._waves      = Sort.PartitionWaves(plan.moves)
+    Sort._w          = 1
+    Sort._gen        = 0
+    Sort._waiting    = false
+    Sort._moveCount  = #plan.moves
+    Sort._needsBank  = needsBank
+    Sort._driver:RegisterEvent("ITEM_LOCK_CHANGED")
     Sort._driver:RegisterEvent("PLAYER_REGEN_DISABLED")
     if needsBank then Sort._driver:RegisterEvent("BANKFRAME_CLOSED") end
-    Sort._step()
+    Sort._stepWave()
     return true
 end
 
@@ -671,6 +779,83 @@ local function testPlanFamilyAndMultiBag(fails)
     ck(after[200] == before[200] and after[300] == before[300], "item totals conserved across the sort")
 end
 
+-- WAVE PARTITION (report §3b harness ask): no two moves in a wave share a slot; the
+-- partition preserves the planner's move order; it conserves every move; and applying
+-- the wave-flattened order reaches the same target the linear plan does.
+local function testPartitionWaves(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function sw(a1, a2, b1, b2) return { op = "swap", a = { cid = a1, slot = a2 }, b = { cid = b1, slot = b2 } } end
+    -- Invariant: within every wave, all touched slots are distinct.
+    local function noCollision(waves)
+        for _, wv in ipairs(waves) do
+            local seen = {}
+            for _, ref in ipairs(wv.slots) do
+                local k = ref.cid .. ":" .. ref.slot
+                if seen[k] then return false end
+                seen[k] = true
+            end
+        end
+        return true
+    end
+    local function flatten(waves)
+        local out = {}
+        for _, wv in ipairs(waves) do for _, m in ipairs(wv.moves) do out[#out + 1] = m end end
+        return out
+    end
+
+    -- Three fully-disjoint swaps collapse into ONE wave.
+    local disjoint = { sw(0, 1, 0, 2), sw(0, 3, 0, 4), sw(0, 5, 0, 6) }
+    local wd = Sort.PartitionWaves(disjoint)
+    ck(#wd == 1, "3 slot-disjoint swaps collapse to a single wave")
+    ck(#wd[1].moves == 3, "the wave holds all three moves")
+    ck(noCollision(wd), "disjoint wave has no internal slot collision")
+
+    -- A chain where each swap shares a slot with the previous -> a wave each, in order.
+    local chain = { sw(0, 1, 0, 2), sw(0, 2, 0, 3), sw(0, 3, 0, 4) }
+    local wc = Sort.PartitionWaves(chain)
+    ck(#wc == 3, "each move shares a slot with the previous -> 3 waves")
+    ck(noCollision(wc), "chained partition collision-free")
+    local flatC = flatten(wc)
+    local order = (#flatC == #chain)
+    for i = 1, #flatC do if flatC[i] ~= chain[i] then order = false end end
+    ck(order, "wave flattening preserves the original move order")
+
+    -- Mixed: a conflict opens a new wave; a trailing disjoint move joins that new wave.
+    local mixed = { sw(0, 1, 0, 2), sw(0, 3, 0, 4), sw(0, 2, 0, 5), sw(0, 6, 0, 7) }
+    local wm = Sort.PartitionWaves(mixed)
+    ck(#wm == 2, "conflict opens wave 2; trailing disjoint move joins wave 2")
+    ck(noCollision(wm), "mixed partition collision-free")
+
+    -- Against a REAL plan: collision-free, move-conserving, and reaches the same target.
+    local seed = {
+        [1] = { id = 200 }, [2] = { id = 100, count = 13 }, [3] = { id = 300, count = 4 },
+        [4] = { id = 100, count = 12 }, [5] = { id = 201 }, [6] = { id = 300, count = 8 },
+        [7] = { id = 101, count = 5 },
+    }
+    local plan = Sort.Plan({ cells = bagCells(0, 8, seed), meta = metaFn })
+    local wp = Sort.PartitionWaves(plan.moves)
+    ck(noCollision(wp), "real plan partitions into collision-free waves")
+    local flatP = flatten(wp)
+    ck(#flatP == #plan.moves, "wave partition conserves every planned move")
+    local copy = bagCells(0, 8, seed)
+    applyMoves(copy, flatP, maxOf)
+    local reached = true
+    for i = 1, #copy do
+        local want = plan.target[i]
+        if copy[i].id ~= want.id then reached = false end
+        local haveCount = copy[i].id and copy[i].count or 0
+        if haveCount ~= (want.count or 0) then reached = false end
+    end
+    ck(reached, "applying the wave-flattened order reaches the plan target exactly")
+
+    -- Degenerate inputs: empty list -> no waves; a merge partitions on from/to slots.
+    ck(#Sort.PartitionWaves({}) == 0, "empty move list -> zero waves")
+    local mg = { { op = "merge", from = { cid = 0, slot = 1 }, to = { cid = 0, slot = 2 } },
+                 { op = "merge", from = { cid = 0, slot = 2 }, to = { cid = 0, slot = 3 } } }
+    local wg = Sort.PartitionWaves(mg)
+    ck(#wg == 2 and noCollision(wg), "merges sharing slot 2 split into 2 collision-free waves")
+end
+
 function Sort.RunSelfTests(verbose)
     local suites = {
         { name = "merge pour (exhaustive)", fn = testMergePour },
@@ -678,6 +863,7 @@ function Sort.RunSelfTests(verbose)
         { name = "plan: merge + group sort", fn = testPlanMergeAndSort },
         { name = "plan: idempotent + locked", fn = testPlanIdempotentAndLocked },
         { name = "plan: family + multi-bag", fn = testPlanFamilyAndMultiBag },
+        { name = "wave partition",          fn = testPartitionWaves },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

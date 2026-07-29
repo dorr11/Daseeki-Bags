@@ -404,6 +404,16 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
         if not cell then
             cell = _G.CreateFrame("Button", nil, win.strip, "BackdropTemplate")
             cell:SetSize(SIZE, SIZE)
+            -- Equipped bank-bag ICON (R3 design point 2): a PURCHASED bank-bag cell shows
+            -- the equipped bag's item texture (trimmed to the suite icon treatment). Under
+            -- the number; hidden for buyable/locked/empty cells. Pure insecure-child art.
+            local icon = cell:CreateTexture(nil, "ARTWORK")
+            icon:SetPoint("TOPLEFT", cell, "TOPLEFT", 2, -2)
+            icon:SetPoint("BOTTOMRIGHT", cell, "BOTTOMRIGHT", -2, 2)
+            local t = (ns.Frame and ns.Frame.STRIP_ICON_TRIM) or 0.08
+            icon:SetTexCoord(t, 1 - t, t, 1 - t)
+            icon:Hide()
+            cell._icon = icon
             local fs = cell:CreateFontString(nil, "OVERLAY")
             fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
             fs:SetPoint("CENTER", cell, "CENTER", 0, 0)
@@ -419,9 +429,26 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
             cell:SetBackdropBorderColor(UI.Color("border"))
             cell._fs:SetText(tostring(s.index))
             cell._fs:SetTextColor(UI.Color("text"))
+            -- Show the equipped bank bag's icon (its mapped inventory slot). Falls back
+            -- to the index number if the texture can't be resolved.
+            local CC = _G.C_Container
+            local invSlot = (CC and CC.ContainerIDToInventoryID and CC.ContainerIDToInventoryID(s.cid))
+                         or (_G.ContainerIDToInventoryID and _G.ContainerIDToInventoryID(s.cid))
+            local tex = invSlot and _G.GetInventoryItemTexture and _G.GetInventoryItemTexture("player", invSlot)
+            if tex then
+                cell._icon:SetTexture(tex)
+                if cell._icon.SetDesaturated then cell._icon:SetDesaturated(false) end
+                cell._icon:SetAlpha(1.0)
+                cell._icon:Show()
+                cell._fs:Hide()
+            else
+                cell._icon:Hide()
+                cell._fs:Show()
+            end
             cell:SetScript("OnEnter", nil)
             cell:SetScript("OnClick", nil)
         elseif s.state == "buyable" then
+            cell._icon:Hide(); cell._fs:Show()
             cell:SetBackdropColor(UI.Color("control"))
             cell:SetBackdropBorderColor(UI.Color("bronze"))   -- the one bronze "buy" well
             cell._fs:SetText("+")
@@ -438,6 +465,7 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
         else -- locked
             cell:SetBackdropColor(UI.Color("inset"))
             cell:SetBackdropBorderColor(UI.Color("controlBorder"))
+            cell._icon:Hide(); cell._fs:Show()
             cell._fs:SetText("")
             cell:SetScript("OnEnter", nil)
             cell:SetScript("OnClick", nil)

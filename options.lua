@@ -199,6 +199,15 @@ end
 
 local catSel = 1   -- selected category index (1-based into DB().categories)
 
+-- Mark that the user has made a DELIBERATE choice about categories (toggled the
+-- master switch or edited the list). The R3 one-time default-flip migration
+-- (Rules.MigrateDefaultFlip) respects this marker so a future default change never
+-- clobbers an intentional opt-in.
+local function markCategoriesChosen()
+    local db = DB()
+    if db then db.categoriesUserChose = true end
+end
+
 -- The viewed owner's combined entry list, for the live match count.
 local function viewedEntries()
     if not (ns.Frame and ns.Frame.BuildCombinedEntries and ns.Frame.ViewedOwner) then return {} end
@@ -229,7 +238,12 @@ function Options.BuildCategories(flow)
         label = "Group items into categories",
         tooltip = "When on, the combined view stacks labelled category sections. Turn off for one flat grid.",
         get = function() local db = DB(); return Rules.Enabled(db) end,
-        set = function(v) local db = DB(); if db then db.categoriesEnabled = v and true or false end regrid() end,
+        set = function(v)
+            local db = DB()
+            if db then db.categoriesEnabled = v and true or false end
+            markCategoriesChosen()
+            regrid()
+        end,
     }).Refresh)
 
     -- References resolved as controls are created; the editor + list refresh together.
@@ -280,6 +294,7 @@ function Options.BuildCategories(flow)
     mgmt:Button({ text = "Add Category", width = 120, onClick = function()
         local _, idx = Rules.Add(catList(), "New Category", "")
         catSel = idx or catSel
+        markCategoriesChosen()
         if list and list.SetSelected then list:SetSelected(catSel) end
         refreshAllCats(); regrid()
     end })
@@ -287,6 +302,7 @@ function Options.BuildCategories(flow)
         local db = DB(); if not db then return end
         Rules.RestoreDefaults(db)
         catSel = 1
+        markCategoriesChosen()
         if list and list.SetSelected then list:SetSelected(catSel) end
         refreshAllCats(); regrid()
     end })

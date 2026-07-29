@@ -61,6 +61,7 @@ Frame.PAD         = 10   -- window inner padding
 Frame.TITLE_H     = 28   -- title bar
 Frame.TOOLBAR_H   = 26   -- layout toggle + owner selector stub + search box row
 Frame.STRIP_H     = 20   -- bag-slot toggle strip
+Frame.STRIP_ICON_TRIM = 0.08   -- SetTexCoord trim to crop an icon's built-in border (suite icon treatment)
 Frame.MONEY_H     = 20   -- bottom money bar
 Frame.VGAP        = 8     -- vertical gap between chrome bands
 Frame.GROUP_HDR_H = 16   -- small per-bag header (split layout)
@@ -82,13 +83,14 @@ function Frame.ShowKeyring() local db = Store and Store.db; if db and db.showKey
 
 -- W4.5: the combined view groups items into category SECTIONS when the categories
 -- feature is on AND the rules2 engine is present. SPLIT is UNAFFECTED (bags are the
--- sections there). The additive DB flag (default ON) is owned by rules2.ApplyDefaults;
--- absence/nil reads as ON so behaviour is identical with or without a saved value.
+-- sections there). The additive DB flag (R3 default OFF — combined opens as one flat
+-- grid) is owned by rules2.ApplyDefaults; absence/nil reads as OFF so the flat grid
+-- is the default with or without a saved value.
 function Frame.CategoriesEnabled()
     if not (ns.Rules and ns.Rules.SectionsForRender) then return false end
     local db = Store and Store.db
     if ns.Rules.Enabled then return ns.Rules.Enabled(db) end
-    return not (db and db.categoriesEnabled == false)
+    return db ~= nil and db.categoriesEnabled == true
 end
 
 -- The effective render mode: "split" (unchanged), "categories" (combined + sections),
@@ -899,6 +901,18 @@ function Frame.RebuildStrip()
             b:SetSize(SIZE, SIZE)
             b:RegisterForClicks("LeftButtonUp")
             b:RegisterForDrag("LeftButton")
+            -- Equipped-bag ICON (R3 design point 2): the numbered strip buttons show the
+            -- equipped bag's item texture, trimmed of its built-in border to match the
+            -- suite icon treatment. Sits UNDER the number/underline/plus (ARTWORK layer);
+            -- hidden until an icon resolves so backpack/keyring/empty keep their glyph.
+            -- Pure art on an insecure child texture — never a protected op on the button.
+            local icon = b:CreateTexture(nil, "ARTWORK")
+            icon:SetPoint("TOPLEFT", b, "TOPLEFT", 2, -2)
+            icon:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -2, 2)
+            local t = Frame.STRIP_ICON_TRIM
+            icon:SetTexCoord(t, 1 - t, t, 1 - t)
+            icon:Hide()
+            b._icon = icon
             local fs = b:CreateFontString(nil, "OVERLAY")
             fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
             fs:SetPoint("CENTER", b, "CENTER", 0, 0)
@@ -935,12 +949,14 @@ function Frame.RebuildStrip()
                 stripTooltip(self)
                 local st = stripStateNow(self)
                 self._plus:SetShown(st.showPlus)
-                self._fs:SetShown(not st.showPlus)   -- "+" replaces the number while hovering an empty slot
+                -- "+" replaces the number while hovering an empty slot; when an equipped-
+                -- bag icon is shown the number stays hidden (the icon is the content).
+                self._fs:SetShown(not st.showPlus and not self._icon:IsShown())
             end)
             b:SetScript("OnLeave", function(self)
                 if _G.GameTooltip then _G.GameTooltip:Hide() end
                 self._plus:Hide()
-                self._fs:Show()
+                self._fs:SetShown(not self._icon:IsShown())
             end)
             -- Left-click: equip (cursor bag) / toggle (shown bag) / inert (empty) — combat-gated.
             b:SetScript("OnClick", function(self)
@@ -966,20 +982,41 @@ function Frame.RebuildStrip()
         b:ClearAllPoints()
         b:SetPoint("LEFT", win.strip, "LEFT", x, 0)
         x = x + SIZE + GAP
-        -- label: backpack "B", keyring "K", carried bags by slot number
+        -- glyph label (fallback / non-icon slots): backpack "B", keyring "K", bags by number
         local lbl = (cid == Store.BACKPACK_CONTAINER and "B")
                  or (cid == Store.KEYRING_CONTAINER  and "K")
                  or tostring(cid)
         b._fs:SetText(lbl)
-        b._fs:Show()
         b._plus:Hide()
         -- "shown" (underline/raised) only when a bag actually occupies the slot and isn't hidden.
         local equipped = b._manageable and (bagEquippedLink(b._slot) ~= nil)
                       or (not b._manageable and owner and owner.containers and owner.containers[cid] ~= nil)
         b._on = equipped and not hidden[cid]
+
+        -- R3: resolve the strip icon. A carried bag equipped in this slot renders the
+        -- equipped bag's inventory texture (live self). Backpack keeps its "B", keyring
+        -- its "K", and empty/cached slots keep their glyph (no icon resolved).
+        local isHidden = hidden[cid] and true or false
+        local iconTex
+        if b._slot and equipped and _G.GetInventoryItemTexture then
+            iconTex = _G.GetInventoryItemTexture("player", b._slot)
+        end
+        if iconTex then
+            b._icon:SetTexture(iconTex)
+            -- hidden bag reads as a dimmed + desaturated icon (the toggle-state cue over the icon).
+            if b._icon.SetDesaturated then b._icon:SetDesaturated(isHidden) end
+            b._icon:SetAlpha(isHidden and 0.35 or 1.0)
+            b._icon:Show()
+            b._fs:Hide()               -- the icon is the content; number glyph steps aside
+        else
+            b._icon:Hide()
+            b._fs:Show()
+        end
+
         b._applySkin()
         -- Lock feedback: a bag mid-pickup desaturates (IsInventoryItemLocked).
         if b._slot and _G.IsInventoryItemLocked and _G.IsInventoryItemLocked(b._slot) then
+            if b._icon:IsShown() and b._icon.SetDesaturated then b._icon:SetDesaturated(true) end
             b._fs:SetTextColor(UI.Color("faint"))
         end
         b:Show()

@@ -82,22 +82,53 @@ end
 
 ----------------------------------------------------------------------
 -- Additive DB defaults (Core-independent; applied on STORE_READY).
---   db.categoriesEnabled — master feature toggle, default ON (design point 2).
+--   db.categoriesEnabled — master feature toggle, default OFF (R3 design point 1:
+--                          the combined view opens as ONE flat grid, matching 1.x
+--                          muscle memory; categories are the opt-in). The seed list
+--                          is still installed so turning the feature on is one click.
 --   db.categories        — the ordered editable list, seeded on first run only
 --                          (an empty list is a valid user choice, never re-seeded).
 ----------------------------------------------------------------------
 
 function Rules.ApplyDefaults(db)
     if type(db) ~= "table" then return end
-    if db.categoriesEnabled == nil then db.categoriesEnabled = true end
+    if db.categoriesEnabled == nil then db.categoriesEnabled = false end
     if db.categories == nil then db.categories = Rules.DefaultCategories() end
     return db
 end
 
--- Master toggle read (absent => ON, matching ApplyDefaults).
+-- Master toggle read (absent => OFF, matching the R3 flat-grid default).
 function Rules.Enabled(db)
-    if type(db) ~= "table" then return true end
-    return db.categoriesEnabled ~= false
+    if type(db) ~= "table" then return false end
+    return db.categoriesEnabled == true
+end
+
+----------------------------------------------------------------------
+-- One-time default-flip migration (R3, design point 1).
+--
+-- The category feature previously DEFAULTED ON. The owner read the resulting
+-- category sections as the combined view being "still segmented" rather than 1.x's
+-- single flat bucket. The new default is OFF. Because a value that was flipped ON by
+-- the OLD default is indistinguishable from one the user deliberately turned on, and
+-- the feature is young (the owner is the only user), we flip EVERY db still sitting
+-- at ON to OFF exactly once — UNLESS the user has left an explicit-choice marker
+-- (db.categoriesUserChose, set by options.lua when the master toggle is changed or a
+-- category is edited). The whole pass is guarded by a one-time marker so a later
+-- deliberate opt-in is never re-clobbered on a subsequent login. Idempotent.
+----------------------------------------------------------------------
+
+Rules.DEFAULT_FLIP_MARKER = "categoriesDefaultFlipR3"
+
+function Rules.MigrateDefaultFlip(db)
+    if type(db) ~= "table" then return false end
+    if db[Rules.DEFAULT_FLIP_MARKER] then return false end   -- already migrated
+    local flipped = false
+    if db.categoriesEnabled == true and not db.categoriesUserChose then
+        db.categoriesEnabled = false
+        flipped = true
+    end
+    db[Rules.DEFAULT_FLIP_MARKER] = true
+    return flipped
 end
 
 ----------------------------------------------------------------------
@@ -430,10 +461,13 @@ function Rules.LiveCountMatches(query, entries)
     return Rules.CountMatches(compiled, entries, { resolver = liveResolver(), isNew = liveIsNew })
 end
 
--- Apply defaults the moment the store is ready (Core-independent), like options.lua.
+-- Apply defaults the moment the store is ready (Core-independent), like options.lua,
+-- then run the one-time default-flip migration (R3) on the same db.
 if ns.On then
     ns:On("STORE_READY", function()
-        Rules.ApplyDefaults(Store and Store.db)
+        local db = Store and Store.db
+        Rules.ApplyDefaults(db)
+        Rules.MigrateDefaultFlip(db)
     end)
 end
 
@@ -614,20 +648,22 @@ end
 
 local function testDefaultsAndCount(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    -- ApplyDefaults is additive: feature ON + seeded list, never clobbering choices.
+    -- ApplyDefaults is additive: feature OFF (flat grid) + seeded list, never
+    -- clobbering choices. The seed list is still installed so opting in is one click.
     local db = {}
     Rules.ApplyDefaults(db)
-    ck(db.categoriesEnabled == true, "categoriesEnabled default ON")
-    ck(type(db.categories) == "table" and #db.categories == 5, "seeded 5 default categories")
-    local off = { categoriesEnabled = false, categories = {} }
-    Rules.ApplyDefaults(off)
-    ck(off.categoriesEnabled == false, "explicit categoriesEnabled=false preserved")
-    ck(#off.categories == 0, "explicit empty category list NOT re-seeded (a valid choice)")
-    ck(Rules.Enabled({}) == true, "Enabled: absent => ON")
+    ck(db.categoriesEnabled == false, "categoriesEnabled default OFF (R3 flat grid)")
+    ck(type(db.categories) == "table" and #db.categories == 5, "seeded 5 default categories even while OFF")
+    local on = { categoriesEnabled = true, categories = {} }
+    Rules.ApplyDefaults(on)
+    ck(on.categoriesEnabled == true, "explicit categoriesEnabled=true preserved")
+    ck(#on.categories == 0, "explicit empty category list NOT re-seeded (a valid choice)")
+    ck(Rules.Enabled({}) == false, "Enabled: absent => OFF (flat default)")
+    ck(Rules.Enabled({ categoriesEnabled = true }) == true, "Enabled: explicit true")
     ck(Rules.Enabled({ categoriesEnabled = false }) == false, "Enabled: explicit false")
-    -- RestoreDefaults re-seeds
-    Rules.RestoreDefaults(off)
-    ck(#off.categories == 5 and off.categoriesEnabled == true, "RestoreDefaults re-seeds list + turns feature on")
+    -- RestoreDefaults re-seeds AND turns the feature on (a deliberate opt-in).
+    Rules.RestoreDefaults(on)
+    ck(#on.categories == 5 and on.categoriesEnabled == true, "RestoreDefaults re-seeds list + turns feature on")
 
     -- CountMatches (live editor readout) over a small bag.
     local R = fakeResolver(catalogDB())
@@ -641,12 +677,12 @@ local function testDefaultsAndCount(fails)
     ck(nJunk == 1, "CountMatches: 1 junk item")
 end
 
--- PRE-EXISTING DB (defect #3 regression lock): a DaseekiBags2DB created BEFORE rules2
--- shipped has NEITHER categoriesEnabled NOR categories. The STORE_READY ApplyDefaults
--- hook must fill BOTH on that existing table (it is additive, not first-run-gated), and
--- the combined entry list must then bucket into real sections. (The owner's live miss was
--- upstream of this — rules2.lua was absent from the beta's Daseeki-Bags2.toc, so the
--- engine never loaded and ns.Rules was nil; this case locks the model itself.)
+-- PRE-EXISTING DB (regression lock): a DaseekiBags2DB created BEFORE rules2 shipped
+-- has NEITHER categoriesEnabled NOR categories. The STORE_READY ApplyDefaults hook
+-- must fill BOTH on that existing table (it is additive, not first-run-gated). Under
+-- the R3 default the feature is OFF (flat combined grid), and the category ENGINE must
+-- still be fully functional as an opt-in — the same combined entry list buckets into
+-- real named sections once the feature is turned on.
 local function testPreExistingDB(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- An existing settings DB with unrelated keys but none of the categories keys.
@@ -654,14 +690,17 @@ local function testPreExistingDB(fails)
     ck(db.categoriesEnabled == nil and db.categories == nil, "fixture: pre-rules2 DB lacks both keys")
 
     Rules.ApplyDefaults(db)
-    ck(db.categoriesEnabled == true, "ApplyDefaults filled categoriesEnabled=true on the EXISTING db")
+    ck(db.categoriesEnabled == false, "ApplyDefaults filled categoriesEnabled=false (R3 flat default) on the EXISTING db")
     ck(type(db.categories) == "table" and #db.categories == 5, "ApplyDefaults seeded the 5 default categories")
-    ck(Rules.Enabled(db) == true, "feature now reads ON (combined view will render sections)")
+    ck(Rules.Enabled(db) == false, "feature reads OFF by default (combined view = one flat grid)")
 
     -- The unrelated pre-existing keys are untouched (additive, never clobbers).
     ck(db.layout == "combined" and db.columns == 12 and db.qualityBorders == true, "existing keys preserved")
 
-    -- End-to-end: a combined entry list now buckets into named sections (not a flat grid).
+    -- Opt in: turning the feature on makes the SAME combined entry list bucket into
+    -- named sections — categories stay fully functional (the simplified engine works).
+    db.categoriesEnabled = true
+    ck(Rules.Enabled(db) == true, "opting in reads ON")
     local R = fakeResolver(catalogDB())
     local entries = {
         { owner = {}, cid = 0, slot = 1, data = rec(1, 1) },   -- potion -> Consumables
@@ -673,8 +712,48 @@ local function testPreExistingDB(fails)
     local names = {}
     for _, s in ipairs(sections) do names[s.name] = s.count end
     ck(names["Junk"] == 1 and names["Consumables"] == 1 and names["Equipment"] == 1,
-        "existing DB now yields category sections (Junk/Consumables/Equipment)")
-    ck(#sections >= 3, "sections built (not a flat grid), got " .. #sections)
+        "opted-in DB yields category sections (Junk/Consumables/Equipment)")
+    ck(#sections >= 3, "sections built when opted in (not a flat grid), got " .. #sections)
+end
+
+-- DEFAULT-FLIP MIGRATION (R3 design point 1). One-time, marker-guarded, idempotent.
+local function testDefaultFlipMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local MARK = Rules.DEFAULT_FLIP_MARKER
+
+    -- 1) A fresh DB: ApplyDefaults already sets OFF, so the migration flips nothing.
+    local fresh = {}
+    Rules.ApplyDefaults(fresh)
+    local didFlip = Rules.MigrateDefaultFlip(fresh)
+    ck(didFlip == false, "fresh DB (already OFF) is not flipped")
+    ck(fresh.categoriesEnabled == false, "fresh DB stays OFF")
+    ck(fresh[MARK] == true, "fresh DB marked migrated")
+
+    -- 2) An OLD-default DB that sat at ON (no explicit-choice marker) -> flipped OFF.
+    local old = { categoriesEnabled = true, categories = Rules.DefaultCategories() }
+    ck(Rules.MigrateDefaultFlip(old) == true, "old default-ON DB is flipped once")
+    ck(old.categoriesEnabled == false, "old DB now OFF (opens as flat grid)")
+    ck(old[MARK] == true, "old DB marked migrated")
+
+    -- 3) Idempotency: a second pass does nothing and never re-flips.
+    old.categoriesEnabled = true   -- pretend the user later turned it back on
+    ck(Rules.MigrateDefaultFlip(old) == false, "second pass is a no-op (marker guard)")
+    ck(old.categoriesEnabled == true, "a later user opt-in is never re-clobbered")
+
+    -- 4) A user who explicitly chose categories (marker present) is respected.
+    local chose = { categoriesEnabled = true, categoriesUserChose = true }
+    ck(Rules.MigrateDefaultFlip(chose) == false, "explicit user choice not flipped")
+    ck(chose.categoriesEnabled == true, "user's ON choice preserved")
+    ck(chose[MARK] == true, "still marked migrated (won't re-check)")
+
+    -- 5) A DB the user had already turned OFF is untouched, just marked.
+    local wasOff = { categoriesEnabled = false }
+    ck(Rules.MigrateDefaultFlip(wasOff) == false, "already-OFF DB not flipped")
+    ck(wasOff.categoriesEnabled == false, "stays OFF")
+    ck(wasOff[MARK] == true, "marked migrated")
+
+    -- 6) Guards: non-table is a safe no-op.
+    ck(Rules.MigrateDefaultFlip(nil) == false, "nil db -> safe no-op")
 end
 
 function Rules.RunSelfTests(verbose)
@@ -685,6 +764,7 @@ function Rules.RunSelfTests(verbose)
         { name = "list ops",          fn = testListOps },
         { name = "defaults + count",  fn = testDefaultsAndCount },
         { name = "pre-existing db",   fn = testPreExistingDB },
+        { name = "default-flip migration", fn = testDefaultFlipMigration },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
