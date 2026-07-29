@@ -97,7 +97,11 @@ local function loadAddon(rel)
     return ok
 end
 
-local TOC_ORDER = { "store.lua", "capture.lua", "migrate.lua" }
+-- W2 adds ui_frame.lua (window side). Its self-tests are PURE (no CreateFrame at
+-- file scope; every frame call is guarded inside an in-game-only function), so it
+-- loads and self-tests cleanly under the headless stub. The sibling's ui_items.lua
+-- / borders.lua are appended by their own harness edit (hand-merged by the owner).
+local TOC_ORDER = { "store.lua", "capture.lua", "migrate.lua", "ui_frame.lua" }
 for _, f in ipairs(TOC_ORDER) do loadAddon(f) end
 
 realprint("=== Daseeki-Bags 2.0 harness :: file load ===")
