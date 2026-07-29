@@ -1,0 +1,34 @@
+## Title: Daseeki Bags 2 (BETA)
+## Notes: A standalone bag interface for WoW Classic Era.
+## Author: Daseeki
+## Category: Bags & Inventory
+## X-License: MIT
+## X-Curse-Project-ID: 1592410
+## OptionalDeps: Daseeki-Core
+## Interface: 11507, 11508, 11509
+## Version: 2.0.0
+## SavedVariables: DaseekiBags2DB, DaseekiBags2Data
+##
+## Daseeki-Bags 2.0 — clean rewrite. This v2.toc documents the intended 2.0
+## load order for the fresh flat tree; it is NOT wired into the live addon yet
+## (the shipping Daseeki-Bags.toc still loads the 1.x tree). Cutover in a later
+## wave replaces Daseeki-Bags.toc with this file and deletes the 1.x sources.
+##
+## New SavedVariables (additive; coexist with the 1.x globals
+## DaseekiBagsAccount / DaseekiBagsSets / DaseekiBagsMesh, which 2.0 reads
+## READ-ONLY once at first load via migrate.lua and never writes):
+##   DaseekiBags2DB   — settings (schema-versioned)
+##   DaseekiBags2Data — inventory cache DB (owners graph; per-container identity)
+##
+core.lua          # shared ns runtime (Print/SafeCall/events/On-Fire bus) + lifecycle
+store.lua         # SavedVariables layer: settings + inventory cache DB
+capture.lua       # live scan on the 1.15 event surface (C_Container)
+migrate.lua       # one-time read-only conversion of the 1.x SV
+# --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
+borders.lua       # quality borders (loads before ui_items; buttons attach at paint)
+ui_items.lua      # item buttons + grid groups (ns.Items contract)
+ui_frame.lua      # the inventory window (consumes ns.Items; DaseekiUI-skinned)
+# --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
+search.lua        # D4 owned search matcher + live dim controller (both layouts)
+sort.lua          # sort engine: pure move planner + throttled, verified executor
+options.lua       # DaseekiUI settings page (Core-gated) + additive qualityBorders default
