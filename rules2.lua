@@ -641,6 +641,42 @@ local function testDefaultsAndCount(fails)
     ck(nJunk == 1, "CountMatches: 1 junk item")
 end
 
+-- PRE-EXISTING DB (defect #3 regression lock): a DaseekiBags2DB created BEFORE rules2
+-- shipped has NEITHER categoriesEnabled NOR categories. The STORE_READY ApplyDefaults
+-- hook must fill BOTH on that existing table (it is additive, not first-run-gated), and
+-- the combined entry list must then bucket into real sections. (The owner's live miss was
+-- upstream of this — rules2.lua was absent from the beta's Daseeki-Bags2.toc, so the
+-- engine never loaded and ns.Rules was nil; this case locks the model itself.)
+local function testPreExistingDB(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- An existing settings DB with unrelated keys but none of the categories keys.
+    local db = { layout = "combined", columns = 12, qualityBorders = true }
+    ck(db.categoriesEnabled == nil and db.categories == nil, "fixture: pre-rules2 DB lacks both keys")
+
+    Rules.ApplyDefaults(db)
+    ck(db.categoriesEnabled == true, "ApplyDefaults filled categoriesEnabled=true on the EXISTING db")
+    ck(type(db.categories) == "table" and #db.categories == 5, "ApplyDefaults seeded the 5 default categories")
+    ck(Rules.Enabled(db) == true, "feature now reads ON (combined view will render sections)")
+
+    -- The unrelated pre-existing keys are untouched (additive, never clobbers).
+    ck(db.layout == "combined" and db.columns == 12 and db.qualityBorders == true, "existing keys preserved")
+
+    -- End-to-end: a combined entry list now buckets into named sections (not a flat grid).
+    local R = fakeResolver(catalogDB())
+    local entries = {
+        { owner = {}, cid = 0, slot = 1, data = rec(1, 1) },   -- potion -> Consumables
+        { owner = {}, cid = 0, slot = 2, data = rec(4, 0) },   -- junk   -> Junk
+        { owner = {}, cid = 0, slot = 3, data = rec(2, 4) },   -- axe    -> Equipment
+        { owner = {}, cid = 0, slot = 4, data = nil          }, -- empty  -> Free space
+    }
+    local sections = Rules.BuildSections(entries, Rules.CompileList(db.categories), { resolver = R })
+    local names = {}
+    for _, s in ipairs(sections) do names[s.name] = s.count end
+    ck(names["Junk"] == 1 and names["Consumables"] == 1 and names["Equipment"] == 1,
+        "existing DB now yields category sections (Junk/Consumables/Equipment)")
+    ck(#sections >= 3, "sections built (not a flat grid), got " .. #sections)
+end
+
 function Rules.RunSelfTests(verbose)
     local suites = {
         { name = "compile + match",   fn = testCompileAndMatch },
@@ -648,6 +684,7 @@ function Rules.RunSelfTests(verbose)
         { name = "first-match-wins",  fn = testFirstMatchWins },
         { name = "list ops",          fn = testListOps },
         { name = "defaults + count",  fn = testDefaultsAndCount },
+        { name = "pre-existing db",   fn = testPreExistingDB },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

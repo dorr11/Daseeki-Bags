@@ -30,5 +30,12 @@ ui_items.lua
 ui_frame.lua
 # --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
 search.lua
+# rules2 (W4.5): simplified custom-categories engine (a category = a saved search
+# query; reuses the search.lua matcher). Consumed by ui_frame (combined-view category
+# SECTIONS) and options.lua (the editor). MUST load — without it ns.Rules is nil, so
+# Frame.CategoriesEnabled() is false and the combined view falls back to a flat grid
+# with zero section headers (was the missing-categories beta defect). After search.lua
+# (its matcher), before options.lua (the editor consumes ns.Rules).
+rules2.lua
 sort.lua
 options.lua

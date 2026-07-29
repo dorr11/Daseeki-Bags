@@ -374,10 +374,44 @@ local function testEnabledToggle(fails)
     Store.db = saved
 end
 
+-- REALISTIC MIXED BAG (defect #2 regression lock): a warrior's bags are mostly
+-- whites/greys/greens with the odd rare and a single epic — NOT "all epics". This
+-- reproduces the owner's mixed inventory and asserts the edge maps ONLY onto rare+,
+-- with the correct per-tier thickness. It proves the quality-edge LOGIC is quiet by
+-- construction (the beta's "every slot rimmed bright" was the template's native
+-- UI-Quickslot2 ring, killed in ui_items._neutralizeSlotArt — not this mapping).
+local function testMixedBagMapping(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- 12 slots: poor, commons, uncommons, one rare, one epic, an empty (nil quality).
+    local bag = { 0, 1, 1, 1, 2, 2, 1, 3, 1, 2, 4, nil }
+    local rimmed, px1, px2 = 0, 0, 0
+    for slot = 1, 12 do
+        local q = bag[slot]
+        if Borders.ShouldShow(q, true) then
+            rimmed = rimmed + 1
+            local p = Borders.TierPx(q)
+            if p == 1 then px1 = px1 + 1 elseif p == 2 then px2 = px2 + 1 end
+        else
+            ck(Borders.TierPx(q) == 0, "sub-rare slot (q=" .. tostring(q) .. ") -> 0px")
+        end
+    end
+    ck(rimmed == 2, "mixed bag: exactly 2 of 12 slots rimmed (the rare + the epic), got " .. rimmed)
+    ck(px1 == 1, "exactly one 1px edge (the rare)")
+    ck(px2 == 1, "exactly one 2px edge (the epic)")
+    -- The commons/uncommons that dominate the bag are explicitly quiet.
+    ck(Borders.ShouldShow(1, true) == false and Borders.ShouldShow(2, true) == false,
+        "commons + uncommons stay edgeless (bag reads calm)")
+    -- Disabling the toggle silences even the rare+ pair.
+    local silenced = 0
+    for slot = 1, 12 do if Borders.ShouldShow(bag[slot], false) then silenced = silenced + 1 end end
+    ck(silenced == 0, "toggle off -> no slot rimmed at all")
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
+        { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "quality color",        fn = testQualityRGB },
         { name = "enabled toggle",       fn = testEnabledToggle },
     }

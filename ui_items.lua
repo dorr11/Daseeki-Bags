@@ -509,11 +509,52 @@ local function styleCount(button)
     end
 end
 
+-- Neutralize the item-button template's BUILT-IN slot artwork so the quiet inset well
+-- reads clean. Both templates (ContainerFrameItemButtonTemplate live / ItemButtonTemplate
+-- cached) ship a 64x64 "UI-Quickslot2" NormalTexture — a bluish-lavender slot ring that
+-- draws OVER our BACKGROUND well: on an EMPTY cell it reads as a bright-blue glow (defect
+-- #1), on a FILLED cell it rims the icon edges blue-purple (the "thick bright" most-slots
+-- symptom of defect #2). We also hide the native IconBorder (Blizzard's full-saturation
+-- quality ring, present on newer ItemButton) so the ONLY quality rim is borders.lua's
+-- 1px/2px DESATURATED rare+ edge. SECURE/TAINT: pure texture ops on child regions
+-- (SetTexture/SetAlpha/Hide) — never a protected op (no Show/Hide/SetPoint/SetID/… on
+-- the secure button itself), safe empty AND filled, both templates. SetAlpha(0) survives
+-- any later template :Show() of the region, so the art stays dead after one call.
+-- Guard-free of the WoW API (operates on the accessors the button exposes) so the harness
+-- can drive it headless with a fake button.
+function Items._neutralizeSlotArt(button)
+    if not button then return nil end
+    local name = button.GetName and button:GetName()
+    local nt = (button.GetNormalTexture and button:GetNormalTexture())
+        or button._normalTexture
+        or (name and _G and _G[name .. "NormalTexture"])
+    if nt then
+        if nt.SetTexture then nt:SetTexture(nil) end
+        if nt.SetAlpha   then nt:SetAlpha(0)    end
+        if nt.Hide       then nt:Hide()         end
+        button._dsSlotArtHidden = nt
+    end
+    -- Blank the button's stored normal texture too so the template can't re-set the art.
+    if button.SetNormalTexture then pcall(button.SetNormalTexture, button, nil) end
+    local ib = button.IconBorder
+        or (name and _G and _G[name .. "IconBorder"])
+    if ib then
+        if ib.SetAlpha then ib:SetAlpha(0) end
+        if ib.Hide     then ib:Hide()      end
+        button._dsIconBorderHidden = ib
+    end
+    return nt
+end
+
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
 -- combat-deferred layout): quiet inset well + new-item wax dot + quest warn tab. All are
 -- non-secure children; nothing here (or at runtime) is a protected op on the button.
 local function ensureDress(button)
     if button._dsWell or not _G.CreateFrame then return end
+
+    -- Kill the template's native slot art FIRST (the bright-blue UI-Quickslot2 ring +
+    -- native quality border) so our calm inset well below is the only slot substrate.
+    Items._neutralizeSlotArt(button)
 
     -- Quiet inset WELL (BACKGROUND): a calm recessed substrate under every cell so empties
     -- read as intentional drop targets and fills sit in a dark well. No per-slot edge
@@ -1066,6 +1107,54 @@ local function testDimCascade(fails)
     ck(b3._dsBagsBorder.alpha == 0.25, "Borders.SetAlpha recedes the quality edge container")
 end
 
+-- SLOT-ART NEUTRALIZATION (empty-well blue-glow fix, defect #1 + the "most filled slots
+-- rimmed" half of #2). The item-button templates ship a UI-Quickslot2 NormalTexture (a
+-- bright bluish ring) that drew over our dark well. _neutralizeSlotArt must clear it (and
+-- the native IconBorder) to invisible. Driven headless with a fake button exposing the
+-- same accessors the real templates do — no CreateFrame needed.
+local function testSlotArtNeutralized(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function texRecorder()
+        local t = { tex = "Interface\\Buttons\\UI-Quickslot2", alpha = 1, shown = true }
+        function t:SetTexture(v) self.tex = v end
+        function t:SetAlpha(a) self.alpha = a end
+        function t:Hide() self.shown = false end
+        function t:Show() self.shown = true end
+        return t
+    end
+
+    -- A fake button with a NormalTexture + IconBorder (mirrors the live template shape).
+    local normal, border = texRecorder(), texRecorder()
+    local setNormalCalled = false
+    local btn = {
+        GetNormalTexture = function() return normal end,
+        SetNormalTexture = function() setNormalCalled = true end,
+        IconBorder = border,
+    }
+    local ret = Items._neutralizeSlotArt(btn)
+    ck(ret == normal, "returns the neutralized NormalTexture")
+    ck(normal.tex == nil, "NormalTexture texture cleared (UI-Quickslot2 killed)")
+    ck(normal.alpha == 0, "NormalTexture alpha 0 (survives a later template :Show())")
+    ck(normal.shown == false, "NormalTexture hidden")
+    ck(btn._dsSlotArtHidden == normal, "marked _dsSlotArtHidden")
+    ck(setNormalCalled == true, "button's stored normal texture blanked (no re-set)")
+    ck(border.alpha == 0 and border.shown == false, "native IconBorder hidden (only borders.lua rims quality)")
+    ck(btn._dsIconBorderHidden == border, "marked _dsIconBorderHidden")
+
+    -- Cached-button shape: no accessor, resolves NormalTexture by $parentNormalTexture.
+    local gNormal = texRecorder()
+    _G["DaseekiBags2FakeItemNormalTexture"] = gNormal
+    local btn2 = { GetName = function() return "DaseekiBags2FakeItem" end }
+    Items._neutralizeSlotArt(btn2)
+    ck(gNormal.tex == nil and gNormal.alpha == 0, "global $parentNormalTexture fallback neutralized")
+    _G["DaseekiBags2FakeItemNormalTexture"] = nil
+
+    -- Robust to a button with neither accessor nor name (never errors, no-op).
+    ck(Items._neutralizeSlotArt({}) == nil, "button without slot art -> safe no-op")
+    ck(Items._neutralizeSlotArt(nil) == nil, "nil button -> safe no-op")
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -1075,6 +1164,7 @@ function Items.RunSelfTests(verbose)
         { name = "cell clamp",         fn = testCellClamp },
         { name = "state precedence",   fn = testStatePrecedence },
         { name = "dim cascade",        fn = testDimCascade },
+        { name = "slot-art neutralized", fn = testSlotArtNeutralized },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
