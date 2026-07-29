@@ -24,7 +24,7 @@
 ## (ns:RegisterSelfTest / ns:RegisterEvent / ns:Print / ns:SafeCall / ns:Fire)
 ## and drive the lifecycle: Store.Init() -> Migrate.Migrate() -> Capture.OnLogin().
 
-# core.lua        # W-later: shared ns runtime + lifecycle (not in W1)
+core.lua          # shared ns runtime (Print/SafeCall/events/On-Fire bus) + lifecycle
 store.lua         # SavedVariables layer: settings + inventory cache DB
 capture.lua       # live scan on the 1.15 event surface (C_Container)
 migrate.lua       # one-time read-only conversion of the 1.x SV

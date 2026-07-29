@@ -53,34 +53,21 @@ _G.NUM_BANKBAGSLOTS  = 7
 -- No C_Container / GetMoney: forces capture's live path to no-op (self-tests
 -- exercise the pure core with a fake api instead).
 
+-- geterrorhandler stub: core.lua routes EVERY error here (standing rule: never a
+-- silent pcall). This recorder surfaces routed errors to stdout so real breakage
+-- stays visible; the core "bus + error routing" self-test temporarily swaps in
+-- its own recorder to assert routing, then restores THIS handler.
+_G.geterrorhandler = function() return function(err) realprint("  !! routed error: " .. tostring(err)) end end
+
 ----------------------------------------------------------------------
--- Minimal ns (mirrors what core.lua will provide in-game)
+-- ns namespace — the REAL runtime now comes from core.lua (loaded FIRST in
+-- TOC_ORDER below): Print / SafeCall / event dispatch / On-Fire bus / self-test
+-- registry. The harness no longer stubs those; it drives the real core. After
+-- load it only re-points ns.Print to the captured-log printer so terminal output
+-- stays clean (core's in-game Print prefixes chat color-escape codes).
 ----------------------------------------------------------------------
 local ADDON = "DaseekiBags"
 local ns = {}
-
-function ns:Print(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-    logline(table.concat(parts, "\t"))
-end
-function ns:SafeCall(fn, ...) return pcall(fn, ...) end
-function ns:Fire() end
-function ns:RegisterEvent() end
-
-local selfTests = {}
-function ns:RegisterSelfTest(name, fn) selfTests[#selfTests + 1] = { name = name, fn = fn } end
-function ns:RunRegisteredSelfTests(verbose)
-    local allPass = true
-    for i = 1, #selfTests do
-        if verbose then ns:Print("selftest: " .. selfTests[i].name) end
-        local ok, res = pcall(selfTests[i].fn, verbose)
-        local passed = ok and res
-        if not ok then ns:Print("  FAIL " .. selfTests[i].name .. " :: error " .. tostring(res)) end
-        allPass = allPass and passed
-    end
-    return allPass
-end
 
 ----------------------------------------------------------------------
 -- Load addon files in .toc order
@@ -97,12 +84,24 @@ local function loadAddon(rel)
     return ok
 end
 
+-- core.lua loads FIRST — it provides the ns runtime the other files consume at
+-- load time (ns:RegisterSelfTest, ns:RegisterEvent, ns:On/Fire). It is headless-
+-- safe (CreateFrame / SlashCmdList / geterrorhandler are all guarded).
 -- W2 adds ui_frame.lua (window side). Its self-tests are PURE (no CreateFrame at
 -- file scope; every frame call is guarded inside an in-game-only function), so it
 -- loads and self-tests cleanly under the headless stub. The sibling's ui_items.lua
 -- / borders.lua are appended by their own harness edit (hand-merged by the owner).
-local TOC_ORDER = { "store.lua", "capture.lua", "migrate.lua", "ui_frame.lua" }
+local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua", "ui_frame.lua" }
 for _, f in ipairs(TOC_ORDER) do loadAddon(f) end
+
+-- core.lua's Print prefixes chat color-escape codes; re-point it to the captured
+-- log for clean terminal output. (Dynamic dispatch: core's RunRegisteredSelfTests
+-- resolves ns:Print at call time, so this override takes effect for the run.)
+function ns:Print(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    logline(table.concat(parts, "\t"))
+end
 
 realprint("=== Daseeki-Bags 2.0 harness :: file load ===")
 local criticalFail = false
