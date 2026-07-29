@@ -229,6 +229,34 @@ function Frame.StripButtonState(ctx)
     }
 end
 
+-- PURE: does the cursor hold an equippable BAG? `kind` is GetCursorInfo()'s first
+-- return; `equipLoc` is GetItemInfoInstant(id)'s equip location. The strip's equip
+-- affordance must key off an actual bag — CursorHasItem() alone is true for ANY item,
+-- so a non-bag on the cursor wrongly read as an equip payload. GetCursorInfo("item")
+-- + INVTYPE_BAG is the reliable holds-a-bag check (catalog-verified 1.15.9).
+function Frame.CursorIsBag(kind, equipLoc)
+    if kind ~= "item" then return false end
+    return equipLoc == "INVTYPE_BAG"
+end
+
+-- PURE: cross-account gold tooltip lines. Ordered { label, copper, isTotal }: the
+-- "All characters" grand total first, then each account by copper desc then label asc.
+-- Harness-locked so the money tooltip content is provable; the live OnEnter only
+-- formats copper into coin strings.
+function Frame.BuildMoneyLines(total, byAccount)
+    local lines = { { label = "All characters", copper = total or 0, isTotal = true } }
+    local accts = {}
+    for acct, copper in pairs(byAccount or {}) do
+        accts[#accts + 1] = { label = (acct ~= "" and acct) or "Unlinked", copper = copper or 0 }
+    end
+    table.sort(accts, function(a, b)
+        if a.copper ~= b.copper then return a.copper > b.copper end
+        return tostring(a.label) < tostring(b.label)
+    end)
+    for _, a in ipairs(accts) do lines[#lines + 1] = a end
+    return lines
+end
+
 ----------------------------------------------------------------------
 -- PURE: entry-list construction
 --
@@ -644,6 +672,23 @@ function Frame.Ensure()
     findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -6, 0)
     win.findBtn = findBtn
 
+    -- Re-anchor the owner selector to FLEX in the gap between the layout toggle (left)
+    -- and the right cluster (Find/Sort/Search). The beta packed a fixed 150px selector
+    -- + 150px search + Sort + Find with no overflow control, so on real window widths
+    -- the selector overran the cluster and covered the Find button (owner report: "no
+    -- Find button"). Binding the selector LEFT->seg and RIGHT->findBtn guarantees Find/
+    -- Sort/Search are never overlapped and the selector simply takes the remaining width.
+    if win.ownerSelector then
+        win.ownerSelector:ClearAllPoints()
+        win.ownerSelector:SetPoint("LEFT", seg, "RIGHT", 10, 0)
+        win.ownerSelector:SetPoint("RIGHT", findBtn, "LEFT", -10, 0)
+    elseif win.ownerLabel then
+        win.ownerLabel:ClearAllPoints()
+        win.ownerLabel:SetPoint("LEFT", seg, "RIGHT", 10, 0)
+        win.ownerLabel:SetPoint("RIGHT", findBtn, "LEFT", -10, 0)
+        win.ownerLabel:SetJustifyH("LEFT")
+    end
+
     -- ── Bag-slot toggle strip (show/hide a container's slots) ─────────────────
     local strip = _G.CreateFrame("Frame", nil, win)
     strip:SetPoint("TOPLEFT", toolbar, "BOTTOMLEFT", 0, -Frame.VGAP)
@@ -672,20 +717,26 @@ function Frame.Ensure()
     local money = _G.CreateFrame("Button", nil, win)
     money:SetSize(160, Frame.MONEY_H)
     money:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    -- Defensive mouse wiring: explicitly enable mouse and float the money bar ABOVE the
+    -- content grid's frame-level stack so a hover always lands on it (the owner reported
+    -- the gold hover doing nothing). Buttons enable mouse by default, but the reskin path
+    -- makes this explicit and re-asserts it so nothing can silently drop the hover.
+    money:EnableMouse(true)
+    money:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
     local moneyFS = money:CreateFontString(nil, "OVERLAY")
     moneyFS:SetFontObject(UI.fonts.numeral or UI.fonts.body)   -- ARIALN numerals (§3)
     moneyFS:SetPoint("RIGHT", money, "RIGHT", 0, 0)
     moneyFS:SetJustifyH("RIGHT")
     -- Warm cream, not bright white — "gold is sacred" but rendered on-brand (§2/§3).
     UI.Skin(moneyFS, function(self) self:SetTextColor(UI.Color("text")) end)
+    -- cross-account totals are sacred (D1): grand total + per-account, from the pure,
+    -- harness-locked line builder (Frame.BuildMoneyLines).
     money:SetScript("OnEnter", function(self)
         _G.GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         _G.GameTooltip:AddLine("Gold", UI.Color("text"))
-        -- cross-account totals are sacred (D1): show the grand total + per account.
-        _G.GameTooltip:AddDoubleLine("All characters", moneyString(Store.TotalMoney()), 1,1,1, 1,1,1)
-        for acct, copper in pairs(Store.MoneyByAccount()) do
-            local label = acct ~= "" and acct or "Unlinked"
-            _G.GameTooltip:AddDoubleLine(label, moneyString(copper))
+        for _, ln in ipairs(Frame.BuildMoneyLines(Store.TotalMoney(), Store.MoneyByAccount())) do
+            local r, g, b = UI.Color(ln.isTotal and "text" or "muted")
+            _G.GameTooltip:AddDoubleLine(ln.label, moneyString(ln.copper), r, g, b, 1, 1, 1)
         end
         _G.GameTooltip:Show()
     end)
@@ -728,7 +779,21 @@ local function bagEquippedLink(slot)
     return nil
 end
 
+-- Live: is the cursor holding an actual BAG (the only valid strip equip payload)?
+-- GetCursorInfo("item") + GetItemInfoInstant(equipLoc) is the reliable check; falls
+-- back to CursorHasItem() only where GetCursorInfo is unavailable, and stays permissive
+-- when the held item can't be classified (never worse than the old behavior).
 local function cursorHasBag()
+    if _G.GetCursorInfo then
+        local kind, id = _G.GetCursorInfo()
+        if kind ~= "item" then return false end
+        local gii = (_G.C_Item and _G.C_Item.GetItemInfoInstant) or _G.GetItemInfoInstant
+        if gii and id then
+            local _, _, _, equipLoc = gii(id)
+            if equipLoc ~= nil then return Frame.CursorIsBag(kind, equipLoc) end
+        end
+        return true   -- item on cursor but unclassifiable: permissive
+    end
     return (_G.CursorHasItem and _G.CursorHasItem()) and true or false
 end
 
@@ -918,6 +983,74 @@ function Frame.RebuildStrip()
             b._fs:SetTextColor(UI.Color("faint"))
         end
         b:Show()
+    end
+end
+
+----------------------------------------------------------------------
+-- Diagnostics (/bags debug strip|toolbar|money) — print live gate/handler/geometry
+-- state so a silent behavioral report (BugSack shows no Lua error) becomes a concrete
+-- readout. Guarded + in-game only (needs the built window).
+----------------------------------------------------------------------
+
+local function P(s) if ns and ns.Print then ns:Print(s) end end
+
+function Frame.DebugStrip()
+    if not (ns and ns.Print) then return end
+    local win = Frame.window
+    if not win then P("[strip] window not built — open the bags first (/bags)"); return end
+    local owner = Frame.ViewedOwner()
+    local live = (ns.Items and ns.Items.IsLive and ns.Items.IsLive(owner)) and true or false
+    P(string.format("[strip] viewedKey=%s selfKey=%s IsLive=%s Items._self=%s inCombat=%s cursorBag=%s",
+        tostring(Frame.ViewedOwnerKey()), tostring(Frame.SelfKey()), tostring(live),
+        tostring(ns.Items and ns.Items._self), tostring(stripInCombat()), tostring(cursorHasBag())))
+    if not live then
+        P("  NOTE: viewed owner is not live-self -> strip is toggle-only (no bag equip). If")
+        P("        this is your OWN character, the self-key derivation is mismatched.")
+    end
+    for i, b in ipairs(win._stripButtons or {}) do
+        if b.IsShown and b:IsShown() then
+            local st = stripStateNow(b)
+            P(string.format("  btn%d cid=%s role=%s manageable=%s invSlot=%s equipped=%s | click=%s drop=%s drag=%s | handlers onClick=%s onDrag=%s onRecv=%s",
+                i, tostring(b._cid), tostring(b._role), tostring(b._manageable), tostring(b._slot),
+                tostring(st.equipped), tostring(st.clickAction), tostring(st.dropAction), tostring(st.dragAction),
+                tostring(b:GetScript("OnClick") ~= nil), tostring(b:GetScript("OnDragStart") ~= nil),
+                tostring(b:GetScript("OnReceiveDrag") ~= nil)))
+        end
+    end
+end
+
+function Frame.DebugToolbar()
+    if not (ns and ns.Print) then return end
+    local win = Frame.window
+    if not win then P("[toolbar] window not built — open the bags first (/bags)"); return end
+    local function d(name, f)
+        if not f then P("  " .. name .. " = MISSING"); return end
+        P(string.format("  %-14s shown=%s w=%.0f left=%.0f right=%.0f level=%s",
+            name, tostring(f.IsShown and f:IsShown()), (f.GetWidth and f:GetWidth()) or -1,
+            (f.GetLeft and f:GetLeft()) or -1, (f.GetRight and f:GetRight()) or -1,
+            tostring(f.GetFrameLevel and f:GetFrameLevel())))
+    end
+    P("[toolbar] control geometry (left/right in screen px; overlaps => crowding):")
+    d("layoutSeg", win.layoutSeg)
+    d("ownerSelector", win.ownerSelector)
+    d("ownerLabel", win.ownerLabel)
+    d("findBtn", win.findBtn)
+    d("sortBtn", win.sortBtn)
+    d("searchBox", win.searchBox)
+    P("  ns.Find present=" .. tostring(ns.Find ~= nil) .. " ns.Sort present=" .. tostring(ns.Sort ~= nil))
+end
+
+function Frame.DebugMoney()
+    if not (ns and ns.Print) then return end
+    local win = Frame.window
+    if not win or not win.money then P("[money] not built — open the bags first (/bags)"); return end
+    local m = win.money
+    P(string.format("[money] shown=%s mouseEnabled=%s left=%.0f right=%.0f bottom=%.0f top=%.0f level=%s onEnter=%s",
+        tostring(m:IsShown()), tostring(m.IsMouseEnabled and m:IsMouseEnabled()),
+        (m:GetLeft() or -1), (m:GetRight() or -1), (m:GetBottom() or -1), (m:GetTop() or -1),
+        tostring(m:GetFrameLevel()), tostring(m:GetScript("OnEnter") ~= nil)))
+    for _, ln in ipairs(Frame.BuildMoneyLines(Store.TotalMoney(), Store.MoneyByAccount())) do
+        P(string.format("  %s = %s", ln.label, moneyString(ln.copper)))
     end
 end
 
@@ -1519,9 +1652,37 @@ local function testStripButtonState(fails)
         "cached alt bag is toggle-only")
 end
 
+-- CURSOR-IS-BAG (Task 2): the strip's equip affordance must fire only for an actual
+-- bag on the cursor, not any item (CursorHasItem was over-broad).
+local function testCursorIsBag(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Frame.CursorIsBag("item", "INVTYPE_BAG") == true, "item + INVTYPE_BAG -> is a bag")
+    ck(Frame.CursorIsBag("item", "INVTYPE_CHEST") == false, "item with non-bag equipLoc -> not a bag")
+    ck(Frame.CursorIsBag("item", "") == false, "non-equippable item -> not a bag")
+    ck(Frame.CursorIsBag("spell", "INVTYPE_BAG") == false, "non-item cursor -> not a bag")
+    ck(Frame.CursorIsBag(nil, nil) == false, "empty cursor -> not a bag")
+end
+
+-- MONEY LINES (Task 4): the cross-account gold tooltip builder — grand total first,
+-- accounts by copper desc, empty account => "Unlinked", nil-safe.
+local function testMoneyLines(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local lines = Frame.BuildMoneyLines(1000, { ["acctA"] = 700, ["acctB"] = 300, [""] = 0 })
+    ck(lines[1].isTotal and lines[1].label == "All characters" and lines[1].copper == 1000, "grand total line first")
+    ck(lines[2].label == "acctA" and lines[2].copper == 700, "richest account second")
+    ck(lines[3].label == "acctB" and lines[3].copper == 300, "next account by copper desc")
+    ck(lines[4].label == "Unlinked" and lines[4].copper == 0, "empty account label -> Unlinked")
+    local solo = Frame.BuildMoneyLines(50, {})
+    ck(#solo == 1 and solo[1].copper == 50 and solo[1].isTotal, "no accounts -> just the total line")
+    ck(#Frame.BuildMoneyLines(nil, nil) == 1, "nil args -> one zero total line")
+    ck(Frame.BuildMoneyLines(nil, nil)[1].copper == 0, "nil total -> 0 copper")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "container order",     fn = testContainerOrder },
+        { name = "cursor is bag",       fn = testCursorIsBag },
+        { name = "money lines",         fn = testMoneyLines },
         { name = "combined entries",    fn = testCombinedEntries },
         { name = "split groups",        fn = testSplitGroups },
         { name = "grid + window size",  fn = testGridAndWindowSize },

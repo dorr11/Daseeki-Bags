@@ -167,6 +167,15 @@ local function dispatch(msg)
         local sub = (rest or ""):match("^(%S*)"):lower()
         if sub == "selftest" or sub == "" then
             ns:RunRegisteredSelfTests(true)
+        elseif sub == "strip" then
+            if ns.Frame and ns.Frame.DebugStrip then ns.Frame.DebugStrip()
+            else ns:Print("strip diagnostic unavailable") end
+        elseif sub == "toolbar" then
+            if ns.Frame and ns.Frame.DebugToolbar then ns.Frame.DebugToolbar()
+            else ns:Print("toolbar diagnostic unavailable") end
+        elseif sub == "money" then
+            if ns.Frame and ns.Frame.DebugMoney then ns.Frame.DebugMoney()
+            else ns:Print("money diagnostic unavailable") end
         else
             ns:Print("unknown debug command: " .. sub)
         end
@@ -177,6 +186,7 @@ local function dispatch(msg)
         ns:Print("  /bags find <name>   - find an item across every character")
         ns:Print("  /bags combined|split - switch layout")
         ns:Print("  /bags debug selftest - run self-tests")
+        ns:Print("  /bags debug strip|toolbar|money - diagnose the open window")
     else
         ns:Print("unknown command '" .. cmd .. "'. Try /bags help.")
     end
@@ -215,7 +225,19 @@ ns:RegisterEvent("PLAYER_LOGIN", function()
     -- Items must know the self character before any IsLive gate runs, so alt and
     -- remote owners render read-only from the first paint.
     if ns.Items and ns.Items.SetSelf and UnitName and GetRealmName then
-        ns:SafeCall(function() ns.Items.SetSelf(UnitName("player") .. "-" .. GetRealmName()) end)
+        ns:SafeCall(function()
+            -- MUST match capture.selfNameRealm's canonical key EXACTLY: the realm is
+            -- space-stripped there (SV keys drop spaces), so a raw UnitName.."-"..realm
+            -- mismatches owner.nameRealm on any spaced-realm and IsLive() is falsely
+            -- false — self bags would render inert and the bag-slot strip never becomes
+            -- manageable. Canonicalize through Store.MakeNameRealm(name, spaceStripped).
+            local realm = ((GetRealmName() or ""):gsub("%s+", ""))
+            ns.Items.SetSelf(ns.Store.MakeNameRealm(UnitName("player"), realm))
+        end)
+    end
+    -- Player class token drives the item-usability (proficiency) desaturation.
+    if ns.Items and ns.Items.SetPlayerClass and UnitClass then
+        ns:SafeCall(function() ns.Items.SetPlayerClass((select(2, UnitClass("player")))) end)
     end
     if ns.Capture and ns.Capture.OnLogin then ns:SafeCall(ns.Capture.OnLogin) end
     if ns.Frame   and ns.Frame.OnLogin   then ns:SafeCall(ns.Frame.OnLogin)   end

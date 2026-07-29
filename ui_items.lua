@@ -253,6 +253,87 @@ function Items.ResolveState(ctx)
     }
 end
 
+-- =====================================================================
+-- PURE: class equip PROFICIENCY (clean-room; restores the 1.x glowUnusable rule)
+--
+-- ROOT CAUSE this replaces: the beta's slotIsUnusable read C_Item.IsUsableItem,
+-- which for armor/weapons answers "can I right-click USE this now" — it returns
+-- FALSE for equippable gear the character can wear, so nearly ALL gear desaturated
+-- ("grey washed"). 1.x drove glowUnusable from Unfit-1.0 (class weapon/armor
+-- PROFICIENCY via GetItemInfoInstant), never IsUsableItem. This restores that real
+-- rule fresh: an item washes ONLY when the CHARACTER CLASS can never equip its
+-- weapon/armor subclass (or, per the owner ask, when it is below its required
+-- level). Item classes that are neither Weapon nor Armor (consumables, trade
+-- goods, quest, reagents…) never enter this path — they can't be "unequippable".
+--
+-- Numeric Enum.ItemClass / Enum.ItemWeaponSubclass / Enum.ItemArmorSubclass values
+-- (Classic Era 1.15) so the logic is pure (no live Enum global); the frame layer
+-- feeds classID/subclassID/equipLoc from GetItemInfoInstant, which resolves from
+-- static data for any valid itemID immediately (stable on the first paint).
+-- =====================================================================
+
+Items.ITEMCLASS_WEAPON = 2
+Items.ITEMCLASS_ARMOR  = 4
+
+-- weapon subclass ids (Classic)
+local W = { AXE1H=0, AXE2H=1, BOW=2, GUN=3, MACE1H=4, MACE2H=5, POLEARM=6,
+            SWORD1H=7, SWORD2H=8, WARGLAIVE=9, STAFF=10, FIST=13, DAGGER=15,
+            THROWN=16, CROSSBOW=18, WAND=19 }
+-- armor subclass ids (Classic)
+local A = { CLOTH=1, LEATHER=2, MAIL=3, PLATE=4, SHIELD=6 }
+
+local function set(...)
+    local t = {}
+    for _, v in ipairs({ ... }) do t[v] = true end
+    return t
+end
+
+-- Per Classic-Era class: the weapon + armor subclasses it can NEVER equip, and
+-- cannotDual (an OFFHAND-ONLY weapon is then unusable). Mirrors the 1.x Unfit tables
+-- for the nine Era classes (no DK/DH/Evoker/Monk exist in Era). cannotDual reflects
+-- the vanilla rule: only Warrior/Rogue/Hunter can dual-wield (trained skill).
+Items.PROFICIENCY = {
+    WARRIOR = { weapon = set(W.WARGLAIVE, W.WAND), armor = set(), cannotDual = false },
+    PALADIN = { weapon = set(W.BOW, W.GUN, W.WARGLAIVE, W.STAFF, W.FIST, W.DAGGER, W.THROWN, W.CROSSBOW, W.WAND), armor = set(), cannotDual = true },
+    HUNTER  = { weapon = set(W.MACE1H, W.MACE2H, W.WARGLAIVE, W.THROWN, W.WAND), armor = set(A.PLATE, A.SHIELD), cannotDual = false },
+    ROGUE   = { weapon = set(W.AXE2H, W.MACE2H, W.POLEARM, W.SWORD2H, W.WARGLAIVE, W.STAFF, W.WAND), armor = set(A.MAIL, A.PLATE, A.SHIELD), cannotDual = false },
+    PRIEST  = { weapon = set(W.AXE1H, W.AXE2H, W.BOW, W.GUN, W.MACE2H, W.POLEARM, W.SWORD1H, W.SWORD2H, W.WARGLAIVE, W.FIST, W.THROWN, W.CROSSBOW), armor = set(A.LEATHER, A.MAIL, A.PLATE, A.SHIELD), cannotDual = true },
+    MAGE    = { weapon = set(W.AXE1H, W.AXE2H, W.BOW, W.GUN, W.MACE1H, W.MACE2H, W.POLEARM, W.SWORD2H, W.WARGLAIVE, W.FIST, W.THROWN, W.CROSSBOW), armor = set(A.LEATHER, A.MAIL, A.PLATE, A.SHIELD), cannotDual = true },
+    WARLOCK = { weapon = set(W.AXE1H, W.AXE2H, W.BOW, W.GUN, W.MACE1H, W.MACE2H, W.POLEARM, W.SWORD2H, W.WARGLAIVE, W.FIST, W.THROWN, W.CROSSBOW), armor = set(A.LEATHER, A.MAIL, A.PLATE, A.SHIELD), cannotDual = true },
+    DRUID   = { weapon = set(W.AXE1H, W.AXE2H, W.BOW, W.GUN, W.SWORD1H, W.SWORD2H, W.WARGLAIVE, W.THROWN, W.CROSSBOW, W.WAND), armor = set(A.MAIL, A.PLATE, A.SHIELD), cannotDual = true },
+    SHAMAN  = { weapon = set(W.BOW, W.GUN, W.POLEARM, W.SWORD1H, W.SWORD2H, W.WARGLAIVE, W.THROWN, W.CROSSBOW, W.WAND), armor = set(A.PLATE), cannotDual = true },
+}
+
+-- Pure: can this class token NEVER equip this item? classID/subclassID/equipLoc come
+-- from GetItemInfoInstant. equipLoc "" (not equippable) or a non-weapon/armor class
+-- => usable (false). Unknown class token => never wash (safety).
+function Items.ClassCannotEquip(classToken, classID, subclassID, equipLoc)
+    local prof = classToken and Items.PROFICIENCY[classToken]
+    if not prof then return false end
+    if not equipLoc or equipLoc == "" then return false end     -- not equippable => usable
+    if classID == Items.ITEMCLASS_WEAPON then
+        if prof.weapon[subclassID] then return true end
+        if equipLoc == "INVTYPE_WEAPONOFFHAND" and prof.cannotDual then return true end
+        return false
+    elseif classID == Items.ITEMCLASS_ARMOR then
+        return prof.armor[subclassID] and true or false
+    end
+    return false                                                 -- neither weapon nor armor
+end
+
+-- Pure: additive per owner ask — an EQUIPPABLE item whose required level exceeds the
+-- character level reads unusable (native "requires level N"). Bags/ammo/non-equippable
+-- are exempt; an unknown (server-uncached) minLevel never washes (re-evaluated on the
+-- pending repaint once GetItemInfo resolves).
+Items.NONLEVEL_EQUIPLOC = { INVTYPE_BAG = true, INVTYPE_AMMO = true }
+function Items.IsBelowLevel(equipLoc, minLevel, playerLevel)
+    if not equipLoc or equipLoc == "" then return false end
+    if Items.NONLEVEL_EQUIPLOC[equipLoc] then return false end
+    if not minLevel or minLevel <= 1 then return false end
+    if not playerLevel then return false end
+    return playerLevel < minLevel
+end
+
 -- "cached 3d ago" tooltip line from an age in seconds (nil for a fresh/unknown age).
 function Items.FormatCachedAge(seconds)
     if not seconds or seconds < 0 then return nil end
@@ -269,6 +350,23 @@ end
 -- Self identity (which owner's bags are the live, interactive ones). Set at login
 -- via Items.SetSelf; derived lazily from UnitName/GetRealmName if unset.
 function Items.SetSelf(nameRealm) Items._self = nameRealm end
+
+-- Live player class token ("WARRIOR", …) for the proficiency gate. Set at login via
+-- Items.SetPlayerClass; derived lazily from UnitClass if unset. Cached (class never
+-- changes mid-session).
+function Items.SetPlayerClass(token) Items._playerClass = token end
+local function playerClassToken()
+    if Items._playerClass then return Items._playerClass end
+    if _G.UnitClass then
+        local _, token = _G.UnitClass("player")
+        Items._playerClass = token
+    end
+    return Items._playerClass
+end
+local function playerLevelNow()
+    if _G.UnitLevel then return _G.UnitLevel("player") end
+    return Items._playerLevel
+end
 
 function Items.IsLive(owner)
     if not owner or owner.source ~= "full" then return false end
@@ -383,15 +481,27 @@ local function slotIsQuest(button)
     return (info and (info.isQuestItem or info.questID)) and true or false
 end
 
--- UNUSABLE: C_Item.IsUsableItem(id) -> usable, noMana. "Can't use" (wrong class/level/
--- skill) is usable == false with noMana falsey; a mere lack of mana (noMana) is NOT
--- unusable and must not tint red. Restores 1.x glowUnusable as desaturate + danger tint.
+-- UNUSABLE: 1.x glowUnusable parity via CLASS PROFICIENCY (Items.ClassCannotEquip),
+-- NOT C_Item.IsUsableItem (which washed all equippable gear grey — the beta defect).
+-- GetItemInfoInstant resolves classID/subclassID/equipLoc from static data for any
+-- valid itemID immediately, so the proficiency verdict is stable on the first paint.
+-- The additive below-level gate uses GetItemInfo's minLevel (async — nil => not washed
+-- until known; the pending repaint re-evaluates once the server responds).
 local function slotIsUnusable(button)
-    local CI = _G.C_Item
     local id = button._data and button._data.id
-    if not (CI and CI.IsUsableItem and id) then return false end
-    local usable, noMana = CI.IsUsableItem(id)
-    return (usable == false and not noMana) and true or false
+    if not id then return false end
+    local gii = (_G.C_Item and _G.C_Item.GetItemInfoInstant) or _G.GetItemInfoInstant
+    if not gii then return false end
+    local _, _, _, equipLoc, _, classID, subclassID = gii(id)
+    if Items.ClassCannotEquip(playerClassToken(), classID, subclassID, equipLoc) then
+        return true
+    end
+    local gi = (_G.C_Item and _G.C_Item.GetItemInfo) or _G.GetItemInfo
+    if gi then
+        local _, _, _, _, minLevel = gi(id)
+        if Items.IsBelowLevel(equipLoc, minLevel, playerLevelNow()) then return true end
+    end
+    return false
 end
 
 -- Clear the new-item mark on interaction (1.x MarkSeen fact: RemoveNewItem on seen).
@@ -1498,9 +1608,80 @@ local function testClickIdentityMatrix(fails)
     ck(recorded.shown == true, "_setSlot shows the freshly-bound button")
 end
 
+-- CLASS PROFICIENCY MATRIX (Task 1 — the grey-wash fix). Locks the real Era rule
+-- (Unfit parity) that ONLY class-unequippable weapon/armor washes, and that
+-- consumables / non-gear never do. This is the regression guard for "IsUsableItem
+-- greyed everything".
+local function testProficiency(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local WEAPON, ARMOR = Items.ITEMCLASS_WEAPON, Items.ITEMCLASS_ARMOR
+    local function wep(class, sub) return Items.ClassCannotEquip(class, WEAPON, sub, "INVTYPE_WEAPONMAINHAND") end
+    local function arm(class, sub) return Items.ClassCannotEquip(class, ARMOR, sub, "INVTYPE_CHEST") end
+    -- subclass shorthands
+    local PLATE, MAIL, LEATHER, CLOTH, SHIELD = 4, 3, 2, 1, 6
+    local AXE1H, SWORD1H, SWORD2H, MACE1H, BOW, STAFF, DAGGER, WAND, WARGLAIVE = 0, 7, 8, 4, 2, 10, 15, 19, 9
+
+    -- WARRIOR: all armor incl. plate; every weapon but warglaive/wand.
+    ck(arm("WARRIOR", PLATE) == false, "warrior can wear plate")
+    ck(wep("WARRIOR", WAND) == true and wep("WARRIOR", WARGLAIVE) == true, "warrior can't wand/warglaive")
+    ck(wep("WARRIOR", SWORD2H) == false and wep("WARRIOR", BOW) == false, "warrior can 2h sword/bow")
+    -- MAGE: cloth only; staff/1h-sword/dagger/wand only.
+    ck(arm("MAGE", CLOTH) == false, "mage cloth ok")
+    ck(arm("MAGE", LEATHER) == true and arm("MAGE", MAIL) == true and arm("MAGE", PLATE) == true, "mage no leather/mail/plate")
+    ck(wep("MAGE", STAFF) == false and wep("MAGE", WAND) == false and wep("MAGE", DAGGER) == false and wep("MAGE", SWORD1H) == false, "mage staff/wand/dagger/1h-sword ok")
+    ck(wep("MAGE", SWORD2H) == true and wep("MAGE", MACE1H) == true and wep("MAGE", BOW) == true, "mage no 2h-sword/mace/bow")
+    -- PRIEST: 1h mace ok, 1h sword no; cloth only.
+    ck(wep("PRIEST", MACE1H) == false and wep("PRIEST", SWORD1H) == true, "priest mace1h ok, sword1h no")
+    ck(arm("PRIEST", LEATHER) == true, "priest no leather")
+    -- ROGUE: leather ok, mail no; dagger ok, staff no.
+    ck(arm("ROGUE", LEATHER) == false and arm("ROGUE", MAIL) == true, "rogue leather ok, mail no")
+    ck(wep("ROGUE", DAGGER) == false and wep("ROGUE", STAFF) == true, "rogue dagger ok, staff no")
+    -- HUNTER: mail ok, plate no; bow ok, wand no.
+    ck(arm("HUNTER", MAIL) == false and arm("HUNTER", PLATE) == true, "hunter mail ok, plate no")
+    ck(wep("HUNTER", BOW) == false and wep("HUNTER", WAND) == true, "hunter bow ok, wand no")
+    -- PALADIN: plate ok; sword/mace/axe ok, dagger/bow no.
+    ck(arm("PALADIN", PLATE) == false, "paladin plate ok")
+    ck(wep("PALADIN", SWORD1H) == false and wep("PALADIN", DAGGER) == true and wep("PALADIN", BOW) == true, "paladin sword ok, dagger/bow no")
+    -- DRUID: leather ok, mail no; mace ok, sword no.
+    ck(arm("DRUID", LEATHER) == false and arm("DRUID", MAIL) == true, "druid leather ok, mail no")
+    ck(wep("DRUID", MACE1H) == false and wep("DRUID", SWORD1H) == true, "druid mace ok, sword no")
+    -- SHAMAN: mail + shield ok, plate no; axe1h ok, sword no.
+    ck(arm("SHAMAN", MAIL) == false and arm("SHAMAN", SHIELD) == false and arm("SHAMAN", PLATE) == true, "shaman mail/shield ok, plate no")
+    ck(wep("SHAMAN", AXE1H) == false and wep("SHAMAN", SWORD1H) == true, "shaman axe1h ok, sword no")
+    -- WARLOCK mirrors MAGE.
+    ck(arm("WARLOCK", CLOTH) == false and arm("WARLOCK", MAIL) == true and wep("WARLOCK", DAGGER) == false, "warlock cloth/dagger ok, mail no")
+
+    -- OFFHAND dual-wield rule: paladin (cannotDual) offhand weapon unusable; rogue usable.
+    ck(Items.ClassCannotEquip("PALADIN", WEAPON, SWORD1H, "INVTYPE_WEAPONOFFHAND") == true, "paladin can't offhand a weapon (no dual-wield)")
+    ck(Items.ClassCannotEquip("ROGUE", WEAPON, SWORD1H, "INVTYPE_WEAPONOFFHAND") == false, "rogue can offhand a weapon (dual-wield)")
+
+    -- NON-GEAR never washes (any item class that isn't weapon/armor, any equipLoc).
+    ck(Items.ClassCannotEquip("MAGE", 0, 5, "") == false, "consumable never unusable")
+    ck(Items.ClassCannotEquip("WARRIOR", 7, 0, "") == false, "trade goods never unusable")
+    ck(Items.ClassCannotEquip("MAGE", ARMOR, PLATE, "") == false, "non-equippable armor row (no slot) -> not washed")
+    ck(Items.ClassCannotEquip("DEATHKNIGHT", WEAPON, WAND, "INVTYPE_WEAPONMAINHAND") == false, "unknown class never washes")
+end
+
+-- BELOW-LEVEL gate (additive per owner ask): equippable gear over the char level washes;
+-- consumables/bags/ammo and unknown/uncached levels never do.
+local function testBelowLevel(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, 30) == true, "gear req 40 at level 30 -> below level")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, 40) == false, "gear req 40 at level 40 -> usable")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, 41) == false, "gear req 40 at level 41 -> usable")
+    ck(Items.IsBelowLevel("", 40, 1) == false, "non-equippable never below-level")
+    ck(Items.IsBelowLevel("INVTYPE_BAG", 40, 1) == false, "bags exempt from level gate")
+    ck(Items.IsBelowLevel("INVTYPE_AMMO", 40, 1) == false, "ammo exempt from level gate")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", nil, 30) == false, "uncached minLevel never washes")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 1, 1) == false, "minLevel 1 never washes")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, nil) == false, "unknown player level -> safe (no wash)")
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
+        { name = "proficiency matrix", fn = testProficiency },
+        { name = "below-level gate",   fn = testBelowLevel },
         { name = "entry building",     fn = testEntryBuilding },
         { name = "quality derivation", fn = testQualityDerivation },
         { name = "dim + cached age",   fn = testDimAndAge },
