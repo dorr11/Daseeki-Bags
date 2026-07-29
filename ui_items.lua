@@ -298,11 +298,14 @@ end
 -- dress (no per-cell ThemeChanged hook — 100+ hooks are the per-frame cost C vetoes;
 -- the quality edge, which re-reads the live provider each paint, carries live rarity).
 local TOKEN_FALLBACK = {
-    inset  = { 0.0706, 0.0627, 0.0471 },
-    text   = { 0.9137, 0.8784, 0.8039 },
-    brand  = { 0.7529, 0.2824, 0.2353 }, -- crimson wax (Field Ledger)
-    warn   = { 0.9600, 0.7600, 0.1800 },
-    danger = { 0.8118, 0.3647, 0.2902 },
+    inset      = { 0.0706, 0.0627, 0.0471 }, -- #12100C sunken well (EMPTY cell)
+    raised     = { 0.1490, 0.1294, 0.0980 }, -- #262119 raised card (FILLED cell)
+    border     = { 0.2353, 0.2039, 0.1490 }, -- #3C3426 hairline (the 1px cell border)
+    borderLite = { 0.3020, 0.2627, 0.1922 }, -- #4D4331 lighter hairline (hover wash)
+    text       = { 0.9137, 0.8784, 0.8039 },
+    brand      = { 0.7529, 0.2824, 0.2353 }, -- crimson wax (Field Ledger)
+    warn       = { 0.9600, 0.7600, 0.1800 },
+    danger     = { 0.8118, 0.3647, 0.2902 },
 }
 local function tokenRGB(name)
     if _G.DaseekiUI and _G.DaseekiUI.Color then return _G.DaseekiUI.Color(name) end
@@ -509,61 +512,248 @@ local function styleCount(button)
     end
 end
 
--- Neutralize the item-button template's BUILT-IN slot artwork so the quiet inset well
--- reads clean. Both templates (ContainerFrameItemButtonTemplate live / ItemButtonTemplate
--- cached) ship a 64x64 "UI-Quickslot2" NormalTexture — a bluish-lavender slot ring that
--- draws OVER our BACKGROUND well: on an EMPTY cell it reads as a bright-blue glow (defect
--- #1), on a FILLED cell it rims the icon edges blue-purple (the "thick bright" most-slots
--- symptom of defect #2). We also hide the native IconBorder (Blizzard's full-saturation
--- quality ring, present on newer ItemButton) so the ONLY quality rim is borders.lua's
--- 1px/2px DESATURATED rare+ edge. SECURE/TAINT: pure texture ops on child regions
--- (SetTexture/SetAlpha/Hide) — never a protected op (no Show/Hide/SetPoint/SetID/… on
--- the secure button itself), safe empty AND filled, both templates. SetAlpha(0) survives
--- any later template :Show() of the region, so the art stays dead after one call.
--- Guard-free of the WoW API (operates on the accessors the button exposes) so the harness
--- can drive it headless with a fake button.
-function Items._neutralizeSlotArt(button)
-    if not button then return nil end
+-- =====================================================================
+-- TEMPLATE-ART KILL-LIST — the load-bearing defensive layer
+-- =====================================================================
+-- INSTITUTIONAL LESSON (why the previous single-shot neutralize failed): killing the
+-- template art ONCE at creation is not enough. ContainerFrameItemButtonTemplate /
+-- ItemButtonTemplate re-apply their art AFTER creation — SetItemButton* helpers, the
+-- template's own OnShow, and quality/new-item update paths re-SHOW NormalTexture /
+-- IconBorder / NewItemTexture and re-start the flash/glow anims. Any build that verifies
+-- the kill only at creation is verifying a state the game overwrites on the owner's screen.
+--
+-- So this is DEFENSIVE BY CONSTRUCTION, three redundant layers:
+--   (1) an EXHAUSTIVE kill sweep (Items._killTemplateArt) that unconditionally hides every
+--       art region both templates own and stops the glow anims — idempotent, cheap, pure
+--       texture/anim ops;
+--   (2) GLOBAL hooksecurefunc post-hooks on the resurrection helpers (SetItemButtonTexture
+--       / SetItemButtonQuality / SetItemButtonCount) that re-sweep OUR buttons the instant
+--       the game touches them, plus a per-button OnShow HookScript re-sweep;
+--   (3) a re-kill sweep at the top of our OWN paint (paintButton) so a repaint can never
+--       leave resurrected art on screen.
+-- The ONLY visible slot art after this is OURS (well + quality edge + markers + count).
+--
+-- Every entry has a REASON (the owner asked "no blue anywhere"; each is a blue/bright vector):
+--   NormalTexture      UI-Quickslot2 bluish-lavender ring — empty-cell blue glow (defect #1)
+--                      + filled-cell blue-purple rim (defect #2). Killed + SetNormalTexture(nil).
+--   IconBorder         Blizzard's FULL-saturation quality ring — the bright rim on rares+.
+--                      Ours (borders.lua) is the only, desaturated, quality edge.
+--   NewItemTexture     the "new loot" flash sheet (blue/gold burst) — our crimson wax dot replaces it.
+--   flashAnim /        AnimationGroups that PULSE NewItemTexture's alpha back up — stopped, or
+--   newitemglowAnim    the sheet we just hid re-animates itself bright next frame.
+--   BattlepayItemTexture  cash-shop swirl — irrelevant in Classic bags, hidden for safety.
+--   JunkIcon           the vendor-coin overlay on greys — we express junk as a calm desat instead.
+--   UpgradeIcon        green upgrade arrow (may be absent in Classic) — off; we don't upsell.
+--   IconOverlay(2)     azerite/corruption ring (retail-only; absent in Classic) — off if present.
+--   SearchOverlay      the template's OWN dark search dim — we run our own dim cascade; killing
+--                      it prevents a double-dark muddy overlay (a "dull" contributor).
+--   IconQuestTexture   yellow "!" quest ring — our warn tab replaces it.
+--   Stock              merchant stock count — never valid in bags, hidden.
+--   Cooldown edge/bling  the cooldown swipe's bright edge ring + finish flash — quieted
+--                      (SetDrawEdge/SetDrawBling false); the dark swipe itself stays (ours).
+--
+-- SECURE / TAINT: every op here is a texture/animation op on a CHILD region of the button
+-- (SetTexture / SetAlpha / Hide / anim:Stop / Cooldown:SetDrawEdge). NONE is a protected op
+-- on the secure button itself (no Show/Hide/SetPoint/SetID/SetParent/SetAttribute on the
+-- button), so the whole sweep is combat-safe and taint-free — it can run on every paint and
+-- inside the hooksecurefunc post-hooks without touching the secure click path.
+-- Guard-free of the WoW API (resolves regions via the accessors/$parent names the templates
+-- expose) so the harness drives it headless with a fake button.
+
+-- Resolve a named child region by accessor field first, then $parentName global.
+local function region(button, field, suffix)
+    if button[field] ~= nil then return button[field] end
     local name = button.GetName and button:GetName()
+    if name and _G then return _G[name .. suffix] end
+    return nil
+end
+
+-- Hide a texture region hard: clear its texture, park alpha at 0 (survives a later
+-- template :Show()), and Hide(). Records it in the button's art registry for the gate.
+local function hideRegion(button, tex, key)
+    if not tex then return end
+    if tex.SetTexture then tex:SetTexture(nil) end
+    if tex.SetAlpha   then tex:SetAlpha(0)    end
+    if tex.Hide       then tex:Hide()         end
+    button._dsArt = button._dsArt or {}
+    button._dsArt[key] = tex
+end
+
+-- Stop a pulsing AnimationGroup (the glow motors) so a hidden sheet cannot re-animate bright.
+local function stopAnim(ag)
+    if not ag then return end
+    if ag.Stop   then ag:Stop()   end
+    if ag.Finish then pcall(ag.Finish, ag) end
+end
+
+-- THE exhaustive kill sweep. Idempotent; safe on any button shape (accessor OR $parent OR
+-- neither). Returns the NormalTexture (back-compat with callers/tests).
+function Items._killTemplateArt(button)
+    if not button then return nil end
+
+    -- NormalTexture is fetched via its accessor when present (not a plain field), else
+    -- via _normalTexture / $parentNormalTexture (the harness's fake-button shape).
     local nt = (button.GetNormalTexture and button:GetNormalTexture())
         or button._normalTexture
-        or (name and _G and _G[name .. "NormalTexture"])
-    if nt then
-        if nt.SetTexture then nt:SetTexture(nil) end
-        if nt.SetAlpha   then nt:SetAlpha(0)    end
-        if nt.Hide       then nt:Hide()         end
-        button._dsSlotArtHidden = nt
-    end
-    -- Blank the button's stored normal texture too so the template can't re-set the art.
+        or (button.GetName and _G and _G[(button:GetName() or "") .. "NormalTexture"])
+    hideRegion(button, nt, "normal")
+    -- Blank the button's STORED normal texture so the template cannot re-set the ring.
     if button.SetNormalTexture then pcall(button.SetNormalTexture, button, nil) end
-    local ib = button.IconBorder
-        or (name and _G and _G[name .. "IconBorder"])
-    if ib then
-        if ib.SetAlpha then ib:SetAlpha(0) end
-        if ib.Hide     then ib:Hide()      end
-        button._dsIconBorderHidden = ib
+    button._dsSlotArtHidden = nt   -- back-compat marker
+
+    local ib = region(button, "IconBorder", "IconBorder")
+    hideRegion(button, ib, "iconBorder")
+    button._dsIconBorderHidden = ib   -- back-compat marker
+
+    hideRegion(button, region(button, "NewItemTexture",        "NewItemTexture"),        "newItem")
+    hideRegion(button, region(button, "BattlepayItemTexture",  "BattlepayItemTexture"),  "battlepay")
+    hideRegion(button, region(button, "JunkIcon",              "JunkIcon"),              "junk")
+    hideRegion(button, region(button, "UpgradeIcon",           "UpgradeIcon"),           "upgrade")
+    hideRegion(button, region(button, "IconOverlay",           "IconOverlay"),           "iconOverlay")
+    hideRegion(button, region(button, "IconOverlay2",          "IconOverlay2"),          "iconOverlay2")
+    hideRegion(button, region(button, "searchOverlay",         "SearchOverlay"),         "searchOverlay")
+    hideRegion(button, region(button, "IconQuestTexture",      "IconQuestTexture"),      "quest")
+    hideRegion(button, region(button, "Stock",                 "Stock"),                 "stock")
+    button._dsNativeQuest = button._dsArt and button._dsArt.quest   -- back-compat marker
+
+    -- Stop the new-item glow motors (they pulse NewItemTexture's alpha).
+    stopAnim(button.flashAnim)
+    stopAnim(button.newitemglowAnim)
+
+    -- Quiet the cooldown swipe's bright edge ring + finish flash; keep the dark swipe (ours).
+    local cd = button.Cooldown or button.cooldown
+        or (button.GetName and _G[(button:GetName() or "") .. "Cooldown"])
+    if cd then
+        if cd.SetDrawEdge  then cd:SetDrawEdge(false)  end
+        if cd.SetDrawBling then cd:SetDrawBling(false) end
     end
+
     return nt
 end
 
+-- Back-compat alias (older call sites / tests referenced the single-shot name).
+Items._neutralizeSlotArt = Items._killTemplateArt
+
+-- GATE HELPER: does the art registry report every killed region hidden? True iff every
+-- recorded region has alpha 0 OR is not shown. The kill-list presence test drives a
+-- SetItemButtonQuality-style resurrection (re-show the regions), fires the re-kill, and
+-- asserts this returns true — proving the DEFENSIVE re-kill, not just the creation kill.
+function Items.ArtRegistryHidden(button)
+    local reg = button and button._dsArt
+    if not reg then return true end
+    for _, tex in pairs(reg) do
+        local a = tex.GetAlpha and tex:GetAlpha()
+        local shown = tex.IsShown and tex:IsShown()
+        if (a ~= nil and a > 0) and (shown ~= false) then return false end
+    end
+    return true
+end
+
+-- Restyle the KEPT click feedback (hover highlight + pressed) to a quiet token wash so we
+-- keep the tactile feedback without the template's bluish default highlight. In-game only
+-- (SetHighlightTexture/SetPushedTexture are button methods). Non-secure texture setup at
+-- creation — not a protected op.
+local function restyleFeedback(button)
+    if button.SetHighlightTexture then
+        local hl = button:CreateTexture(nil, "HIGHLIGHT")
+        hl:SetTexture("Interface\\Buttons\\WHITE8X8")
+        hl:SetVertexColor(tokenRGB("borderLite"))
+        hl:SetAlpha(0.18)   -- barely-there warm wash, not the blue glow
+        hl:SetPoint("TOPLEFT", button, "TOPLEFT", 1, -1)
+        hl:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
+        button:SetHighlightTexture(hl)
+        button._dsHighlight = hl
+    end
+    if button.GetPushedTexture and button.SetPushedTexture then
+        local pt = button:CreateTexture(nil, "OVERLAY")
+        pt:SetTexture("Interface\\Buttons\\WHITE8X8")
+        pt:SetVertexColor(tokenRGB("border"))
+        pt:SetAlpha(0.28)
+        pt:SetPoint("TOPLEFT", button, "TOPLEFT", 1, -1)
+        pt:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
+        button:SetPushedTexture(pt)
+        button._dsPushed = pt
+    end
+end
+
+-- Install the GLOBAL defensive re-kill hooks ONCE. hooksecurefunc post-hooks run AFTER the
+-- game's own helper, so the instant the template re-applies art (icon/quality/count update)
+-- we re-sweep. The hooks are global (these helpers are global), but each body no-ops unless
+-- the button is one of OURS (marked _dsWell) — a single cheap identity check; foreign item
+-- buttons (bank/merchant/etc.) are untouched. hooksecurefunc is the sanctioned non-tainting
+-- hook; the bodies do only child-texture ops, so no taint reaches the secure click path.
+local function installArtHooks()
+    if Items._artHooksInstalled or not _G.hooksecurefunc then return end
+    if _G.SetItemButtonTexture then
+        _G.hooksecurefunc("SetItemButtonTexture", function(btn)
+            if btn and btn._dsWell then Items._killTemplateArt(btn) end
+        end)
+    end
+    if _G.SetItemButtonQuality then
+        _G.hooksecurefunc("SetItemButtonQuality", function(btn)
+            if btn and btn._dsWell then Items._killTemplateArt(btn) end
+        end)
+    end
+    if _G.SetItemButtonCount then
+        _G.hooksecurefunc("SetItemButtonCount", function(btn)
+            if btn and btn._dsCount then styleCount(btn) end   -- re-assert our numeral style
+        end)
+    end
+    Items._artHooksInstalled = true
+end
+Items._installArtHooks = installArtHooks
+
+-- Set a cell's BACKING state: empty -> `inset` sunken well; filled -> `raised` card. The
+-- raised fill lifts a held item onto a subtle card (depth the flat beta lacked — the "dull"
+-- fix) while empties stay dead-calm recessed drop targets. Pure texture recolor.
+local function setWellState(button, filled)
+    if not button._dsWell then return end
+    button._dsWell:SetColorTexture(tokenRGB(filled and "raised" or "inset"))
+end
+
+-- Toggle the calm 1px cell hairline. It is the DEFAULT quiet cell definition (the DaseekiUI
+-- "inset input" look: dark fill + `border` hairline). On a rare+ cell the louder desaturated
+-- quality edge REPLACES it, so the two never double-rim: pass showEdge=true to hide the
+-- hairline when borders.lua is drawing the quality edge instead.
+local function setWellBorder(button, showEdge)
+    if not button._dsWellBorder then return end
+    if showEdge then button._dsWellBorder:Hide() else button._dsWellBorder:Show() end
+end
+
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
--- combat-deferred layout): quiet inset well + new-item wax dot + quest warn tab. All are
--- non-secure children; nothing here (or at runtime) is a protected op on the button.
+-- combat-deferred layout): quiet inset well + 1px cell hairline + new-item wax dot +
+-- quest warn tab. All are non-secure children; nothing here (or at runtime) is a protected
+-- op on the button. Also installs the global defensive re-kill hooks (once) and restyles
+-- the kept click feedback to a quiet wash.
 local function ensureDress(button)
     if button._dsWell or not _G.CreateFrame then return end
 
-    -- Kill the template's native slot art FIRST (the bright-blue UI-Quickslot2 ring +
-    -- native quality border) so our calm inset well below is the only slot substrate.
-    Items._neutralizeSlotArt(button)
+    -- Kill the template's native art FIRST (exhaustive sweep) so our calm well below is the
+    -- only slot substrate, and arm the defensive re-kill hooks + quiet feedback restyle.
+    Items._killTemplateArt(button)
+    installArtHooks()
+    restyleFeedback(button)
 
-    -- Quiet inset WELL (BACKGROUND): a calm recessed substrate under every cell so empties
-    -- read as intentional drop targets and fills sit in a dark well. No per-slot edge
-    -- (C floor: 100+ snapped edges shimmer for little gain — the gap already IS the grid).
+    -- Quiet WELL (BACKGROUND): a calm substrate under every cell. `inset` when empty (sunken
+    -- drop target), recolored `raised` when filled (item sits on a subtle card). Set inset now.
     local well = button:CreateTexture(nil, "BACKGROUND")
     well:SetPoint("TOPLEFT", button, "TOPLEFT", 1, -1)
     well:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
     well:SetColorTexture(tokenRGB("inset"))
     button._dsWell = well
+
+    -- 1px pixel-snapped `border` hairline defining the cell (crisp at 720p — the opposite of
+    -- the fractional-scale blurry ring that read "grainy"). Drawn by borders.lua's shared
+    -- snapped-outline factory (one owner for all grid edges, one snap driver). Rare+ cells
+    -- hide it in favor of the quality edge (setWellBorder) so cells never double-rim.
+    if ns.Borders and ns.Borders.NewSnappedOutline then
+        local wb = ns.Borders.NewSnappedOutline(button, { outset = 0, layer = "BORDER", thicknessPx = 1 })
+        if wb then
+            wb:SetColor(tokenRGB("border"))
+            wb:Show()
+            button._dsWellBorder = wb
+        end
+    end
 
     local sz = button:GetWidth() or Items.DEFAULT_SIZE
 
@@ -581,7 +771,7 @@ local function ensureDress(button)
     button._dsNewDot = dot
 
     -- QUEST warn tab (warn token), top-left corner — WoW's "!" convention without the
-    -- yellow bang art.
+    -- yellow bang art (the native quest ring is already killed in _killTemplateArt).
     local tab = button:CreateTexture(nil, "OVERLAY")
     local tsz = math.max(5, math.floor(sz * 0.26))
     tab:SetSize(tsz, tsz)
@@ -590,22 +780,24 @@ local function ensureDress(button)
     tab:Hide()
     button._dsQuestTab = tab
 
-    -- Suppress the template's native yellow quest bang; our warn tab replaces it.
-    local qt = button.IconQuestTexture
-        or (button.GetName and _G[(button:GetName() or "") .. "IconQuestTexture"])
-    if qt then qt:Hide(); button._dsNativeQuest = qt end
-
     styleCount(button)
 end
 Items._ensureDress = ensureDress
 
 local function paintButton(button)
+    -- DEFENSIVE re-kill sweep (layer 3): our own paint calls SetItemButton* below, which are
+    -- the template's art-resurrection helpers. Sweeping first makes a repaint idempotent w.r.t.
+    -- template art — no resurrected blue can survive a paint even if a hook is somehow missed.
+    Items._killTemplateArt(button)
+
     local data = button._data
     if not data or not data.id then
         if _G.SetItemButtonTexture then _G.SetItemButtonTexture(button, nil) end
         if _G.SetItemButtonCount then _G.SetItemButtonCount(button, 0) end
         local icon = iconOf(button); if icon then icon:SetTexture(nil) end
         if ns.Borders then ns.Borders.Apply(button, nil) end
+        setWellState(button, false)     -- EMPTY -> inset well
+        setWellBorder(button, false)    -- empty cells show the calm 1px hairline
         if button._live then updateCooldown(button) end
         button._pendingId = nil
         button._quality = nil
@@ -619,8 +811,16 @@ local function paintButton(button)
     else local t = iconOf(button); if t then t:SetTexture(icon) end end
     if _G.SetItemButtonCount then _G.SetItemButtonCount(button, (visual and visual.count) or 1) end
 
-    if ns.Borders then ns.Borders.Apply(button, visual and visual.quality) end
-    button._quality = visual and visual.quality
+    local quality = visual and visual.quality
+    if ns.Borders then ns.Borders.Apply(button, quality) end
+    button._quality = quality
+
+    -- FILLED -> raised card backing. The 1px hairline yields to the quality edge on rare+
+    -- (borders.lua draws it) so a cell never carries both rims.
+    setWellState(button, true)
+    local edgeShown = ns.Borders and ns.Borders.ShouldShow
+        and ns.Borders.ShouldShow(quality, ns.Borders.Enabled()) or false
+    setWellBorder(button, edgeShown)
 
     if button._live then
         updateCooldown(button)
@@ -696,6 +896,14 @@ function Items.CreateButton(parent, opts)
 
     if ns.Borders then ns.Borders.Attach(button) end
     ensureDress(button)
+
+    -- DEFENSIVE re-kill (layer 2b): the template's OWN OnShow re-applies art every time the
+    -- button is shown (relayout / pool reuse). A non-secure OnShow post-hook re-sweeps AFTER
+    -- it, so no resurrected NormalTexture/NewItemTexture ever survives a Show. Never touches
+    -- the secure click path (HookScript adds an insecure post-hook; body is texture-only).
+    if button.HookScript then
+        button:HookScript("OnShow", function(self) Items._killTemplateArt(self) end)
+    end
 
     button.SetSlot   = function(self, o, c, s, d) Items._setSlot(self, o, c, s, d) end
     button.SetEmpty  = function(self, o, c, s)    Items._setSlot(self, o, c, s, nil) end
@@ -1155,6 +1363,141 @@ local function testSlotArtNeutralized(fails)
     ck(Items._neutralizeSlotArt(nil) == nil, "nil button -> safe no-op")
 end
 
+-- KILL-LIST PRESENCE GATE — proves the DEFENSIVE re-kill, not just the creation kill.
+-- Builds a fake button with every art region VISIBLE, kills once, then simulates the
+-- template's SetItemButtonQuality/OnShow resurrection (re-showing NormalTexture / IconBorder
+-- / NewItemTexture and restarting the glow anim), runs the re-kill the hooks + paint sweep
+-- would run, and asserts the art registry reports EVERYTHING hidden again. This is the gate
+-- the institutional lesson demands: the render is defensive by construction, not verified
+-- only at the moment of creation.
+local function testKillListResurrection(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function tex()
+        local t = { alpha = 1, shown = true, tex = "art" }
+        function t:SetTexture(v) self.tex = v end
+        function t:SetAlpha(a) self.alpha = a end
+        function t:Hide() self.shown = false end
+        function t:Show() self.shown = true end
+        function t:GetAlpha() return self.alpha end
+        function t:IsShown() return self.shown end
+        return t
+    end
+    local anim = { running = true }
+    function anim:Stop() self.running = false end
+    function anim:Finish() end
+    local cd = { edge = true, bling = true }
+    function cd:SetDrawEdge(v) self.edge = v end
+    function cd:SetDrawBling(v) self.bling = v end
+
+    local normal, iconBorder, newItem, battlepay, junk, quest, search =
+        tex(), tex(), tex(), tex(), tex(), tex(), tex()
+    local btn = {
+        _dsWell = true, _dsCount = true,   -- marks it "ours" for the hook bodies
+        GetNormalTexture = function() return normal end,
+        SetNormalTexture = function() end,
+        IconBorder = iconBorder, NewItemTexture = newItem,
+        BattlepayItemTexture = battlepay, JunkIcon = junk,
+        IconQuestTexture = quest, searchOverlay = search,
+        flashAnim = anim, newitemglowAnim = anim, Cooldown = cd,
+    }
+
+    Items._killTemplateArt(btn)
+    ck(Items.ArtRegistryHidden(btn) == true, "after first kill: all art hidden")
+    ck(anim.running == false, "new-item glow anim stopped")
+    ck(cd.edge == false and cd.bling == false, "cooldown edge + bling quieted")
+    for _, k in ipairs({ "normal", "iconBorder", "newItem", "battlepay", "junk", "quest", "searchOverlay" }) do
+        ck(btn._dsArt[k] ~= nil, "kill registry enumerates " .. k)
+    end
+
+    -- RESURRECTION: the template re-shows its art (exactly what SetItemButtonQuality / the
+    -- template OnShow do after our creation-time kill).
+    normal:Show(); normal.alpha = 1; normal.tex = "UI-Quickslot2"
+    iconBorder:Show(); iconBorder.alpha = 1
+    newItem:Show(); newItem.alpha = 1
+    anim.running = true
+    ck(Items.ArtRegistryHidden(btn) == false, "resurrection is detectable (registry not all-hidden)")
+
+    -- The re-kill the global hooks + paint sweep run:
+    Items._killTemplateArt(btn)
+    ck(Items.ArtRegistryHidden(btn) == true, "re-kill hides ALL resurrected art (defensive)")
+    ck(anim.running == false, "re-kill re-stops the glow anim")
+    ck(normal.alpha == 0 and newItem.alpha == 0 and iconBorder.alpha == 0,
+        "re-kill parks NormalTexture/NewItemTexture/IconBorder at alpha 0")
+end
+
+-- CLICK-IDENTITY MATRIX (Task 2). Proves the LAYOUT MATH binds each render position to the
+-- correct (cid, slot) as a 1:1 map across every mode, and that _setSlot writes that slot into
+-- the secure button's GetID(). A stale-ID click bug (the "completely broken" suspect) would
+-- surface here as a position carrying the wrong (cid,slot), or a duplicated / dropped pair.
+local function testClickIdentityMatrix(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local o = newOwnerWith({
+        [0]  = { size = 4, slots = { [1] = { id = 6948 }, [3] = { id = 22157, quality = 3 } } },
+        [1]  = { size = 3, link = "item:14046", slots = { [2] = { id = 4234 } } },
+        [-1] = { size = 2, slots = { [1] = { id = 4306 } } },
+    })
+
+    local function assertBijection(list, label)
+        local seen = {}
+        for i, e in ipairs(list) do
+            ck(e.cid ~= nil and e.slot ~= nil, label .. " entry " .. i .. " carries cid+slot")
+            local key = tostring(e.cid) .. ":" .. tostring(e.slot)
+            ck(not seen[key], label .. " no duplicate (cid,slot) binding " .. key)
+            seen[key] = true
+        end
+        return seen
+    end
+
+    -- COMBINED-FLAT: positions map to (cid,slot) — backpack 1..4, then bag 1..3, then bank 1..2.
+    local flat = Items.BuildEntries(o, { scope = "all" })
+    ck(#flat == 4 + 3 + 2, "combined flatten covers every slot of every container")
+    assertBijection(flat, "combined")
+    ck(flat[1].cid == 0 and flat[1].slot == 1, "combined pos1 = backpack slot1")
+    ck(flat[3].cid == 0 and flat[3].slot == 3 and flat[3].data and flat[3].data.quality == 3,
+        "combined pos3 = backpack slot3 (the rare) — position carries the RIGHT slot")
+    ck(flat[5].cid == 1 and flat[5].slot == 1, "combined pos5 = bag1 slot1")
+
+    -- SPLIT: each group is one cid; positions 1..size map to slots 1..size within that cid.
+    local groups = Items.BuildGroups(o, { scope = "all" })
+    for _, g in ipairs(groups) do
+        for i, e in ipairs(g.entries) do
+            ck(e.cid == g.cid, "split group " .. tostring(g.cid) .. " entry keeps its own cid")
+            ck(e.slot == i, "split group slot follows render position")
+        end
+    end
+
+    -- CATEGORIES (mixed-cid section): a category = a saved query, so its section mixes bags.
+    -- Every entry must keep its ORIGINAL (cid,slot) — mixed cids allowed — and the section's
+    -- pairs must equal the occupied source slots exactly (no repaint over a stale pair).
+    local filled = {}
+    for _, e in ipairs(flat) do if e.data then filled[#filled + 1] = e end end
+    local seen = assertBijection(filled, "category section")
+    ck(seen["0:1"] and seen["0:3"] and seen["1:2"] and seen["-1:1"],
+        "mixed-cid section spans all bags with the exact source (cid,slot) pairs")
+
+    -- RE-BUCKET STABILITY: a reorder / search pass reuses pooled buttons. Position i must ALWAYS
+    -- rebind to entries[i]'s own (cid,slot) — never inherit a stale pair from its prior tenant.
+    local flat2 = Items.BuildEntries(o, { scope = "all" })
+    for i = 1, #flat2 do
+        ck(flat2[i].cid == flat[i].cid and flat2[i].slot == flat[i].slot,
+            "rebuild position " .. i .. " rebinds to the same (cid,slot)")
+    end
+
+    -- SetID BINDING: _setSlot writes the displayed slot into the secure button's GetID() and
+    -- records cid/slot, so the template's secure click acts on exactly the pair it paints.
+    local recorded = {}
+    local fakeIcon = { SetTexture = function() end, SetAlpha = function() end,
+                       SetDesaturated = function() end, SetVertexColor = function() end }
+    local btn = { _live = true, icon = fakeIcon,
+                  SetNormalTexture = function() end,
+                  SetID = function(_, id) recorded.id = id end,
+                  Show  = function() recorded.shown = true end }
+    Items._setSlot(btn, o, 1, 2, o.containers[1].slots[2])
+    ck(recorded.id == 2, "_setSlot -> button:SetID(displayed slot)")
+    ck(btn._cid == 1 and btn._slot == 2, "_setSlot binds cid+slot fields to the displayed pair")
+    ck(recorded.shown == true, "_setSlot shows the freshly-bound button")
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -1165,6 +1508,8 @@ function Items.RunSelfTests(verbose)
         { name = "state precedence",   fn = testStatePrecedence },
         { name = "dim cascade",        fn = testDimCascade },
         { name = "slot-art neutralized", fn = testSlotArtNeutralized },
+        { name = "kill-list resurrection", fn = testKillListResurrection },
+        { name = "click-identity matrix",  fn = testClickIdentityMatrix },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

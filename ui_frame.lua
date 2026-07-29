@@ -1076,6 +1076,7 @@ function Frame.Rebuild()
         else
             local entries = Frame.BuildCombinedEntries(owner, opts)
             local g = acquireGroup(win, 1)
+            if g.SetHeader then g:SetHeader(nil) end   -- clear any leftover split bag-header on a reused group
             g:SetGrid(cols, bs, gap)
             g:ClearAllPoints()
             g:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, 0)

@@ -270,6 +270,11 @@ function Borders.Apply(button, quality)
         if t.SetVertexColor then t:SetVertexColor(r, g, bl, 1) end
         t:Show()
     end)
+    -- Idempotent re-show: a prior search-dim may have parked the container at 0.25
+    -- alpha (Borders.SetAlpha). Reset to full here so Apply is self-contained and a
+    -- re-shown edge never inherits a stale dim, regardless of paint call order. The
+    -- dim cascade re-applies afterward from _applyDress if the slot is still dimmed.
+    if b.SetAlpha then b:SetAlpha(1) end
     b:Show()
 end
 
@@ -279,6 +284,92 @@ end
 function Borders.SetAlpha(button, alpha)
     local b = button and button._dsBagsBorder
     if b and b.SetAlpha then b:SetAlpha(alpha or 1) end
+end
+
+----------------------------------------------------------------------
+-- SHARED pixel-snapped outline factory (borders.lua owns ALL snapped-edge
+-- drawing in the grid). The quality edge above is the rare+ consumer; the item
+-- grid's per-cell WELL border (the quiet "inset input" hairline that defines
+-- every cell — dead-calm, `border` token) is the other. One implementation, one
+-- snap driver, so both stay crisp at 720p and re-snap together on scale changes.
+----------------------------------------------------------------------
+
+-- PURE: physical thickness (local units) of a `logicalPx`-thick line given the
+-- one-physical-pixel unit. Kept pure so the grid can assert 1px stays 1px.
+function Borders.PhysicalThickness(logicalPx, onePixelUnit)
+    local px = logicalPx or 1
+    if px < 0 then px = 0 end
+    return px * (onePixelUnit or 1)
+end
+
+-- Position a four-texture outline of physical thickness `unit` around frame `b`.
+local function layoutOutline(b, unit)
+    local e = b._edges
+    if not e then return end
+    e.top:ClearAllPoints()
+    e.top:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
+    e.top:SetPoint("TOPRIGHT", b, "TOPRIGHT", 0, 0)
+    e.top:SetHeight(unit)
+    e.bottom:ClearAllPoints()
+    e.bottom:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, 0)
+    e.bottom:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 0)
+    e.bottom:SetHeight(unit)
+    e.left:ClearAllPoints()
+    e.left:SetPoint("TOPLEFT", b, "TOPLEFT", 0, -unit)
+    e.left:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, unit)
+    e.left:SetWidth(unit)
+    e.right:ClearAllPoints()
+    e.right:SetPoint("TOPRIGHT", b, "TOPRIGHT", 0, -unit)
+    e.right:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, unit)
+    e.right:SetWidth(unit)
+end
+
+-- Create a snapped-outline Frame parented to `parent`. opts:
+--   outset      — px the outline sits outside the parent's box (default 0)
+--   layer       — draw layer for the edge textures (default "BORDER")
+--   thicknessPx — logical thickness (default 1)
+-- Returns an object o with o.frame + o:SetColor(r,g,b,a) / o:Show() / o:Hide() /
+--   o:SetThickness(px) / o:Relayout(). In-game only (guarded on CreateFrame); the
+--   textures are non-secure children — pure texture ops, never a protected call.
+function Borders.NewSnappedOutline(parent, opts)
+    if not parent or not _G.CreateFrame then return nil end
+    opts = opts or {}
+    local outset = opts.outset or 0
+    local layer  = opts.layer or "BORDER"
+    local f = _G.CreateFrame("Frame", nil, parent)
+    f:SetPoint("TOPLEFT", parent, "TOPLEFT", -outset, outset)
+    f:SetPoint("BOTTOMRIGHT", parent, "BOTTOMRIGHT", outset, -outset)
+    if f.SetFrameLevel then f:SetFrameLevel((parent:GetFrameLevel() or 1) + 1) end
+
+    local function newEdge()
+        local t = f:CreateTexture(nil, layer)
+        t:SetTexture(WHITE)
+        if t.SetSnapToPixelGrid then t:SetSnapToPixelGrid(true) end
+        if t.SetTexelSnappingBias then t:SetTexelSnappingBias(0) end
+        return t
+    end
+    f._edges  = { top = newEdge(), bottom = newEdge(), left = newEdge(), right = newEdge() }
+    f._pxTier = opts.thicknessPx or 1
+
+    local o = { frame = f }
+    function o:SetThickness(px) f._pxTier = px; layoutOutline(f, Borders.PhysicalThickness(px, onePixel(f))) end
+    function o:Relayout()       layoutOutline(f, Borders.PhysicalThickness(f._pxTier, onePixel(f))) end
+    function o:SetColor(r, g, b, a)
+        local e = f._edges
+        e.top:SetVertexColor(r, g, b, a or 1); e.bottom:SetVertexColor(r, g, b, a or 1)
+        e.left:SetVertexColor(r, g, b, a or 1); e.right:SetVertexColor(r, g, b, a or 1)
+    end
+    function o:SetAlpha(a) if f.SetAlpha then f:SetAlpha(a or 1) end end
+    function o:Show() f:Show() end
+    function o:Hide() f:Hide() end
+
+    -- Re-snap on show (effective scale only reliable once shown) and on display events.
+    f:SetScript("OnShow", function(self) o:Relayout() end)
+    f._dsRelayout = function() if f:IsShown() then o:Relayout() end end
+    o:SetThickness(f._pxTier)
+    ensureSnapDriver()
+    if snapSet then snapSet[f] = true end
+    return o
 end
 
 ----------------------------------------------------------------------
@@ -407,6 +498,17 @@ local function testMixedBagMapping(fails)
     ck(silenced == 0, "toggle off -> no slot rimmed at all")
 end
 
+-- PURE snapped-thickness helper (shared outline factory): a logical Npx line maps to
+-- N physical pixels, clamps negatives to 0, and defaults the unit to 1 (headless).
+local function testPhysicalThickness(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Borders.PhysicalThickness(1, 0.5) == 0.5, "1px * 0.5 unit = 0.5")
+    ck(Borders.PhysicalThickness(2, 0.5) == 1.0, "2px * 0.5 unit = 1.0")
+    ck(Borders.PhysicalThickness(1) == 1, "unit defaults to 1")
+    ck(Borders.PhysicalThickness(nil, 0.7) == 0.7, "nil px -> 1px")
+    ck(Borders.PhysicalThickness(-3, 0.5) == 0, "negative px clamps to 0")
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
@@ -414,6 +516,7 @@ function Borders.RunSelfTests(verbose)
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "quality color",        fn = testQualityRGB },
         { name = "enabled toggle",       fn = testEnabledToggle },
+        { name = "physical thickness",   fn = testPhysicalThickness },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
