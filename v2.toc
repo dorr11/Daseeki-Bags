@@ -20,15 +20,15 @@
 ##   DaseekiBags2DB   — settings (schema-versioned)
 ##   DaseekiBags2Data — inventory cache DB (owners graph; per-container identity)
 ##
-core.lua          # shared ns runtime (Print/SafeCall/events/On-Fire bus) + lifecycle
-store.lua         # SavedVariables layer: settings + inventory cache DB
-capture.lua       # live scan on the 1.15 event surface (C_Container)
-migrate.lua       # one-time read-only conversion of the 1.x SV
+core.lua
+store.lua
+capture.lua
+migrate.lua
 # --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
-borders.lua       # quality borders (loads before ui_items; buttons attach at paint)
-ui_items.lua      # item buttons + grid groups (ns.Items contract)
-ui_frame.lua      # the inventory window (consumes ns.Items; DaseekiUI-skinned)
+borders.lua
+ui_items.lua
+ui_frame.lua
 # --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
-search.lua        # D4 owned search matcher + live dim controller (both layouts)
-sort.lua          # sort engine: pure move planner + throttled, verified executor
-options.lua       # DaseekiUI settings page (Core-gated) + additive qualityBorders default
+search.lua
+sort.lua
+options.lua
