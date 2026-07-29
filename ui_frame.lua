@@ -252,9 +252,10 @@ end
 -- Viewed owner (self-only this wave; W3 adds the owner dropdown)
 ----------------------------------------------------------------------
 
--- The owner record currently displayed. Stub: always self. W3 replaces the body
--- with the selector's choice; callers use this indirection so nothing hard-codes
--- "self" outside here.
+-- The owner record currently displayed. Defaults to self; W3's owner selector sets
+-- Frame._viewKey to browse an alt/remote owner. Callers use this indirection so
+-- nothing hard-codes "self" outside here. This is the SHARED viewed-owner state the
+-- bank window and both owner selectors read.
 function Frame.ViewedOwnerKey()
     if Frame._viewKey then return Frame._viewKey end
     -- self identity, matching capture.selfNameRealm() shape
@@ -266,6 +267,50 @@ end
 
 function Frame.ViewedOwner()
     return Store.GetOwner(Frame.ViewedOwnerKey())
+end
+
+-- The self identity key (used to detect "am I viewing an alt?").
+function Frame.SelfKey()
+    local name  = (_G.UnitName and _G.UnitName("player")) or "Unknown"
+    local realm = (_G.GetRealmName and _G.GetRealmName()) or ""
+    realm = (realm:gsub("%s+", ""))
+    return Store.MakeNameRealm(name, realm)
+end
+
+-- Set the shared viewed owner (W3 owner selector). Passing the self key (or nil)
+-- returns to the live self view. Repaints the inventory window, notifies the bank
+-- window, and refreshes every attached owner selector so both windows agree.
+function Frame.SetViewedOwner(key)
+    if key == Frame.SelfKey() then key = nil end   -- nil == self (live)
+    Frame._viewKey = key
+    if Frame.IsShown and Frame.IsShown() then Frame.Rebuild() end
+    if ns.Bank and ns.Bank.OnOwnerChanged then ns.Bank.OnOwnerChanged() end
+    if ns.Owner and ns.Owner.RefreshAll then ns.Owner.RefreshAll() end
+end
+
+----------------------------------------------------------------------
+-- PURE: keyring enable gate (W3, Expert C §5c)
+--
+-- Keyring renders in THIS (inventory) window as W2 built it (container -2). W3 adds
+-- the live IsKeyRingEnabled() gate so it doesn't show when the game feature is off,
+-- and confirms its size stays dynamic (capture re-scans -2 on BAG_UPDATE, so the
+-- store's container.size — and thus the entry count — follows the live keyring).
+----------------------------------------------------------------------
+
+-- settingOn = the user's "Show keyring" preference; apiEnabled = IsKeyRingEnabled().
+-- Both must be true. apiEnabled nil (headless / API absent) is treated as enabled so
+-- the keyring still renders under the harness and on any client lacking the global.
+function Frame.KeyringGate(settingOn, apiEnabled)
+    if not settingOn then return false end
+    if apiEnabled == nil then return true end
+    return apiEnabled and true or false
+end
+
+-- Live wrapper: the persisted "Show keyring" setting AND the game's IsKeyRingEnabled().
+function Frame.KeyringEnabled()
+    local apiEnabled
+    if _G.IsKeyRingEnabled then apiEnabled = _G.IsKeyRingEnabled() and true or false end
+    return Frame.KeyringGate(Frame.ShowKeyring(), apiEnabled)
 end
 
 ----------------------------------------------------------------------
@@ -404,11 +449,24 @@ function Frame.Ensure()
     seg:SetPoint("LEFT", toolbar, "LEFT", 0, 0)
     win.layoutSeg = seg
 
-    -- Owner-selector STUB (self only this wave; W3 swaps in a dropdown here).
+    -- Owner selector (W3): the titlebar flyout listing every cached owner. Selecting
+    -- an alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
+    -- re-rendering this window (and the bank) read-only. Falls back to a plain label
+    -- if ui_owner.lua is somehow absent.
     local ownerLbl = toolbar:CreateFontString(nil, "OVERLAY")
     ownerLbl:SetFontObject(UI.fonts.muted)
     ownerLbl:SetPoint("LEFT", seg, "RIGHT", 10, 0)
     win.ownerLabel = ownerLbl
+    if ns.Owner and ns.Owner.CreateSelector then
+        local sel = ns.Owner.CreateSelector(toolbar, {
+            onSelect = function(key) Frame.SetViewedOwner(key) end,
+        })
+        if sel then
+            sel:SetPoint("LEFT", seg, "RIGHT", 10, 0)
+            win.ownerSelector = sel
+            ownerLbl:Hide()
+        end
+    end
 
     -- Search box PLACEHOLDER (inert; W4 wires the matcher). Right-pinned.
     local searchWrap = UI.FlatFrame(toolbar, "inset", "controlBorder")
@@ -447,6 +505,17 @@ function Frame.Ensure()
     })
     sortBtn:SetPoint("RIGHT", searchWrap, "LEFT", -6, 0)
     win.sortBtn = sortBtn
+
+    -- Find button (W3): open the cross-character Find window, seeded with the current
+    -- search text so "search everywhere" is one click from the in-bag search.
+    local findBtn = UI.MakeButton(toolbar, {
+        text = "Find", width = 48,
+        onClick = function()
+            if ns.Find and ns.Find.Toggle then ns.Find.Toggle(win.searchBox and win.searchBox:GetText()) end
+        end,
+    })
+    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -6, 0)
+    win.findBtn = findBtn
 
     -- ── Bag-slot toggle strip (show/hide a container's slots) ─────────────────
     local strip = _G.CreateFrame("Frame", nil, win)
@@ -515,7 +584,7 @@ function Frame.RebuildStrip()
 
     -- ALL carried containers (ignore the hidden filter here — the strip needs to
     -- show hidden ones too so they can be toggled back on).
-    local order = Frame.CarriedContainerOrder(owner, { showKeyring = Frame.ShowKeyring() })
+    local order = Frame.CarriedContainerOrder(owner, { showKeyring = Frame.KeyringEnabled() })
     local x, SIZE, GAP = 0, Frame.STRIP_H, 4
     for i, cid in ipairs(order) do
         local b = win._stripButtons[i]
@@ -605,14 +674,15 @@ function Frame.Rebuild()
     local owner  = Frame.ViewedOwner()
     local layout = Frame.Layout()
     local cols, bs, gap = Frame.Columns(), Frame.ButtonSize(), Frame.Gap()
-    local opts = { columns = cols, buttonSize = bs, gap = gap, showKeyring = Frame.ShowKeyring(),
+    local opts = { columns = cols, buttonSize = bs, gap = gap, showKeyring = Frame.KeyringEnabled(),
                    hidden = (Store.db and Store.db.hiddenBags) or {} }
 
-    -- owner label (stub)
+    -- owner label (fallback stub) + owner selector (W3)
     if win.ownerLabel then
         local key = Frame.ViewedOwnerKey()
         win.ownerLabel:SetText(owner and (owner.name or key) or key)
     end
+    if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
     -- money (viewed owner)
     if win.moneyFS then win.moneyFS:SetText(moneyString(owner and owner.money or 0)) end
     if win.layoutSeg and win.layoutSeg.Refresh then win.layoutSeg:Refresh() end
@@ -915,6 +985,41 @@ local function testApplyDefaults(fails)
     ck(type(db.hiddenBags) == "table", "hiddenBags map created")
 end
 
+-- W3: keyring enable gate (setting AND IsKeyRingEnabled), API-absent = enabled.
+local function testKeyringGate(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Frame.KeyringGate(true, nil)   == true,  "setting on, API absent (headless) -> enabled")
+    ck(Frame.KeyringGate(true, true)  == true,  "setting on, keyring enabled -> enabled")
+    ck(Frame.KeyringGate(true, false) == false, "setting on, keyring DISABLED in game -> hidden")
+    ck(Frame.KeyringGate(false, true) == false, "setting off -> hidden even when enabled")
+    ck(Frame.KeyringGate(false, nil)  == false, "setting off, API absent -> hidden")
+end
+
+-- W3: keyring size is DYNAMIC — it follows the store's captured container size (which
+-- capture re-scans on BAG_UPDATE), never a cached constant. Growing the stored keyring
+-- must grow the rendered entry count with no other change (Expert C §5c quirk 3).
+local function testKeyringDynamicSize(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local o = fixtureOwner()
+    -- fixtureOwner's keyring (-2) is size 12; count keyring entries in the combined flow.
+    local function keyringEntryCount()
+        local n = 0
+        for _, e in ipairs(Frame.BuildCombinedEntries(o, { showKeyring = true })) do
+            if e.cid == Store.KEYRING_CONTAINER then n = n + 1 end
+        end
+        return n
+    end
+    ck(keyringEntryCount() == 12, "keyring renders its captured size (12)")
+    -- Simulate a keyring upgrade: capture re-scans -2 to a larger size in the store.
+    local key = Store.NewContainer(24)
+    key.slots[1] = Store.NewSlot(5175, 1)
+    Store.PutContainer(o, Store.KEYRING_CONTAINER, key, 200)
+    ck(keyringEntryCount() == 24, "grown keyring (24) reflected immediately — size is store-driven")
+    -- And it disappears entirely when the gate is off (setting/feature), not by size.
+    ck(#Frame.CarriedContainerOrder(o, { showKeyring = false }) ==
+       #Frame.CarriedContainerOrder(o, { showKeyring = true }) - 1, "gate off drops the keyring container")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "container order",     fn = testContainerOrder },
@@ -923,6 +1028,8 @@ function Frame.RunSelfTests(verbose)
         { name = "grid + window size",  fn = testGridAndWindowSize },
         { name = "geometry round-trip", fn = testGeometryRoundTrip },
         { name = "apply defaults",      fn = testApplyDefaults },
+        { name = "keyring gate",        fn = testKeyringGate },
+        { name = "keyring dynamic size", fn = testKeyringDynamicSize },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

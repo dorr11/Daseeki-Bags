@@ -159,6 +159,10 @@ local function dispatch(msg)
         if ns.Frame and ns.Frame.Toggle then ns.Frame.Toggle() end
     elseif cmd == "combined" or cmd == "split" then
         if ns.Frame and ns.Frame.SetLayout then ns.Frame.SetLayout(cmd) end
+    elseif cmd == "bank" then
+        if ns.Bank and ns.Bank.Toggle then ns.Bank.Toggle() end
+    elseif cmd == "find" then
+        if ns.Find and ns.Find.Open then ns.Find.Open(rest) end
     elseif cmd == "debug" then
         local sub = (rest or ""):match("^(%S*)"):lower()
         if sub == "selftest" or sub == "" then
@@ -169,6 +173,8 @@ local function dispatch(msg)
     elseif cmd == "help" then
         ns:Print("commands (/bags, short /dbags):")
         ns:Print("  /bags [toggle]      - show/hide the bag window")
+        ns:Print("  /bags bank          - show/hide the bank window")
+        ns:Print("  /bags find <name>   - find an item across every character")
         ns:Print("  /bags combined|split - switch layout")
         ns:Print("  /bags debug selftest - run self-tests")
     else
