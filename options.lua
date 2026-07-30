@@ -120,22 +120,26 @@ function Options.Build(flow)
     local grid = flow:AddSection("Grid")
     grid:Hint("Slot size and spacing. Changes re-grid the open window instantly.")
 
+    -- Touching Columns or Cell gap marks the grid density as user-chosen, so the one-time
+    -- 1.0-parity density migration (Frame.MigrateDensity) never re-defaults a value the
+    -- owner deliberately set. Button size is NOT a migrated key, so it does not set the
+    -- marker (a beta DB that only tweaked cell size still receives the tight 1.0 grid).
     register(grid:Slider({
         label = "Columns", min = 6, max = 20, step = 1, width = 260, format = intFmt,
-        get = function() local db = DB(); return (db and db.columns) or 12 end,
-        set = function(v) local db = DB(); if db then db.columns = math.floor(v + 0.5) end regrid() end,
+        get = function() local db = DB(); return (db and db.columns) or (ns.Frame and ns.Frame.DEFAULT_COLUMNS) or 11 end,
+        set = function(v) local db = DB(); if db then db.columns = math.floor(v + 0.5); db.densityUserChose = true end regrid() end,
     }).Refresh)
 
     register(grid:Slider({
         label = "Button size", min = 28, max = 48, step = 1, width = 260, format = intFmt,
-        get = function() local db = DB(); return (db and db.buttonSize) or 37 end,
+        get = function() local db = DB(); return (db and db.buttonSize) or (ns.Frame and ns.Frame.DEFAULT_BUTTONSIZE) or 37 end,
         set = function(v) local db = DB(); if db then db.buttonSize = math.floor(v + 0.5) end regrid() end,
     }).Refresh)
 
     register(grid:Slider({
         label = "Cell gap", min = 0, max = 10, step = 1, width = 260, format = intFmt,
-        get = function() local db = DB(); return (db and db.gap) or 4 end,
-        set = function(v) local db = DB(); if db then db.gap = math.floor(v + 0.5) end regrid() end,
+        get = function() local db = DB(); return (db and db.gap) or (ns.Frame and ns.Frame.DEFAULT_GAP) or 2 end,
+        set = function(v) local db = DB(); if db then db.gap = math.floor(v + 0.5); db.densityUserChose = true end regrid() end,
     }).Refresh)
 
     -- ── Sorting ───────────────────────────────────────────────────────────────

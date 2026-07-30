@@ -122,6 +122,39 @@ function Frame.ApplyDefaults(db)
 end
 
 ----------------------------------------------------------------------
+-- One-time 1.0-parity DENSITY migration (mirrors rules2 default-flip).
+--
+-- The look-parity pass tightened the grid defaults (gap 4->2, columns 12->11) so 2.0
+-- reads "essentially EXACTLY like 1.0". ApplyDefaults is additive and never clobbers
+-- an existing value, so a pre-parity beta DB stays at the loose 4/12 and the owner
+-- would NOT see the tight grid — against his directive. This migrates the density ONCE
+-- for a DB still sitting at BOTH old defaults, UNLESS the user deliberately set a grid
+-- value (db.densityUserChose, written by the Columns / Cell-gap sliders in options.lua).
+-- Any value other than exactly the old 4/12 pair is treated as a genuine customization
+-- and left untouched. Guarded by a one-time marker so a later deliberate 4/12 (or any
+-- opt-out) is never re-clobbered on a subsequent login. Idempotent.
+----------------------------------------------------------------------
+
+Frame.DENSITY_MARKER      = "densityMigrated"
+Frame.OLD_DEFAULT_GAP     = 4    -- pre-parity loose gap
+Frame.OLD_DEFAULT_COLUMNS = 12   -- pre-parity column band
+
+function Frame.MigrateDensity(db)
+    if type(db) ~= "table" then return false end
+    if db[Frame.DENSITY_MARKER] then return false end   -- already migrated (one-time)
+    local migrated = false
+    if not db.densityUserChose
+       and db.gap     == Frame.OLD_DEFAULT_GAP
+       and db.columns == Frame.OLD_DEFAULT_COLUMNS then
+        db.gap     = Frame.DEFAULT_GAP       -- 2  (1.0 cell pitch 39 = 37 + 2)
+        db.columns = Frame.DEFAULT_COLUMNS   -- 11 (owner's real DaseekiBagsSets config)
+        migrated = true
+    end
+    db[Frame.DENSITY_MARKER] = true
+    return migrated
+end
+
+----------------------------------------------------------------------
 -- PURE: container ordering
 --
 -- Stable carried-container order for THIS window (inventory, not bank):
@@ -1568,7 +1601,7 @@ function Frame.EnsureStripEvents()
 end
 
 function Frame.OnLogin()
-    if Store and Store.db then Frame.ApplyDefaults(Store.db) end
+    if Store and Store.db then Frame.ApplyDefaults(Store.db); Frame.MigrateDensity(Store.db) end
     Frame.HookBagToggles()
     Frame.EnsureStripEvents()
     -- Subscribe to W1 capture's store-updated event (capture.lua fires
@@ -1718,6 +1751,45 @@ local function testApplyDefaults(fails)
     ck(db.buttonSize == Frame.DEFAULT_BUTTONSIZE, "buttonSize default filled")
     ck(db.showKeyring == true, "showKeyring default filled")
     ck(type(db.hiddenBags) == "table", "hiddenBags map created")
+end
+
+-- 1.0-PARITY one-time density migration: an old-default (4/12) beta DB flips to the tight
+-- 2/11 grid ONCE; genuine customizations survive; the marker + user-touched flag guard
+-- re-runs; idempotent (mirrors rules2's categories default-flip).
+local function testDensityMigration(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- (1) Old-default beta DB migrates once to the tight 1.0 grid, sets the marker.
+    local old = { gap = 4, columns = 12 }
+    ck(Frame.MigrateDensity(old) == true, "old-default 4/12 db migrates")
+    ck(old.gap == Frame.DEFAULT_GAP and old.columns == Frame.DEFAULT_COLUMNS, "migrated to parity 2/11")
+    ck(old[Frame.DENSITY_MARKER] == true, "one-time marker set")
+    -- idempotent: after the marker, a later deliberate change is never re-clobbered.
+    old.gap = 5; old.columns = 13
+    ck(Frame.MigrateDensity(old) == false, "second run is a no-op (marker guards)")
+    ck(old.gap == 5 and old.columns == 13, "post-migration values untouched by the re-run")
+
+    -- (2) Genuine customizations survive — anything other than exactly the 4/12 pair.
+    for _, spec in ipairs({ { 4, 10 }, { 3, 12 }, { 2, 11 }, { 0, 20 } }) do
+        local db = { gap = spec[1], columns = spec[2] }
+        ck(Frame.MigrateDensity(db) == false, "non-old-default " .. spec[1] .. "/" .. spec[2] .. " not migrated")
+        ck(db.gap == spec[1] and db.columns == spec[2], "custom " .. spec[1] .. "/" .. spec[2] .. " survives")
+        ck(db[Frame.DENSITY_MARKER] == true, "marker set even when nothing migrated")
+    end
+
+    -- (3) A user-touched grid marker blocks the flip even at exactly 4/12.
+    local chose = { gap = 4, columns = 12, densityUserChose = true }
+    ck(Frame.MigrateDensity(chose) == false, "densityUserChose blocks the flip at 4/12")
+    ck(chose.gap == 4 and chose.columns == 12, "deliberate 4/12 preserved")
+
+    -- (4) nil / non-table guarded.
+    ck(Frame.MigrateDensity(nil) == false, "nil db -> no migration")
+
+    -- (5) Fresh DB: ApplyDefaults lands on parity, Migrate is then a no-op.
+    local fresh = {}
+    Frame.ApplyDefaults(fresh)
+    ck(fresh.gap == Frame.DEFAULT_GAP and fresh.columns == Frame.DEFAULT_COLUMNS, "fresh db defaults to parity")
+    ck(Frame.MigrateDensity(fresh) == false, "fresh parity db not migrated (already tight)")
 end
 
 -- W3: keyring enable gate (setting AND IsKeyRingEnabled), API-absent = enabled.
@@ -1961,6 +2033,7 @@ function Frame.RunSelfTests(verbose)
         { name = "grid + window size",  fn = testGridAndWindowSize },
         { name = "geometry round-trip", fn = testGeometryRoundTrip },
         { name = "apply defaults",      fn = testApplyDefaults },
+        { name = "density migration",   fn = testDensityMigration },
         { name = "keyring gate",        fn = testKeyringGate },
         { name = "keyring dynamic size", fn = testKeyringDynamicSize },
         { name = "category section size", fn = testCategorySectionSize },
