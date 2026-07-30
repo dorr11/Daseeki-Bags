@@ -855,13 +855,15 @@ local function setWellState(button, filled)
     button._dsWell:SetColorTexture(tokenRGB(filled and "raised" or "inset"))
 end
 
--- Toggle the calm 1px cell hairline. It is the DEFAULT quiet cell definition (the DaseekiUI
--- "inset input" look: dark fill + `border` hairline). On a rare+ cell the louder desaturated
--- quality edge REPLACES it, so the two never double-rim: pass showEdge=true to hide the
--- hairline when borders.lua is drawing the quality edge instead.
-local function setWellBorder(button, showEdge)
-    if not button._dsWellBorder then return end
-    if showEdge then button._dsWellBorder:Hide() else button._dsWellBorder:Show() end
+-- PURE: the CELL border-presence matrix (1.0 parity — NO universal neutral ring). 1.x shows
+-- no border on common/poor items or empties; a cell gets a ring ONLY for the unusable red
+-- (which WINS) or a qualifying quality edge (uncommon+, per minQuality). Mirrors
+-- borders.Apply so the two never disagree. Returns "unusable" | "quality" | "none".
+function Items.CellBorderKind(quality, unusable, enabled, minQuality)
+    if not enabled then return "none" end            -- borders off / gate closed
+    if unusable then return "unusable" end           -- red border wins over rarity
+    if ns.Borders and ns.Borders.ShouldShow(quality, enabled, minQuality) then return "quality" end
+    return "none"                                     -- common / poor / empty -> clean cell
 end
 
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
@@ -886,18 +888,11 @@ local function ensureDress(button)
     well:SetColorTexture(tokenRGB("inset"))
     button._dsWell = well
 
-    -- 1px pixel-snapped `border` hairline defining the cell (crisp at 720p — the opposite of
-    -- the fractional-scale blurry ring that read "grainy"). Drawn by borders.lua's shared
-    -- snapped-outline factory (one owner for all grid edges, one snap driver). Rare+ cells
-    -- hide it in favor of the quality edge (setWellBorder) so cells never double-rim.
-    if ns.Borders and ns.Borders.NewSnappedOutline then
-        local wb = ns.Borders.NewSnappedOutline(button, { outset = 0, layer = "BORDER", thicknessPx = 1 })
-        if wb then
-            wb:SetColor(tokenRGB("border"))
-            wb:Show()
-            button._dsWellBorder = wb
-        end
-    end
+    -- 1.0-PARITY (grey-border fix): NO universal neutral cell hairline. 1.x draws no ring on
+    -- common/poor items or empties — the cell reads from its dark inset/raised WELL + the 2px
+    -- gap alone. Only borders.lua's quality edge (uncommon+) or the unusable red border ever
+    -- ring a cell. (The old `border`-token snapped outline here was the grey ring the owner
+    -- saw on every slot; removed.)
 
     local sz = button:GetWidth() or Items.DEFAULT_SIZE
 
@@ -951,8 +946,7 @@ local function paintButton(button)
         if _G.SetItemButtonCount then _G.SetItemButtonCount(button, 0) end
         local icon = iconOf(button); if icon then icon:SetTexture(nil) end
         if ns.Borders then ns.Borders.Apply(button, nil) end
-        setWellState(button, false)     -- EMPTY -> inset well
-        setWellBorder(button, false)    -- empty cells show the calm 1px hairline
+        setWellState(button, false)     -- EMPTY -> dark inset well (no ring; 1.0 clean cell)
         if button._live then updateCooldown(button) end
         button._pendingId = nil
         button._quality = nil
@@ -969,19 +963,16 @@ local function paintButton(button)
     local quality = visual and visual.quality
     -- 1.0-PARITY: an UNUSABLE (class-can't-equip / below-level) item draws a RED border that
     -- WINS over the quality edge (borders.Apply precedence). Computed once here (live only)
-    -- and cached so applyDressState/setWellBorder agree without recomputing.
+    -- and cached on the button so applyDressState reuses it without a second scan.
     local unusable = (button._live and slotIsUnusable(button)) or false
     button._unusable = unusable
     if ns.Borders then ns.Borders.Apply(button, quality, unusable) end
     button._quality = quality
 
-    -- FILLED -> raised card backing. The 1px hairline yields to ANY drawn edge — the quality
-    -- edge (uncommon+) OR the unusable red border — so a cell never carries both rims.
+    -- FILLED -> raised card backing (no neutral ring — 1.0 clean cell). The ONLY border a
+    -- cell can carry is borders.Apply's uncommon+ quality edge or the unusable red (drawn
+    -- above); a common item shows just its icon on the raised well, like 1.x.
     setWellState(button, true)
-    local qualityEdge = ns.Borders and ns.Borders.ShouldShow
-        and ns.Borders.ShouldShow(quality, ns.Borders.Enabled(),
-            ns.Borders.MinQuality and ns.Borders.MinQuality()) or false
-    setWellBorder(button, (unusable or qualityEdge) and true or false)
 
     if button._live then
         updateCooldown(button)
@@ -1770,15 +1761,41 @@ local function testDaseekiCellVsQualityEdge(fails)
     ck(dist({ B.QualityRGB(2) }, okGreen) >= 0.30, "uncommon green distinguishable from the ok-token green")
     -- Unusable pure-red vs Legendary orange: the unusable cue never reads as legendary.
     ck(dist({ B.UnusableRGB() }, { B.QualityRGB(5) }) >= 0.30, "unusable red distinguishable from Legendary orange")
-    -- SAME-cell invariant: any drawn edge (uncommon+ OR unusable) hides the calm hairline
-    -- (ui_items setWellBorder), so a crimson cell border and a colored edge never co-render.
+    -- 1.0 clean-cell invariant: a cell carries a border ONLY at uncommon+ (quality) or when
+    -- unusable — common/poor/empty draw NO ring at all (the neutral hairline was removed).
     ck(B.ShouldShow(2, true) == true and B.ShouldShow(1, true) == false,
-        "edge replaces the hairline at uncommon+ (common/poor keep the crimson cell border)")
+        "border only at uncommon+ (common/poor draw no ring — 1.0 clean cell)")
+end
+
+-- 1.0-PARITY grey-border removal: the CELL border-presence matrix. Common/poor/empty draw
+-- NO ring (the universal neutral hairline is gone); uncommon+ get the quality edge; unusable
+-- gets red (winning over quality); borders-off draws nothing. This is the styling the KEYRING
+-- keys inherit too — keys are common quality, so they render as clean dark cells like 1.x.
+local function testCellBorderMatrix(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local K = Items.CellBorderKind
+    -- enabled, default Uncommon floor
+    ck(K(nil, false, true, 2) == "none", "empty / no quality -> no ring")
+    ck(K(0, false, true, 2)   == "none", "poor -> no ring (1.0 clean commons)")
+    ck(K(1, false, true, 2)   == "none", "common (e.g. a KEY) -> no ring — clean like 1.x")
+    ck(K(2, false, true, 2)   == "quality", "uncommon -> quality edge")
+    ck(K(3, false, true, 2)   == "quality", "rare -> quality edge")
+    ck(K(4, false, true, 2)   == "quality", "epic -> quality edge")
+    -- unusable red WINS over quality (and over common)
+    ck(K(4, true, true, 2)    == "unusable", "unusable epic -> red (wins over quality)")
+    ck(K(1, true, true, 2)    == "unusable", "unusable common -> red")
+    -- configurable floor raises where the quality ring starts
+    ck(K(2, false, true, 3)   == "none",    "min=Rare -> uncommon has no ring")
+    ck(K(3, false, true, 3)   == "quality", "min=Rare -> rare gets the quality edge")
+    -- borders OFF -> nothing at all, even unusable
+    ck(K(4, true, false, 2)   == "none", "borders off -> no ring at all (even unusable)")
+    ck(K(2, false, false, 2)  == "none", "borders off -> uncommon draws no ring")
 end
 
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
+        { name = "cell border matrix", fn = testCellBorderMatrix },
         { name = "daseeki cell vs edge", fn = testDaseekiCellVsQualityEdge },
         { name = "proficiency matrix", fn = testProficiency },
         { name = "below-level gate",   fn = testBelowLevel },
