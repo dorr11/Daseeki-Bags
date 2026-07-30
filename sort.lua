@@ -5,7 +5,8 @@
 --   PURE core (no WoW API; exhaustively harness-tested):
 --     Sort.MergePour(src, dst, max)        — one stack pour (the merge arithmetic)
 --     Sort.CanonicalStacks(total, max)      — a total's merged shape (fulls + remainder)
---     Sort.CompareStacks(a, b)              — group order: class → subclass → name → quality↓
+--     Sort.CompareStacks(a, b)              — group order (1.x parity): set → class → subclass →
+--                                              equip → quality → icon → ilvl → itemID → stackCount, all ↓
 --     Sort.Plan(state)                      — current layout -> { target, moves, stats }
 --     Sort.PartitionWaves(moves)            — ordered moves -> waves of slot-disjoint moves
 --
@@ -76,41 +77,82 @@ function Sort.CanonicalStacks(total, maxStack)
 end
 
 ----------------------------------------------------------------------
--- PURE: group ordering (design: class → subclass → name → quality desc)
--- a, b = { id, count, meta = { classID, subClassID, name, quality } }
+-- PURE: group ordering — 1.x PARITY.
+--
+-- This reproduces 1.x's `Sort.Rule` (core/api/sorting.lua): the owner's own fork
+-- compares a FIXED chain of keys and, at the first key that differs, returns the
+-- one with the GREATER value first — i.e. every key is DESCENDING. The chain:
+--
+--   set → class → subclass → equip → quality → iconFileID → level → itemID → stackCount   (all ↓)
+--
+--   set  — 1.x's super-key that splits the bag into three bands (1.x GetSpaces):
+--            0 = Consumable/Container  (classID < Enum.ItemClass.Weapon(2))
+--            1 = a piece of one of the player's saved equipment sets  (retail only;
+--                1.x's BelongsToSet is a NO-OP on Classic Era 1.15.9, our target —
+--                so on the live client `set` is binary 0/2, never 1)
+--            2 = everything else (weapons, armor, gems, trade goods, quest, misc…)
+--          DESC ⇒ band 2 (gear/goods) first, band 1 (set pieces) middle,
+--                 band 0 (consumables/containers) LAST.
+--   class/subclass — Enum.ItemClass / subclass, DESC (higher class id first).
+--   equip          — equipLoc string ("" when not equippable), raw string DESC.
+--   quality/level  — item quality and item level, DESC.
+--   iconFileID     — groups identical-icon items together, DESC.
+--   itemID/stackCount — final deterministic tiebreak, DESC (fuller stack first).
+--
+-- a, b = { id, count, meta = { set, classID, subClassID, equip, quality,
+--          iconFileID, level, name, maxStack } }.  Missing-meta defaults mirror
+-- 1.x GetSpaces (class→14, subclass→-1, equip→"", others→0).
+--
+-- NB: 1.x has NO `name` key and this comparator deliberately keeps it that way —
+-- name is carried in meta only for search/UI, never consulted for sort order.
 ----------------------------------------------------------------------
 
 function Sort.CompareStacks(a, b)
     local am, bm = a.meta or {}, b.meta or {}
-    local ac, bc = am.classID or HUGE, bm.classID or HUGE
-    if ac ~= bc then return ac < bc end
-    local as, bs = am.subClassID or HUGE, bm.subClassID or HUGE
-    if as ~= bs then return as < bs end
-    local an, bn = am.name or "", bm.name or ""
-    if an ~= bn then return an < bn end
+    local aset, bset = am.set or 0, bm.set or 0
+    if aset ~= bset then return aset > bset end          -- band: gear→set→consumables
+    local ac, bc = am.classID or 14, bm.classID or 14
+    if ac ~= bc then return ac > bc end                  -- class DESC
+    local asc, bsc = am.subClassID or -1, bm.subClassID or -1
+    if asc ~= bsc then return asc > bsc end              -- subclass DESC
+    local ae, be = am.equip or "", bm.equip or ""
+    if ae ~= be then return ae > be end                  -- equipLoc string DESC
     local aq, bq = am.quality or 0, bm.quality or 0
-    if aq ~= bq then return aq > bq end        -- quality DESCENDING
-    if a.id ~= b.id then return (a.id or 0) < (b.id or 0) end
-    return (a.count or 0) > (b.count or 0)      -- fuller stacks first (stable)
+    if aq ~= bq then return aq > bq end                  -- quality DESC
+    local ai, bi = am.iconFileID or 0, bm.iconFileID or 0
+    if ai ~= bi then return ai > bi end                  -- icon DESC (groups same-icon)
+    local al, bl = am.level or 0, bm.level or 0
+    if al ~= bl then return al > bl end                  -- item level DESC
+    if a.id ~= b.id then return (a.id or 0) > (b.id or 0) end   -- itemID DESC
+    return (a.count or 0) > (b.count or 0)               -- fuller stacks first (canonical tail)
 end
 
--- PURE: the DESCENDING comparator (audit §6.3). Reverses the GROUPING keys (class → subclass
--- → name → id) so item categories appear in the opposite order, but keeps the within-item tail
--- IDENTICAL to ascending — higher quality first, then fuller stack first. Keeping the tail
--- canonical is what makes descending a fixed point under re-planning (it agrees with Phase I's
--- "fill the earliest partial to full"), so re-sorting never oscillates the full/partial stacks.
+-- PURE: the reversed-grouping comparator (2.0's `descending` toggle — an ADDITIVE
+-- 2.0 extra; 1.x itself has only the one order above). It flips the STRUCTURAL
+-- grouping keys (set, class, subclass, equip, icon, level, itemID) so the bands
+-- and categories appear in the opposite order, but keeps the within-item tail
+-- IDENTICAL to the default — higher quality first, then fuller stack first. Keeping
+-- that tail canonical is what makes descending a fixed point under re-planning (it
+-- agrees with Phase I's "fill the earliest partial to full"), so re-sorting never
+-- oscillates the full/partial stacks.
 function Sort.CompareStacksDesc(a, b)
     local am, bm = a.meta or {}, b.meta or {}
-    local ac, bc = am.classID or HUGE, bm.classID or HUGE
-    if ac ~= bc then return ac > bc end         -- class DESCENDING (reversed grouping)
-    local as, bs = am.subClassID or HUGE, bm.subClassID or HUGE
-    if as ~= bs then return as > bs end         -- subclass DESCENDING
-    local an, bn = am.name or "", bm.name or ""
-    if an ~= bn then return an > bn end         -- name Z→A
+    local aset, bset = am.set or 0, bm.set or 0
+    if aset ~= bset then return aset < bset end          -- band order reversed
+    local ac, bc = am.classID or 14, bm.classID or 14
+    if ac ~= bc then return ac < bc end                  -- class ASC (reversed grouping)
+    local asc, bsc = am.subClassID or -1, bm.subClassID or -1
+    if asc ~= bsc then return asc < bsc end              -- subclass ASC
+    local ae, be = am.equip or "", bm.equip or ""
+    if ae ~= be then return ae < be end                  -- equipLoc string ASC
+    local ai, bi = am.iconFileID or 0, bm.iconFileID or 0
+    if ai ~= bi then return ai < bi end                  -- icon ASC
+    local al, bl = am.level or 0, bm.level or 0
+    if al ~= bl then return al < bl end                  -- item level ASC
     local aq, bq = am.quality or 0, bm.quality or 0
-    if aq ~= bq then return aq > bq end         -- quality: higher first (canonical tail kept)
-    if a.id ~= b.id then return (a.id or 0) > (b.id or 0) end
-    return (a.count or 0) > (b.count or 0)      -- fuller stacks first (canonical tail kept)
+    if aq ~= bq then return aq > bq end                  -- quality: higher first (canonical tail kept)
+    if a.id ~= b.id then return (a.id or 0) < (b.id or 0) end   -- itemID ASC (reversed grouping)
+    return (a.count or 0) > (b.count or 0)               -- fuller stacks first (canonical tail kept)
 end
 
 ----------------------------------------------------------------------
@@ -204,14 +246,15 @@ function Sort.Plan(state)
             targetStacks[#targetStacks + 1] = { id = id, count = cnt, meta = m }
         end
     end
-    -- Direction toggle (audit §6.3): ascending is the canonical CompareStacks order; descending
-    -- REVERSES THE GROUPING (class → subclass → name) but deliberately KEEPS the within-item
-    -- canonical tail — fuller stack first, higher quality first — so descending agrees with
-    -- Phase I (which always fills the earliest partial to full). That keeps descending a fixed
-    -- point: re-sorting a desc-sorted bag yields zero moves (no stack oscillation), matching the
-    -- determinism ascending already has. Only the group order flips.
+    -- Direction toggle: the DEFAULT is 1.x's canonical order (Sort.CompareStacks — the
+    -- set→class→subclass→equip→quality→icon→level→id→stack chain, all ↓); descending
+    -- REVERSES THE GROUPING (band/class/subclass/equip/icon/level/id) but deliberately KEEPS
+    -- the within-item canonical tail — fuller stack first, higher quality first — so descending
+    -- still agrees with Phase I (which always fills the earliest partial to full). That keeps
+    -- descending a fixed point: re-sorting a desc-sorted bag yields zero moves (no stack
+    -- oscillation), matching the determinism the default order already has. Only the group order flips.
     local cmp = state.descending and Sort.CompareStacksDesc or Sort.CompareStacks
-    table.sort(targetStacks, cmp)   -- display order (asc default, desc grouping when descending)
+    table.sort(targetStacks, cmp)   -- display order (1.x default, reversed grouping when descending)
 
     -- fit count per stack + constrained-first assignment order
     local fit, order = {}, {}
@@ -368,29 +411,41 @@ local function bankIsOpen()
     return bf and bf.IsShown and bf:IsShown() and true or false
 end
 
--- Live meta lookup (cached per Run). classID/subClassID resolve synchronously from
--- GetItemInfoInstant; name/quality/maxStack come from GetItemInfo (may be uncached
--- on a cold item — falls back so the sort still runs deterministically).
+-- Live meta lookup (cached per Run) — populates the full 1.x parity key set.
+-- classID/subClassID/equipLoc/icon resolve synchronously from GetItemInfoInstant;
+-- name/quality/itemLevel/maxStack come from GetItemInfo (may be uncached on a cold
+-- item — falls back to 1.x's GetSpaces defaults so the sort still runs deterministically).
+-- `set` is 1.x's band super-key computed from classID: Consumable/Container (class < 2)
+-- => 0 (sorts to the bottom), everything else => 2. 1.x's middle band (1 = player
+-- equipment-set piece) comes from BelongsToSet, which is a NO-OP on Classic Era 1.15.9
+-- (our target), so the live client only ever produces 0/2 — matching 1.x exactly there.
+local WEAPON_CLASS = (_G.Enum and _G.Enum.ItemClass and _G.Enum.ItemClass.Weapon) or 2
 local function makeMetaFn(cache)
     return function(id)
         if not id then return nil end
         local m = cache[id]
         if m then return m end
-        m = { classID = HUGE, subClassID = HUGE, name = "", quality = 0, maxStack = 1 }
+        m = { set = 2, classID = 14, subClassID = -1, equip = "", quality = 0,
+              iconFileID = 0, level = 0, name = "", maxStack = 1 }
         local CI = _G.C_Item or {}
         local instant = CI.GetItemInfoInstant or _G.GetItemInfoInstant
         local info    = CI.GetItemInfo        or _G.GetItemInfo
         if instant then
-            local _, _, _, _, _, classID, subClassID = instant(id)
+            local _, _, _, itemEquipLoc, icon, classID, subClassID = instant(id)
             if classID then m.classID = classID end
             if subClassID then m.subClassID = subClassID end
+            if itemEquipLoc then m.equip = itemEquipLoc end   -- "" when not equippable
+            if icon then m.iconFileID = icon end
         end
         if info then
-            local name, _, quality, _, _, _, _, stackCount = info(id)
+            local name, _, quality, itemLevel, _, _, _, stackCount = info(id)
             if name then m.name = name:lower() end
             if quality then m.quality = quality end
+            if itemLevel then m.level = itemLevel end
             if stackCount and stackCount > 0 then m.maxStack = stackCount end
         end
+        -- 1.x band: Consumable(0)/Container(1) drop to band 0; the rest stay band 2.
+        m.set = (m.classID < WEAPON_CLASS) and 0 or 2
         cache[id] = m
         return m
     end
@@ -683,14 +738,17 @@ local function testCanonicalStacks(fails)
     ck(eqarr(Sort.CanonicalStacks(0, 20),  {}), "0 -> no stacks")
 end
 
--- meta catalog for the plan tests. classID/subClassID drive grouping.
+-- meta catalog for the plan tests — carries the full 1.x parity key set.
+-- 1.x band `set`: Consumable(class 0)/Container(1) => 0 (sort LAST); all else => 2 (sort FIRST).
 local META = {
-    -- id  = class, subclass, name, quality, maxStack
-    [100] = { classID = 0, subClassID = 0, name = "apple",   quality = 1, maxStack = 20 }, -- consumable
-    [101] = { classID = 0, subClassID = 0, name = "bread",   quality = 1, maxStack = 20 }, -- consumable
-    [200] = { classID = 2, subClassID = 7, name = "sword",   quality = 3, maxStack = 1  }, -- weapon
-    [201] = { classID = 4, subClassID = 0, name = "cloak",   quality = 2, maxStack = 1  }, -- armor
-    [300] = { classID = 7, subClassID = 1, name = "cloth",   quality = 1, maxStack = 10 }, -- tradegood
+    -- id  = set, class, subclass, equip,                  quality, icon, level, name,     maxStack
+    [100] = { set = 0, classID = 0,  subClassID = 0, equip = "",                     quality = 1, iconFileID = 1001, level = 1,  name = "apple",  maxStack = 20 }, -- consumable
+    [101] = { set = 0, classID = 0,  subClassID = 0, equip = "",                     quality = 1, iconFileID = 1002, level = 1,  name = "bread",  maxStack = 20 }, -- consumable
+    [200] = { set = 2, classID = 2,  subClassID = 7, equip = "INVTYPE_WEAPONMAINHAND", quality = 3, iconFileID = 2001, level = 60, name = "sword",  maxStack = 1  }, -- weapon
+    [201] = { set = 2, classID = 4,  subClassID = 1, equip = "INVTYPE_CLOAK",         quality = 2, iconFileID = 2002, level = 55, name = "cloak",  maxStack = 1  }, -- armor
+    [300] = { set = 2, classID = 7,  subClassID = 5, equip = "",                     quality = 1, iconFileID = 3001, level = 0,  name = "cloth",  maxStack = 10 }, -- tradegood
+    [400] = { set = 2, classID = 9,  subClassID = 0, equip = "",                     quality = 1, iconFileID = 4001, level = 0,  name = "recipe", maxStack = 1  }, -- recipe
+    [500] = { set = 2, classID = 12, subClassID = 0, equip = "",                     quality = 1, iconFileID = 5001, level = 0,  name = "quest",  maxStack = 1  }, -- quest item
 }
 local function metaFn(id) return META[id] end
 local function maxOf(id) local m = META[id]; return (m and m.maxStack) or 1 end
@@ -747,6 +805,16 @@ local function testPlanMergeAndSort(fails)
     end
     ck(sortedOK, "realized layout is in canonical group order")
 
+    -- 1.x PARITY: the exact realized id sequence. Gear band first by class↓
+    -- (cloth c7 → cloak c4 → sword c2), then the consumable band (bread → apple),
+    -- with each stackable in {full, remainder} order (cloth {10,2}, apple {20,5}).
+    local ids = {}
+    for _, c in ipairs(seq) do ids[#ids + 1] = c.id end
+    local want1x = { 300, 300, 201, 200, 101, 100, 100 }
+    local orderOK = (#ids == #want1x)
+    for i = 1, #want1x do if ids[i] ~= want1x[i] then orderOK = false end end
+    ck(orderOK, "realized id order matches 1.x (gear by class↓, consumables last)")
+
     -- Apples merged to canonical {20,5}; cloth to {10,2}. Count them in the result.
     local appleStacks, clothStacks = {}, {}
     for _, c in ipairs(seq) do
@@ -761,17 +829,19 @@ end
 
 local function testPlanIdempotentAndLocked(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    -- Already-sorted bag: re-planning yields zero moves (idempotent / determinism).
+    -- Already-sorted bag (in 1.x order: gear band first by class↓, consumables band
+    -- last): re-planning yields zero moves (idempotent / determinism).
+    --   201 cloak(class4) → 200 sword(class2) → 101 bread → 100 apple{20,5}
     local cells = bagCells(0, 6, {
-        [1] = { id = 100, count = 20 }, [2] = { id = 100, count = 5 },
-        [3] = { id = 101, count = 5 }, [4] = { id = 200 }, [5] = { id = 201 },
+        [1] = { id = 201 }, [2] = { id = 200 },
+        [3] = { id = 101, count = 5 }, [4] = { id = 100, count = 20 }, [5] = { id = 100, count = 5 },
     })
     local plan = Sort.Plan({ cells = cells, meta = metaFn })
     ck(#plan.moves == 0, "already-sorted bag -> no moves (idempotent)")
 
     -- Locked slot is a fixed point: its item is never a move source or destination.
     local locked = bagCells(0, 6, {
-        [1] = { id = 200 },                      -- weapon that WOULD sort last
+        [1] = { id = 200 },                      -- weapon (sorts to the front in 1.x order)
         [2] = { id = 100, count = 5, locked = true },  -- LOCKED apple stays put
         [3] = { id = 101, count = 5 },
     })
@@ -811,6 +881,46 @@ local function testPlanFamilyAndMultiBag(fails)
     local after = { [200] = 0, [300] = 0 }
     for _, c in ipairs(copy) do if c.id then after[c.id] = (after[c.id] or 0) + c.count end end
     ck(after[200] == before[200] and after[300] == before[300], "item totals conserved across the sort")
+end
+
+-- 1.x PARITY (the headline of this change): a realistic mixed bag must land in the
+-- EXACT order 1.x produced — the `set` band splits consumables to the bottom, and the
+-- gear/goods band is ordered by class DESCENDING (quest → recipe → tradegood → armor →
+-- weapon), the reverse of old-2.0's ascending-by-class. This is the assertion the owner
+-- cares about ("consumables/trade/gear grouped the way 1.x grouped them").
+local function testPlan1xOrder(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- A deliberately shuffled mixed bag spanning five item classes + a consumable pair.
+    local seed = {
+        [1] = { id = 100, count = 5 },  -- apple    (consumable, class 0, band 0)
+        [2] = { id = 500 },             -- quest    (class 12,   band 2)
+        [3] = { id = 300, count = 6 },  -- cloth    (tradegood,  class 7, band 2)
+        [4] = { id = 200 },             -- sword    (weapon,     class 2, band 2)
+        [5] = { id = 101, count = 5 },  -- bread    (consumable, class 0, band 0)
+        [6] = { id = 400 },             -- recipe   (class 9,    band 2)
+        [7] = { id = 201 },             -- cloak    (armor,      class 4, band 2)
+    }
+    local cells = bagCells(0, 12, seed)
+    local plan  = Sort.Plan({ cells = cells, meta = metaFn })
+    local copy  = bagCells(0, 12, seed)
+    applyMoves(copy, plan.moves, maxOf)
+
+    local ids = {}
+    for i = 1, #copy do if copy[i].id then ids[#ids + 1] = copy[i].id end end
+    -- band 2 by class DESC: quest(12) recipe(9) cloth(7) cloak(4) sword(2); then band 0: bread, apple
+    local want = { 500, 400, 300, 201, 200, 101, 100 }
+    local ok = (#ids == #want)
+    for i = 1, #want do if ids[i] ~= want[i] then ok = false end end
+    if not ok then
+        local got = table.concat(ids, ",")
+        ck(false, "mixed bag lands in 1.x order (want 500,400,300,201,200,101,100; got " .. got .. ")")
+    else
+        ck(true, "mixed bag lands in 1.x order")
+    end
+
+    -- Prove the divergence from OLD 2.0 explicitly: consumables are LAST now, not first.
+    ck(ids[#ids] == 100 and ids[#ids - 1] == 101, "consumables sort to the BOTTOM (1.x), not the top")
+    ck(ids[1] == 500, "highest-class item (quest) leads the gear/goods band")
 end
 
 -- WAVE PARTITION (report §3b harness ask): no two moves in a wave share a slot; the
@@ -915,12 +1025,13 @@ local function testPlanDirection(fails)
     local desc = realizedSeq(true)
     ck(#asc == #desc, "same number of stacks regardless of direction")
 
-    -- ascending groups by class ASCENDING: consumable(0) first, tradegood(7) last.
-    ck(META[asc[1].id].classID == 0, "ascending: consumable (class 0) group first")
-    ck(META[asc[#asc].id].classID == 7, "ascending: tradegood (class 7) group last")
-    -- descending REVERSES the grouping: tradegood(7) first, consumable(0) last.
-    ck(META[desc[1].id].classID == 7, "descending: tradegood (class 7) group first (reversed)")
-    ck(META[desc[#desc].id].classID == 0, "descending: consumable (class 0) group last (reversed)")
+    -- DEFAULT (1.x order): gear band first by class↓ — tradegood(7) leads, consumable
+    -- band (class 0) trails. (Bag has classes 0, 2, 4, 7.)
+    ck(META[asc[1].id].classID == 7, "default (1.x): tradegood (class 7) group first")
+    ck(META[asc[#asc].id].classID == 0, "default (1.x): consumable (class 0) group last")
+    -- DESCENDING toggle REVERSES the grouping: consumable(0) first, tradegood(7) last.
+    ck(META[desc[1].id].classID == 0, "descending: consumable (class 0) group first (reversed)")
+    ck(META[desc[#desc].id].classID == 7, "descending: tradegood (class 7) group last (reversed)")
 
     -- within-item tail is KEPT canonical in BOTH directions: the fuller apple stack precedes
     -- the partial one whichever way we sort (this is what keeps descending a fixed point).
@@ -946,6 +1057,7 @@ function Sort.RunSelfTests(verbose)
         { name = "merge pour (exhaustive)", fn = testMergePour },
         { name = "canonical stacks",        fn = testCanonicalStacks },
         { name = "plan: merge + group sort", fn = testPlanMergeAndSort },
+        { name = "plan: 1.x order parity",   fn = testPlan1xOrder },
         { name = "plan: idempotent + locked", fn = testPlanIdempotentAndLocked },
         { name = "plan: family + multi-bag", fn = testPlanFamilyAndMultiBag },
         { name = "plan: direction inversion", fn = testPlanDirection },
