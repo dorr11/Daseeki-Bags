@@ -74,15 +74,38 @@ function Owner.SourceBadge(source)
     return "Summary"
 end
 
+----------------------------------------------------------------------
+-- PURE: owner management (delete cached alt / favorites) — audit 5.2 / 5.5
+--
+-- Store.RemoveOwner unconditionally nils an owner; the LIVE SELF must never be deletable
+-- (its record is re-created on the next capture, and deleting the character you're logged
+-- into makes no sense). CanRemove is the pure guard the UI + the RemoveOwner wrapper share.
+----------------------------------------------------------------------
+
+-- True only when `key` is a real, non-self owner (so it may be removed from the cache).
+function Owner.CanRemove(key, selfKey)
+    if type(key) ~= "string" or key == "" then return false end
+    if selfKey ~= nil and key == selfKey then return false end   -- never the live self
+    return true
+end
+
+-- Favorites are a per-settings preference (DaseekiBags2DB.ownerFavorites = { [key]=true }),
+-- additive and independent of the cache DB. These pure helpers take the map explicitly; the
+-- live wrappers below read/write Store.db.
+function Owner.IsFavoriteIn(favorites, key)
+    return (type(favorites) == "table" and key ~= nil and favorites[key] == true) and true or false
+end
+
 -- Build the ordered owner list for the flyout.
 --   owners      = Store.data.owners shape  ([key] = ownerRecord)
 --   selfKey     = the logged-in character's "Name-Realm" (Owner.SelfKey())
 --   selfAccount = Store.data.selfAccount (own-account grouping; "" when unknown)
 --   now         = injectable epoch (defaults Store.Now())
--- Returns an array of descriptors, ordered self → own-account → cross-account, then
--- name ascending within each group:
---   { key, name, class, account, source, isSelf, isOwnAccount, ageSeconds, hasBank, rank }
-function Owner.BuildOwnerList(owners, selfKey, selfAccount, now)
+--   favorites   = optional { [key]=true } — favorited owners sort to the TOP (below self)
+-- Returns an array of descriptors, ordered self → favorites → own-account → cross-account,
+-- then name ascending within each group:
+--   { key, name, class, account, source, isSelf, isOwnAccount, isFavorite, ageSeconds, hasBank, rank }
+function Owner.BuildOwnerList(owners, selfKey, selfAccount, now, favorites)
     now = now or (Store.Now and Store.Now()) or 0
     local list = {}
     if type(owners) ~= "table" then return list end
@@ -91,13 +114,19 @@ function Owner.BuildOwnerList(owners, selfKey, selfAccount, now)
         local acct   = o.account or ""
         local isOwn  = (not isSelf) and acct ~= "" and selfAccount ~= nil
                        and selfAccount ~= "" and acct == selfAccount
+        local isFav  = (not isSelf) and Owner.IsFavoriteIn(favorites, key)
         local age    = (o.ts and o.ts > 0) and (now - o.ts) or nil
+        -- rank: self(0) < favorite(1) < own-account(2) < cross-account/summary(3). A favorite
+        -- outranks its normal group so starring any owner lifts it just under self.
+        local rank
+        if isSelf then rank = 0 elseif isFav then rank = 1 elseif isOwn then rank = 2 else rank = 3 end
         list[#list + 1] = {
             key = key, name = o.name or key, class = o.class, account = acct,
             source = o.source or "summary",
             isSelf = isSelf, isOwnAccount = isOwn and true or false,
+            isFavorite = isFav and true or false,
             ageSeconds = age, hasBank = Owner.HasBankData(o),
-            rank = isSelf and 0 or (isOwn and 1 or 2),
+            rank = rank,
         }
     end
     table.sort(list, function(a, b)
@@ -128,11 +157,71 @@ local function viewedKey()
     return Owner.SelfKey()
 end
 
+-- Live favorites map (DaseekiBags2DB.ownerFavorites), lazily created on first star.
+local function favoritesMap(create)
+    local db = Store and Store.db
+    if not db then return nil end
+    if type(db.ownerFavorites) ~= "table" then
+        if not create then return nil end
+        db.ownerFavorites = {}
+    end
+    return db.ownerFavorites
+end
+
+function Owner.IsFavorite(key)
+    return Owner.IsFavoriteIn(favoritesMap(false), key)
+end
+
+-- Flip a favorite. Returns the new state (true = now favorite). Self is never favorited
+-- (it always sorts first anyway) — a no-op that returns false.
+function Owner.ToggleFavorite(key)
+    if type(key) ~= "string" or key == "" or key == Owner.SelfKey() then return false end
+    local fav = favoritesMap(true)
+    if not fav then return false end
+    if fav[key] then fav[key] = nil; return false end
+    fav[key] = true; return true
+end
+
+-- Remove a cached owner, guarded so the live self can NEVER be deleted. Also drops any
+-- favorite/viewed state pointing at it. Returns true when a removal happened.
+function Owner.RemoveOwner(key)
+    if not Owner.CanRemove(key, Owner.SelfKey()) then return false end
+    if not (Store and Store.RemoveOwner and Store.GetOwner and Store.GetOwner(key)) then return false end
+    Store.RemoveOwner(key)
+    local fav = favoritesMap(false)
+    if fav then fav[key] = nil end
+    -- if we were viewing the removed owner, snap the view back to self (live)
+    if ns.Frame and ns.Frame.ViewedOwnerKey and ns.Frame.ViewedOwnerKey() == key
+       and ns.Frame.SetViewedOwner then
+        ns.Frame.SetViewedOwner(nil)
+    end
+    return true
+end
+
 -- Build the descriptor list live from the store.
 function Owner.LiveList()
     local data = Store and Store.data
     local owners = data and data.owners or {}
-    return Owner.BuildOwnerList(owners, Owner.SelfKey(), data and data.selfAccount, Store.Now())
+    return Owner.BuildOwnerList(owners, Owner.SelfKey(), data and data.selfAccount, Store.Now(),
+        favoritesMap(false))
+end
+
+-- Plain confirm before deleting a cached owner (audit 5.5). Uses the FrameXML StaticPopup
+-- surface when present; a stripped/headless client without it simply no-ops (fail-safe: no
+-- silent delete). The removal itself runs through Owner.RemoveOwner, which self-guards.
+local REMOVE_POPUP = "DASEEKIBAGS2_REMOVE_OWNER"
+local function confirmRemoveOwner(key, name, onDone)
+    if not (_G.StaticPopupDialogs and _G.StaticPopup_Show) then return end
+    _G.StaticPopupDialogs[REMOVE_POPUP] = _G.StaticPopupDialogs[REMOVE_POPUP] or {
+        text = "Remove %s's cached data? This cannot be undone.",
+        button1 = _G.YES or "Yes",
+        button2 = _G.NO or "No",
+        timeout = 0, whileDead = true, hideOnEscape = true, showAlert = true,
+        OnAccept = function(_, data)
+            if data and Owner.RemoveOwner(data.key) and data.onDone then data.onDone() end
+        end,
+    }
+    _G.StaticPopup_Show(REMOVE_POPUP, name or key, nil, { key = key, onDone = onDone })
 end
 
 -- Create a titlebar owner selector: a compact button showing the viewed character's
@@ -226,9 +315,32 @@ function Owner.CreateSelector(parent, opts)
         row._badge = row:CreateFontString(nil, "OVERLAY")
         row._badge:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
         row._badge:SetPoint("LEFT", row._name, "RIGHT", 6, 0)
+
+        -- Favorite STAR (far right): ★ lit when favorite, ☆ idle otherwise. Toggles the
+        -- favorite and re-populates so the row re-sorts to the top. Non-self only (self is
+        -- always first); hidden on the self row.
+        row._star = _G.CreateFrame("Button", nil, row)
+        row._star:SetSize(16, 16)
+        row._star:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row._starFS = row._star:CreateFontString(nil, "OVERLAY")
+        row._starFS:SetFontObject(UI.fonts.body)
+        row._starFS:SetPoint("CENTER", row._star, "CENTER", 0, 0)
+
+        -- DELETE ✕ (left of the star), non-self only. Opens a plain confirm before removing the
+        -- cached owner (never the live self — guarded downstream). Danger-tinted on hover.
+        row._del = _G.CreateFrame("Button", nil, row)
+        row._del:SetSize(16, 16)
+        row._del:SetPoint("RIGHT", row._star, "LEFT", -2, 0)
+        row._delFS = row._del:CreateFontString(nil, "OVERLAY")
+        row._delFS:SetFontObject(UI.fonts.body)
+        row._delFS:SetPoint("CENTER", row._del, "CENTER", 0, 0)
+        row._delFS:SetText("\195\151")   -- ✕ (U+00D7 multiplication sign)
+        row._del:SetScript("OnEnter", function() if row._delFS then row._delFS:SetTextColor(UI.Color("danger")) end end)
+        row._del:SetScript("OnLeave", function() if row._delFS then row._delFS:SetTextColor(UI.Color("muted")) end end)
+
         row._fresh = row:CreateFontString(nil, "OVERLAY")
         row._fresh:SetFontObject(UI.fonts.small)
-        row._fresh:SetPoint("RIGHT", row, "RIGHT", -8, 0)
+        row._fresh:SetPoint("RIGHT", row._del, "LEFT", -6, 0)
         row:SetScript("OnEnter", function(self) self._hl:Show() end)
         row:SetScript("OnLeave", function(self) self._hl:Hide() end)
         popup._rows[i] = row
@@ -257,6 +369,29 @@ function Owner.CreateSelector(parent, opts)
                 popup:Hide()
                 if opts.onSelect then opts.onSelect(d.key) end
             end)
+
+            -- Favorite star: lit ★ when favorite, idle ☆ otherwise. Hidden on the self row.
+            if d.isSelf then
+                row._star:Hide(); row._del:Hide()
+            else
+                row._star:Show()
+                row._starFS:SetText(d.isFavorite and "\226\152\133" or "\226\152\134")   -- ★ / ☆
+                row._starFS:SetTextColor(UI.Color(d.isFavorite and "warn" or "faint"))
+                row._star:SetScript("OnClick", function()
+                    Owner.ToggleFavorite(d.key)
+                    populate()   -- re-sort (favorite rises to the top)
+                end)
+                -- Delete ✕ → plain confirm, then remove the cached owner (self is never here).
+                row._del:Show()
+                row._delFS:SetTextColor(UI.Color("muted"))
+                row._del:SetScript("OnClick", function()
+                    confirmRemoveOwner(d.key, d.name, function()
+                        populate()
+                        if Owner.RefreshAll then Owner.RefreshAll() end
+                    end)
+                end)
+            end
+
             row:Show()
             y = y + 26
             shown = i
@@ -353,11 +488,11 @@ local function testOwnerListOrdering(fails)
     -- own-account alts next, alphabetical: Amy then Bob
     ck(list[2].name == "Amy" and list[2].isOwnAccount, "own-account Amy second (alpha)")
     ck(list[3].name == "Bob" and list[3].isOwnAccount, "own-account Bob third")
-    ck(list[2].rank == 1 and list[3].rank == 1, "own-account rank 1")
-    -- cross-account + summary last (rank 2), alphabetical: Cid then Rex
+    ck(list[2].rank == 2 and list[3].rank == 2, "own-account rank 2 (favorites occupy rank 1)")
+    -- cross-account + summary last (rank 3), alphabetical: Cid then Rex
     ck(list[4].name == "Cid" and not list[4].isOwnAccount, "cross-account Cid fourth")
     ck(list[5].name == "Rex", "summary Rex last")
-    ck(list[4].rank == 2 and list[5].rank == 2, "cross-account/summary rank 2")
+    ck(list[4].rank == 3 and list[5].rank == 3, "cross-account/summary rank 3")
     -- descriptor fields
     ck(list[1].hasBank == true, "self has bank data")
     ck(list[2].hasBank == true, "Amy has a bank bag -> hasBank")
@@ -372,7 +507,72 @@ local function testOwnerListOrdering(fails)
     ck(#Owner.BuildOwnerList(nil, "X", "a", 1) == 0, "nil owners -> empty list")
     -- no selfAccount => nobody is "own account" (all non-self are rank 2)
     local noAcct = Owner.BuildOwnerList(owners, "Zed-R", "", 1000)
-    ck(noAcct[1].isSelf and noAcct[2].rank == 2, "blank selfAccount -> no own-account group")
+    ck(noAcct[1].isSelf and noAcct[2].rank == 3, "blank selfAccount -> everyone non-self is cross (rank 3)")
+end
+
+-- RemoveOwner safety (audit 5.5): the live self is NEVER removable; a cached alt is.
+local function testRemoveOwnerSafety(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- pure guard
+    ck(Owner.CanRemove("Alt-R", "Self-R") == true, "an alt is removable")
+    ck(Owner.CanRemove("Self-R", "Self-R") == false, "the self key is NOT removable")
+    ck(Owner.CanRemove(nil, "Self-R") == false, "nil key not removable")
+    ck(Owner.CanRemove("", "Self-R") == false, "empty key not removable")
+    ck(Owner.CanRemove("Alt-R", nil) == true, "no self key -> alt still removable")
+
+    -- live path against a real store. In the harness, SelfKey() = "Tester-TestRealm".
+    _G.DaseekiBags2DB = nil; _G.DaseekiBags2Data = nil; Store.Init()
+    local selfKey = Owner.SelfKey()
+    Store.EnsureOwner(selfKey)
+    Store.EnsureOwner("Alt-TestRealm")
+    ck(Store.OwnerCount() == 2, "two owners seeded")
+    -- self cannot be removed
+    ck(Owner.RemoveOwner(selfKey) == false, "RemoveOwner refuses the live self")
+    ck(Store.GetOwner(selfKey) ~= nil, "self owner survives a delete attempt")
+    -- an alt is removed
+    ck(Owner.RemoveOwner("Alt-TestRealm") == true, "RemoveOwner removes a cached alt")
+    ck(Store.GetOwner("Alt-TestRealm") == nil, "alt owner is gone after removal")
+    -- removing a non-existent owner is a safe false
+    ck(Owner.RemoveOwner("Ghost-Nowhere") == false, "removing an absent owner -> false")
+
+    -- favorites round-trip on the settings DB
+    ck(Owner.IsFavorite("Alt-TestRealm") == false, "nothing favorited initially")
+    Store.EnsureOwner("Buddy-TestRealm")
+    ck(Owner.ToggleFavorite("Buddy-TestRealm") == true, "toggle on -> favorite")
+    ck(Owner.IsFavorite("Buddy-TestRealm") == true, "favorite persists")
+    ck(Owner.ToggleFavorite("Buddy-TestRealm") == false, "toggle off -> not favorite")
+    ck(Owner.IsFavorite("Buddy-TestRealm") == false, "un-favorite persists")
+    ck(Owner.ToggleFavorite(selfKey) == false, "self can never be favorited")
+end
+
+-- Favorites sort to the top (audit 5.2): a favorited cross-account owner outranks its
+-- normal group, landing just under self.
+local function testFavoritesSort(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local owners = {
+        ["Zed-R"] = { name = "Zed", class = "MAGE",    account = "acctA", source = "full",  ts = 1000, containers = { [0] = {} } },
+        ["Amy-R"] = { name = "Amy", class = "PRIEST",  account = "acctA", source = "full",  ts = 900,  containers = { [0] = {} } },
+        ["Cid-R"] = { name = "Cid", class = "ROGUE",   account = "acctB", source = "full",  ts = 500,  containers = { [0] = {} } },
+        ["Rex-R"] = { name = "Rex", class = "HUNTER",  account = "",      source = "summary", ts = 0,   containers = {} },
+    }
+    -- No favorites: Zed(self), then own-account Amy, then cross-account Cid, then summary Rex.
+    local base = Owner.BuildOwnerList(owners, "Zed-R", "acctA", 1000, nil)
+    ck(base[1].key == "Zed-R" and base[2].key == "Amy-R", "no favorites -> self then own-account")
+    ck(base[3].key == "Cid-R", "cross-account next without favorites")
+
+    -- Favorite Cid (a cross-account owner) and Rex (a summary owner): both rise above own-account.
+    local favs = { ["Cid-R"] = true, ["Rex-R"] = true }
+    local list = Owner.BuildOwnerList(owners, "Zed-R", "acctA", 1000, favs)
+    ck(list[1].key == "Zed-R" and list[1].rank == 0, "self still first")
+    ck(list[2].isFavorite and list[3].isFavorite, "both favorites occupy ranks 2 & 3 rows")
+    ck(list[2].rank == 1 and list[3].rank == 1, "favorites share rank 1 (above own-account)")
+    -- within the favorite group, alphabetical: Cid before Rex
+    ck(list[2].key == "Cid-R" and list[3].key == "Rex-R", "favorites alphabetical among themselves")
+    -- the non-favorite own-account Amy now sorts BELOW the favorites
+    ck(list[4].key == "Amy-R" and list[4].rank == 2, "own-account Amy drops below favorites")
+    -- a favorited SELF is ignored (self is never a favorite; always rank 0)
+    local selfFav = Owner.BuildOwnerList(owners, "Zed-R", "acctA", 1000, { ["Zed-R"] = true })
+    ck(selfFav[1].key == "Zed-R" and selfFav[1].isFavorite == false, "self ignores a favorite flag")
 end
 
 function Owner.RunSelfTests(verbose)
@@ -380,6 +580,8 @@ function Owner.RunSelfTests(verbose)
         { name = "freshness + badge",   fn = testFreshnessAndBadge },
         { name = "has bank data",       fn = testHasBankData },
         { name = "owner-list ordering", fn = testOwnerListOrdering },
+        { name = "remove-owner safety", fn = testRemoveOwnerSafety },
+        { name = "favorites sort",      fn = testFavoritesSort },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

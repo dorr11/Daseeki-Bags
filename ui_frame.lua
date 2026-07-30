@@ -92,6 +92,12 @@ function Frame.ButtonSize()  local db = Store and Store.db; return (db and db.bu
 function Frame.Gap()         local db = Store and Store.db; return (db and db.gap)        or Frame.DEFAULT_GAP        end
 function Frame.Layout()      local db = Store and Store.db; return (db and db.layout)     or "combined"              end
 function Frame.ShowKeyring() local db = Store and Store.db; if db and db.showKeyring ~= nil then return db.showKeyring end return true end
+-- Money bar visibility (audit §9.4 dead-control fix): absent/true => shown, explicit false hides.
+function Frame.MoneyShown()  local db = Store and Store.db; return not (db and db.showMoney == false) end
+-- Frame-lock (audit §9.8): absent/false => draggable, explicit true locks the window position.
+function Frame.FrameLocked() local db = Store and Store.db; return (db and db.frameLock) and true or false end
+-- Pure predicate the title-bar drag handler consults; injectable `locked` for tests.
+function Frame.DragAllowed(locked) return not locked end
 
 -- W4.5: the combined view groups items into category SECTIONS when the categories
 -- feature is on AND the rules2 engine is present. SPLIT is UNAFFECTED (bags are the
@@ -306,32 +312,39 @@ end
 
 -- PURE: the 1.0 Money-tooltip structure (playerMoney.lua parity). Builds an ordered row
 -- list from per-character descriptors:
---   chars = { { name, class, account, copper }, ... }
+--   chars = { { name, class, account, faction, copper }, ... }
 --   opts  = { selfAccount, minCopper (default 0, from moneyTooltipMinGold*10000),
---             maxPerGroup (default 5) }
+--             maxPerGroup (default 5),
+--             sameFactionOnly (bool), selfFaction (this char's faction, e.g. "Horde") }
 -- Behavior matched from 1.x: characters split into THIS account ("mine") vs OTHER accounts;
 -- within each group, money>0 AND >=minCopper, sorted by copper DESC then name; the first
 -- `maxPerGroup` shown, the rest summed into one "Others" rollup line; the Other-Accounts
 -- group is preceded by a spacer + an "Other Accounts" section header; a "Total" footer holds
--- the grand total of every character. Row kinds: "char" | "others" | "spacer" | "section" |
--- "total". Harness-locked so the tooltip content is provable; the live render only colors +
--- coin-formats.
+-- the grand total. The same-faction filter (audit §4.4) is applied UP FRONT — a filtered-out
+-- character contributes to neither the rows NOR the total (it's a same-faction view). A char
+-- with an unknown (nil) faction is never filtered out (we can't prove it's the other faction).
+-- Row kinds: "char" | "others" | "spacer" | "section" | "total". Harness-locked.
 function Frame.BuildMoneyReport(chars, opts)
     opts = opts or {}
     local selfAccount = opts.selfAccount
     local minCopper   = opts.minCopper or 0
     local maxPerGroup = opts.maxPerGroup or 5
     local haveSelf    = (selfAccount ~= nil and selfAccount ~= "")
+    local factionGate = opts.sameFactionOnly and opts.selfFaction and opts.selfFaction ~= ""
 
     local mine, others, total = {}, {}, 0
     for _, c in ipairs(chars or {}) do
-        local copper = c.copper or 0
-        total = total + copper
-        if copper > 0 and copper >= minCopper then
-            local acct = c.account or ""
-            local isMine = (not haveSelf) or (acct == selfAccount)
-            local row = { kind = "char", name = c.name or "?", class = c.class, account = acct, copper = copper }
-            if isMine then mine[#mine + 1] = row else others[#others + 1] = row end
+        -- Same-faction filter: drop opposite-faction characters entirely (rows + total).
+        -- Unknown faction (nil) is kept — we never hide gold we can't prove is cross-faction.
+        if not (factionGate and c.faction ~= nil and c.faction ~= opts.selfFaction) then
+            local copper = c.copper or 0
+            total = total + copper
+            if copper > 0 and copper >= minCopper then
+                local acct = c.account or ""
+                local isMine = (not haveSelf) or (acct == selfAccount)
+                local row = { kind = "char", name = c.name or "?", class = c.class, account = acct, copper = copper }
+                if isMine then mine[#mine + 1] = row else others[#others + 1] = row end
+            end
         end
     end
     local function sortGroup(g)
@@ -668,7 +681,8 @@ function Frame.MoneyChars()
     local out = {}
     if Store and Store.ForEachOwner then
         Store.ForEachOwner(function(_, o)
-            out[#out + 1] = { name = o.name or "?", class = o.class, account = o.account or "", copper = o.money or 0 }
+            out[#out + 1] = { name = o.name or "?", class = o.class, account = o.account or "",
+                              faction = o.faction, copper = o.money or 0 }
         end)
     end
     return out
@@ -684,9 +698,16 @@ function Frame.RenderMoneyTooltip(GT)
     GT:ClearLines()
     GT:AddLine(_G.MONEY or "Money", tok("text"))
     local selfAccount = Store and Store.data and Store.data.selfAccount
-    local minGold     = (Store and Store.db and Store.db.moneyTooltipMinGold) or 0
+    local db          = Store and Store.db
+    local minGold     = (db and db.moneyTooltipMinGold) or 0
+    -- Same-faction filter (audit §4.4). Default OFF (additive; unchanged 2.0 behavior — see
+    -- the deliverable note: the exact 1.x default is unverifiable under clean-room, so we take
+    -- the no-regression choice). selfFaction from the live UnitFactionGroup.
+    local sameFaction = db and db.moneyTooltipFaction == true
+    local selfFaction = _G.UnitFactionGroup and _G.UnitFactionGroup("player") or nil
     local rows = Frame.BuildMoneyReport(Frame.MoneyChars(), {
         selfAccount = selfAccount, minCopper = (minGold or 0) * 10000, maxPerGroup = 5,
+        sameFactionOnly = sameFaction, selfFaction = selfFaction,
     })
     for _, row in ipairs(rows) do
         if row.kind == "char" then
@@ -706,6 +727,47 @@ function Frame.RenderMoneyTooltip(GT)
         end
     end
     GT:Show()
+end
+
+-- PURE: decide what a click on the money display should do (audit §4.5, "click coins to
+-- pick up/deposit at the bank the way the default UI does").
+--   opts = { inCombat, isSelf, atBank, hasPickup }
+-- Returns: "combat" (blocked in combat) | "alt" (viewing someone else's cached money — never
+-- pickable) | nil (not at the bank — the default UI only offers coin pickup there) |
+-- "unsupported" (at bank, self, out of combat, but the client has no coin-pickup surface) |
+-- "pickup" (open the coin pickup). Combat is guarded because moving money is an insecure UI
+-- op we defer out of the lockdown, matching the sort/strip combat gating already in place.
+function Frame.MoneyClickAction(opts)
+    opts = opts or {}
+    if opts.inCombat then return "combat" end
+    if not opts.isSelf then return "alt" end
+    if not opts.atBank then return nil end
+    if not opts.hasPickup then return "unsupported" end
+    return "pickup"
+end
+
+-- Live money-bar click handler. Only the logged-in self's live money can be picked up, only at
+-- the bank, only out of combat. Uses the FrameXML OpenCoinPickupFrame surface (the exact
+-- default-UI coin pickup) — a FrameXML Lua global that the engine API catalog does not cover,
+-- so it is existence-guarded and SafeCall-isolated. (Catalog note: no OpenCoinPickupFrame /
+-- DropPlayerMoney / DepositCursorMoney appear in wow-api-catalog/1.15.9.68808 — only the raw
+-- primitives PickupPlayerMoney/GetCursorMoney/DropCursorMoney — so the dialog global is the
+-- correct, if un-catalogable, surface; verify in-game that the coin dialog opens.)
+function Frame.OnMoneyClick()
+    local inCombat  = (_G.InCombatLockdown and _G.InCombatLockdown()) and true or false
+    local isSelf    = (Frame.ViewedOwnerKey() == Frame.SelfKey())
+    local atBank    = (_G.BankFrame and _G.BankFrame.IsShown and _G.BankFrame:IsShown()) and true or false
+    local hasPickup = (_G.OpenCoinPickupFrame ~= nil)
+    local action = Frame.MoneyClickAction({ inCombat = inCombat, isSelf = isSelf, atBank = atBank, hasPickup = hasPickup })
+    if action == "combat" then
+        if ns.Print then ns:Print("Can't move money in combat.") end
+        return
+    end
+    if action ~= "pickup" then return end   -- alt view / not at bank / unsupported => no-op
+    local amount = (_G.GetMoney and _G.GetMoney()) or 0
+    local mf = Frame.window and Frame.window.money
+    if ns.SafeCall then ns:SafeCall(_G.OpenCoinPickupFrame, amount, mf, _G.UIParent)
+    else _G.OpenCoinPickupFrame(amount, mf, _G.UIParent) end
 end
 
 -- Save the live window position into settings.
@@ -761,16 +823,18 @@ function Frame.Ensure()
     if _G.UISpecialFrames then table.insert(_G.UISpecialFrames, WINDOW_NAME) end
 
     -- ── Title row (1.0 anatomy): gold "<Char>'s Inventory" + top-right icon cluster
-    --    (search · owner · find · sort) + red X. Drag to move; RIGHT-CLICK flips the
-    --    combined/split layout (the modern segmented control relocated here — see
-    --    Frame.SetLayout; also reachable from the options panel). ────────────────
+    --    (search · owner · find · sort) + red X. Drag to move (unless the window is locked);
+    --    RIGHT-CLICK flips the combined/split layout. ────────────────────────────
     local titleBar = _G.CreateFrame("Frame", nil, win)
     titleBar:SetPoint("TOPLEFT", win, "TOPLEFT", 0, 0)
     titleBar:SetPoint("TOPRIGHT", win, "TOPRIGHT", 0, 0)
     titleBar:SetHeight(TITLE_H)
     titleBar:EnableMouse(true)
     titleBar:RegisterForDrag("LeftButton")
-    titleBar:SetScript("OnDragStart", function() win:StartMoving() end)
+    -- Frame-lock (audit §9.8): the drag is suppressed while db.frameLock is on.
+    titleBar:SetScript("OnDragStart", function()
+        if Frame.DragAllowed(Frame.FrameLocked()) then win:StartMoving() end
+    end)
     titleBar:SetScript("OnDragStop",  function() win:StopMovingOrSizing(); saveGeometry(win) end)
     titleBar:SetScript("OnMouseUp", function(_, mb)
         if mb == "RightButton" then
@@ -984,8 +1048,18 @@ function Frame.Ensure()
     money:SetScript("OnEnter", function(self)
         _G.GameTooltip:SetOwner(self, "ANCHOR_LEFT")
         Frame.RenderMoneyTooltip(_G.GameTooltip)
+        -- Hint the bank-only coin pickup so the click is discoverable.
+        if _G.OpenCoinPickupFrame and _G.GameTooltip.AddLine then
+            _G.GameTooltip:AddLine(" ")
+            _G.GameTooltip:AddLine("Click at the bank to pick up coins.", UI.Color("muted"))
+            _G.GameTooltip:Show()
+        end
     end)
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
+    -- Coin pickup (audit §4.5): left-click the money display to pick up coins — bank-only,
+    -- self-only, combat-guarded (all decided by Frame.OnMoneyClick / MoneyClickAction).
+    money:RegisterForClicks("LeftButtonUp")
+    money:SetScript("OnClick", function() Frame.OnMoneyClick() end)
     win.money   = money
     win.moneyFS = moneyFS
 
@@ -1491,7 +1565,10 @@ function Frame.Rebuild()
         win.title:SetText(Frame.WindowTitle(nm))
     end
     if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
-    -- money (viewed owner)
+    -- money (viewed owner) — the "Show money bar" toggle (audit §9.4) is now live: hide/show the
+    -- money display region per db.showMoney. The bottom band stays (it also holds the slot
+    -- counter + options glyph), so hiding money never clips those; it just drops the coin region.
+    if win.money then win.money:SetShown(Frame.MoneyShown()) end
     if win.moneyFS then win.moneyFS:SetText(moneyString(owner and owner.money or 0)) end
     -- free/total slot counter, bottom-center (1.x SlotCount: "free/total")
     if win.slotCount then
@@ -2139,6 +2216,65 @@ local function testMoneyReport(fails)
     ck(#empty == 1 and empty[1].kind == "total" and empty[1].copper == 0, "no chars -> Total 0 only")
 end
 
+-- Parity-triage additions: same-faction money filter (§4.4), coin-click decision (§4.5),
+-- money-bar toggle (§9.4), frame-lock drag gate (§9.8). All pure/headless.
+local function testTriageBits(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local G = 10000
+
+    -- ── Same-faction money filter ──────────────────────────────────────────────
+    local chars = {
+        { name = "Horde1", account = "A", faction = "Horde",    copper = 100 * G },
+        { name = "Horde2", account = "A", faction = "Horde",    copper = 50 * G },
+        { name = "Ally1",  account = "A", faction = "Alliance", copper = 40 * G },
+        { name = "Unknown", account = "A", faction = nil,       copper = 7 * G },   -- unknown faction
+    }
+    -- filter OFF (default): everyone counts; total = 197g
+    local off = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9 })
+    ck(off[#off].kind == "total" and off[#off].copper == 197 * G, "faction filter off -> total counts all (197g)")
+    -- filter ON, self Horde: Alliance dropped from rows AND total; unknown faction KEPT
+    local on = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9,
+        sameFactionOnly = true, selfFaction = "Horde" })
+    local names = {}
+    for _, r in ipairs(on) do if r.kind == "char" then names[r.name] = true end end
+    ck(names.Horde1 and names.Horde2, "same-faction: own-faction chars shown")
+    ck(names.Ally1 == nil, "same-faction: opposite-faction char hidden")
+    ck(names.Unknown == true, "same-faction: unknown-faction char kept (never hide unprovable gold)")
+    ck(on[#on].kind == "total" and on[#on].copper == 157 * G, "same-faction: total EXCLUDES opposite faction (157g)")
+    -- filter ON but no selfFaction known -> behaves as OFF (can't filter safely)
+    local unk = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9,
+        sameFactionOnly = true, selfFaction = nil })
+    ck(unk[#unk].copper == 197 * G, "same-faction with unknown self faction -> no filtering")
+
+    -- ── Coin-click decision (MoneyClickAction) ─────────────────────────────────
+    ck(Frame.MoneyClickAction({ inCombat = true, isSelf = true, atBank = true, hasPickup = true }) == "combat",
+        "combat blocks coin pickup")
+    ck(Frame.MoneyClickAction({ isSelf = false, atBank = true, hasPickup = true }) == "alt",
+        "viewing an alt -> no pickup (alt)")
+    ck(Frame.MoneyClickAction({ isSelf = true, atBank = false, hasPickup = true }) == nil,
+        "not at bank -> no action")
+    ck(Frame.MoneyClickAction({ isSelf = true, atBank = true, hasPickup = false }) == "unsupported",
+        "no coin-pickup surface -> unsupported")
+    ck(Frame.MoneyClickAction({ isSelf = true, atBank = true, hasPickup = true }) == "pickup",
+        "self + at bank + out of combat + supported -> pickup")
+
+    -- ── Money-bar toggle (§9.4 dead-control fix) ───────────────────────────────
+    _G.DaseekiBags2DB = nil; _G.DaseekiBags2Data = nil; Store.Init()
+    ck(Frame.MoneyShown() == true, "money bar shown by default")
+    Store.db.showMoney = false
+    ck(Frame.MoneyShown() == false, "money bar hidden when showMoney=false")
+    Store.db.showMoney = true
+    ck(Frame.MoneyShown() == true, "money bar shown when showMoney=true")
+
+    -- ── Frame-lock drag gate (§9.8) ────────────────────────────────────────────
+    ck(Frame.DragAllowed(false) == true, "unlocked -> drag allowed")
+    ck(Frame.DragAllowed(true) == false, "locked -> drag suppressed")
+    Store.db.frameLock = true
+    ck(Frame.FrameLocked() == true, "frameLock=true reads locked")
+    Store.db.frameLock = nil
+    ck(Frame.FrameLocked() == false, "absent frameLock -> unlocked (default)")
+end
+
 -- 1.0-LOOK PARITY: the new anatomy helpers — title format, free/total counter, and the
 -- bag-strip band geometry — plus the toolbar-free window math. All pure/headless.
 local function testParityAnatomy(fails)
@@ -2206,6 +2342,7 @@ function Frame.RunSelfTests(verbose)
         { name = "effective mode",       fn = testEffectiveMode },
         { name = "strip slots",          fn = testStripSlots },
         { name = "strip button state",   fn = testStripButtonState },
+        { name = "triage bits (§4.4/§4.5/§9.4/§9.8)", fn = testTriageBits },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

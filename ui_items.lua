@@ -230,13 +230,18 @@ end
 -- PURE: two-layer STATE resolver (Layer 2). Given a slot's live facts, decide the icon
 -- treatment (mutually exclusive) and the corner markers (independent), with precedence:
 --   icon:  dimmed  >  junk(quality 0)  >  normal
---   markers: new-item wax dot + quest tab show ONLY when NOT dimmed (dim recedes all)
+--   markers: new-item wax dot + quest tab + equipment-set tick show ONLY when NOT dimmed
 -- 1.0-PARITY change (glowUnusable): UNUSABLE no longer greys the icon — 1.x kept the icon
 -- FULL-COLOR and drew a RED BORDER instead (RED_FONT_COLOR). So unusable now yields
 -- redBorder=true (drawn by borders.Apply, winning over the quality edge on that cell) while
 -- the icon stays normal. `unusableTint` is retired (kept false for back-compat readers).
---   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>, isUnusable=<bool> }
--- returns { icon, iconDesat, redBorder, unusableTint, showNewDot, showQuestTab, dressAlpha }.
+--   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>, isUnusable=<bool>,
+--           isSet=<bool> }
+-- returns { icon, iconDesat, redBorder, unusableTint, showNewDot, showQuestTab, showSetMark,
+--           dressAlpha }.
+-- The equipment-set tick (audit §2.8, Daseeki-Armory) is an INDEPENDENT corner marker — a
+-- subtle bronze corner tick, NOT a border, so the quality edge and the unusable red border
+-- keep full precedence on the cell edge. Like the other markers it recedes fully when dimmed.
 function Items.ResolveState(ctx)
     ctx = ctx or {}
     local dimmed = ctx.dimmed and true or false
@@ -252,6 +257,7 @@ function Items.ResolveState(ctx)
         unusableTint = false,                    -- retired (1.x kept the icon full-color)
         showNewDot   = (ctx.isNew and not dimmed) and true or false,
         showQuestTab = (ctx.isQuest and not dimmed) and true or false,
+        showSetMark  = (ctx.isSet and not dimmed) and true or false,
         dressAlpha   = Items.DressAlpha(dimmed),
     }
 end
@@ -507,6 +513,21 @@ local function slotIsUnusable(button)
     return false
 end
 
+-- EQUIPMENT-SET: read-only Daseeki-Armory consumer. True when this slot's item belongs to
+-- one of the logged-in character's saved sets. Gated by the db.setMarkers toggle (absent =>
+-- ON). Feature is INERT when Armory is absent/uninitialised (guarded), and — like new/quest —
+-- meaningful only for live self bags (Armory stores per-character sets, so alts have no data).
+local function slotIsSet(button)
+    local db = ns.Store and ns.Store.db
+    if db and db.setMarkers == false then return false end   -- toggle off
+    local id = button._data and button._data.id
+    if not id then return false end
+    local A = _G.DaseekiArmory
+    if not (A and A.GetSetsContainingItem and A.db and A.db.sets) then return false end
+    local ok, names = pcall(A.GetSetsContainingItem, A, id)
+    return (ok and type(names) == "table" and #names > 0) and true or false
+end
+
 -- Clear the new-item mark on interaction (1.x MarkSeen fact: RemoveNewItem on seen).
 -- Wired as an insecure OnEnter post-hook on live buttons (hover-to-clear) so the secure
 -- click path is never touched. RemoveNewItem is not a protected op.
@@ -570,16 +591,23 @@ function Items._applyDress(button, spec)
     if tab then
         if spec.showQuestTab then tab:SetAlpha(a); tab:Show() else tab:Hide() end
     end
+
+    -- EQUIPMENT-SET bronze corner tick (independent marker; recedes with the dim like the rest)
+    local setMark = button._dsSetMark
+    if setMark then
+        if spec.showSetMark then setMark:SetAlpha(a); setMark:Show() else setMark:Hide() end
+    end
 end
 
 -- Detect the live facts, resolve the state spec, and apply it. Also the SetDimmed target.
 local function applyDressState(button)
     local live = button._live and true or false
     local hasItem = button._data and button._data.id ~= nil
-    local isNew, isQuest, isUnusable = false, false, false
+    local isNew, isQuest, isUnusable, isSet = false, false, false, false
     if hasItem and live then
         isNew      = slotIsNew(button)
         isQuest    = slotIsQuest(button)
+        isSet      = slotIsSet(button)
         -- reuse the unusable verdict paintButton already computed (avoids a second
         -- proficiency/level scan); recompute only if this path ran standalone.
         if button._unusable ~= nil then isUnusable = button._unusable else isUnusable = slotIsUnusable(button) end
@@ -590,6 +618,7 @@ local function applyDressState(button)
         isNew      = isNew,
         isQuest    = isQuest,
         isUnusable = isUnusable,
+        isSet      = isSet,
     })
     Items._applyDress(button, spec)
 end
@@ -895,6 +924,17 @@ local function ensureDress(button)
     tab:Hide()
     button._dsQuestTab = tab
 
+    -- EQUIPMENT-SET tick (bronze), bottom-LEFT corner — the one free corner (new=top-right,
+    -- quest=top-left, count numeral=bottom-right). A small filled square reads as a quiet
+    -- "belongs to a gear set" tick; deliberately subtler than the crimson new dot.
+    local setMark = button:CreateTexture(nil, "OVERLAY")
+    local ssz = math.max(4, math.floor(sz * 0.20))
+    setMark:SetSize(ssz, ssz)
+    setMark:SetPoint("BOTTOMLEFT", button, "BOTTOMLEFT", 1, 1)
+    setMark:SetColorTexture(tokenRGB("bronze"))
+    setMark:Hide()
+    button._dsSetMark = setMark
+
     styleCount(button)
 end
 Items._ensureDress = ensureDress
@@ -1036,6 +1076,7 @@ function Items.CreateButton(parent, opts)
         if ns.Borders then ns.Borders.Apply(self, nil) end
         if self._dsNewDot then self._dsNewDot:Hide() end
         if self._dsQuestTab then self._dsQuestTab:Hide() end
+        if self._dsSetMark then self._dsSetMark:Hide() end
         self:Hide()
     end
     return button
@@ -1355,7 +1396,7 @@ local function testStatePrecedence(fails)
     local s = Items.ResolveState({ quality = 3 })
     ck(s.icon == "normal" and s.iconDesat == false and s.unusableTint == false, "normal rare -> clean icon")
     ck(s.redBorder == false, "normal -> no red border")
-    ck(s.showNewDot == false and s.showQuestTab == false, "normal -> no markers")
+    ck(s.showNewDot == false and s.showQuestTab == false and s.showSetMark == false, "normal -> no markers")
     ck(s.dressAlpha == 1.0, "normal -> full dress alpha")
 
     -- junk (quality 0): slight desat, NO tint, calm
@@ -1371,22 +1412,27 @@ local function testStatePrecedence(fails)
     local uj = Items.ResolveState({ quality = 0, isUnusable = true })
     ck(uj.icon == "junk" and uj.redBorder == true, "unusable junk -> junk icon + red border")
 
-    -- markers are independent of icon treatment (a new, quest, unusable item shows both)
-    local m = Items.ResolveState({ quality = 3, isNew = true, isQuest = true, isUnusable = true })
-    ck(m.showNewDot == true and m.showQuestTab == true, "new+quest markers show alongside unusable")
+    -- markers are independent of icon treatment (a new, quest, set, unusable item shows all)
+    local m = Items.ResolveState({ quality = 3, isNew = true, isQuest = true, isSet = true, isUnusable = true })
+    ck(m.showNewDot == true and m.showQuestTab == true and m.showSetMark == true,
+        "new+quest+set markers show alongside unusable")
+    -- the set tick is NOT a border — it never affects redBorder precedence
+    ck(m.redBorder == true, "set marker does not disturb the unusable red border")
 
-    -- DIMMED outranks everything: icon=dimmed, markers + red border suppressed, alpha 0.25
-    local d = Items.ResolveState({ quality = 0, isNew = true, isQuest = true, isUnusable = true, dimmed = true })
+    -- DIMMED outranks everything: icon=dimmed, ALL markers + red border suppressed, alpha 0.25
+    local d = Items.ResolveState({ quality = 0, isNew = true, isQuest = true, isSet = true, isUnusable = true, dimmed = true })
     ck(d.icon == "dimmed" and d.iconDesat == true, "dimmed outranks junk")
     ck(d.redBorder == false, "dimmed suppresses the unusable red border")
-    ck(d.showNewDot == false and d.showQuestTab == false, "dimmed suppresses all markers")
+    ck(d.showNewDot == false and d.showQuestTab == false and d.showSetMark == false, "dimmed suppresses all markers")
     ck(d.dressAlpha == 0.25, "dimmed -> 0.25 dress alpha")
 
-    -- new-only and quest-only
+    -- new-only, quest-only, set-only
     local n = Items.ResolveState({ quality = 2, isNew = true })
-    ck(n.showNewDot == true and n.showQuestTab == false and n.icon == "normal", "new-only marker")
+    ck(n.showNewDot == true and n.showQuestTab == false and n.showSetMark == false and n.icon == "normal", "new-only marker")
     local q = Items.ResolveState({ quality = 2, isQuest = true })
-    ck(q.showQuestTab == true and q.showNewDot == false, "quest-only marker")
+    ck(q.showQuestTab == true and q.showNewDot == false and q.showSetMark == false, "quest-only marker")
+    local st = Items.ResolveState({ quality = 2, isSet = true })
+    ck(st.showSetMark == true and st.showNewDot == false and st.showQuestTab == false and st.icon == "normal", "set-only marker")
 end
 
 -- DIM CASCADE covering ALL dress layers: a dimmed slot recedes icon + quality edge +

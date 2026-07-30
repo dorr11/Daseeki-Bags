@@ -200,6 +200,31 @@ if _G.SlashCmdList then
 end
 
 ----------------------------------------------------------------------
+-- Keybindings (audit §10.2). Bindings.xml (loaded last on the v2 tocs) calls these
+-- in-game handler globals; the BINDING_HEADER_/BINDING_NAME_ strings label them in the
+-- KeyBindings UI (enUS inline — suite convention, no localization files on this tree).
+--
+-- Action names are DASEEKIBAGS2_* so they NEVER collide with the live 1.x DASEEKIBAGS_*
+-- bindings (DASEEKIBAGS_TOGGLE / DASEEKIBAGS_BANK_TOGGLE) while both addons are installed;
+-- a cutover rename follows when v2 replaces 1.x. Guarded on _G.SlashCmdList so the headless
+-- harness (which has neither SlashCmdList nor a bindings UI) never sees these globals.
+----------------------------------------------------------------------
+
+if _G.SlashCmdList then
+    function _G.DaseekiBags2_ToggleBags() if ns.Frame and ns.Frame.Toggle then ns.Frame.Toggle() end end
+    function _G.DaseekiBags2_ToggleBank() if ns.Bank and ns.Bank.Toggle then ns.Bank.Toggle() end end
+    function _G.DaseekiBags2_ToggleFind()
+        if ns.Find and ns.Find.Toggle then ns.Find.Toggle()
+        elseif ns.Find and ns.Find.Open then ns.Find.Open() end
+    end
+
+    _G.BINDING_HEADER_DASEEKIBAGS2           = "Daseeki Bags"
+    _G.BINDING_NAME_DASEEKIBAGS2_TOGGLE      = "Toggle Bags"
+    _G.BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE = "Toggle Bank"
+    _G.BINDING_NAME_DASEEKIBAGS2_FIND        = "Find Item Across Characters"
+end
+
+----------------------------------------------------------------------
 -- Lifecycle
 --   ADDON_LOADED (this addon) -> Store.Init() then one-time Migrate.Migrate()
 --                                (marker-guarded/idempotent). Fires STORE_READY.

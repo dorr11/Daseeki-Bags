@@ -94,6 +94,25 @@ function Sort.CompareStacks(a, b)
     return (a.count or 0) > (b.count or 0)      -- fuller stacks first (stable)
 end
 
+-- PURE: the DESCENDING comparator (audit §6.3). Reverses the GROUPING keys (class → subclass
+-- → name → id) so item categories appear in the opposite order, but keeps the within-item tail
+-- IDENTICAL to ascending — higher quality first, then fuller stack first. Keeping the tail
+-- canonical is what makes descending a fixed point under re-planning (it agrees with Phase I's
+-- "fill the earliest partial to full"), so re-sorting never oscillates the full/partial stacks.
+function Sort.CompareStacksDesc(a, b)
+    local am, bm = a.meta or {}, b.meta or {}
+    local ac, bc = am.classID or HUGE, bm.classID or HUGE
+    if ac ~= bc then return ac > bc end         -- class DESCENDING (reversed grouping)
+    local as, bs = am.subClassID or HUGE, bm.subClassID or HUGE
+    if as ~= bs then return as > bs end         -- subclass DESCENDING
+    local an, bn = am.name or "", bm.name or ""
+    if an ~= bn then return an > bn end         -- name Z→A
+    local aq, bq = am.quality or 0, bm.quality or 0
+    if aq ~= bq then return aq > bq end         -- quality: higher first (canonical tail kept)
+    if a.id ~= b.id then return (a.id or 0) > (b.id or 0) end
+    return (a.count or 0) > (b.count or 0)      -- fuller stacks first (canonical tail kept)
+end
+
 ----------------------------------------------------------------------
 -- PURE: the planner
 --
@@ -185,7 +204,14 @@ function Sort.Plan(state)
             targetStacks[#targetStacks + 1] = { id = id, count = cnt, meta = m }
         end
     end
-    table.sort(targetStacks, Sort.CompareStacks)   -- display order
+    -- Direction toggle (audit §6.3): ascending is the canonical CompareStacks order; descending
+    -- REVERSES THE GROUPING (class → subclass → name) but deliberately KEEPS the within-item
+    -- canonical tail — fuller stack first, higher quality first — so descending agrees with
+    -- Phase I (which always fills the earliest partial to full). That keeps descending a fixed
+    -- point: re-sorting a desc-sorted bag yields zero moves (no stack oscillation), matching the
+    -- determinism ascending already has. Only the group order flips.
+    local cmp = state.descending and Sort.CompareStacksDesc or Sort.CompareStacks
+    table.sort(targetStacks, cmp)   -- display order (asc default, desc grouping when descending)
 
     -- fit count per stack + constrained-first assignment order
     local fit, order = {}, {}
@@ -563,10 +589,18 @@ function Sort.Run(cids, opts)
     if not cells then return false end
 
     local cache = {}
+    -- Sort direction: opts.descending overrides; else the persisted db.sortDescending
+    -- (absent/false => ascending, the canonical order).
+    local descending = opts.descending
+    if descending == nil then
+        local db = Store and Store.db
+        descending = (db and db.sortDescending) and true or false
+    end
     local plan = Sort.Plan({
         cells = cells,
         meta = makeMetaFn(cache),
         canHold = makeCanHoldFn(cache),
+        descending = descending,
     })
     if #plan.moves == 0 then
         if ns.Print then ns:Print("bags already sorted.") end
@@ -856,6 +890,57 @@ local function testPartitionWaves(fails)
     ck(#wg == 2 and noCollision(wg), "merges sharing slot 2 split into 2 collision-free waves")
 end
 
+-- Sort DIRECTION (audit §6.3): descending must reverse the canonical display order exactly
+-- while still fully merging + canonicalising the contents (same multiset, reversed layout).
+local function testPlanDirection(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function realizedSeq(descending)
+        local start = {
+            [1] = { id = 200 },              -- sword (weapon, class 2)
+            [2] = { id = 100, count = 13 },  -- apple (consumable, class 0)
+            [3] = { id = 300, count = 4 },   -- cloth (tradegood, class 7)
+            [4] = { id = 100, count = 12 },  -- apple partial -> merges to {20,5}
+            [5] = { id = 201 },              -- cloak (armor, class 4)
+        }
+        local cells = bagCells(0, 8, start)
+        local plan = Sort.Plan({ cells = cells, meta = metaFn, descending = descending })
+        local copy = bagCells(0, 8, start)
+        applyMoves(copy, plan.moves, maxOf)
+        local seq = {}
+        for i = 1, #copy do if copy[i].id then seq[#seq + 1] = copy[i] end end
+        return seq
+    end
+
+    local asc  = realizedSeq(false)
+    local desc = realizedSeq(true)
+    ck(#asc == #desc, "same number of stacks regardless of direction")
+
+    -- ascending groups by class ASCENDING: consumable(0) first, tradegood(7) last.
+    ck(META[asc[1].id].classID == 0, "ascending: consumable (class 0) group first")
+    ck(META[asc[#asc].id].classID == 7, "ascending: tradegood (class 7) group last")
+    -- descending REVERSES the grouping: tradegood(7) first, consumable(0) last.
+    ck(META[desc[1].id].classID == 7, "descending: tradegood (class 7) group first (reversed)")
+    ck(META[desc[#desc].id].classID == 0, "descending: consumable (class 0) group last (reversed)")
+
+    -- within-item tail is KEPT canonical in BOTH directions: the fuller apple stack precedes
+    -- the partial one whichever way we sort (this is what keeps descending a fixed point).
+    local function appleOrder(seq)
+        local out = {}
+        for _, c in ipairs(seq) do if c.id == 100 then out[#out + 1] = c.count end end
+        return out
+    end
+    local ascA, descA = appleOrder(asc), appleOrder(desc)
+    ck(ascA[1] == 20 and ascA[2] == 5, "ascending apples: fuller {20} before partial {5}")
+    ck(descA[1] == 20 and descA[2] == 5, "descending apples: fuller {20} STILL before partial {5} (canonical tail)")
+
+    -- descending is DETERMINISTIC / idempotent: re-planning a desc-sorted bag -> zero moves.
+    local sortedDesc = {}
+    for i, c in ipairs(desc) do sortedDesc[i] = { cid = 0, slot = i, id = c.id, count = c.count } end
+    for i = #desc + 1, 8 do sortedDesc[i] = { cid = 0, slot = i, id = nil, count = 0 } end
+    local rp = Sort.Plan({ cells = sortedDesc, meta = metaFn, descending = true })
+    ck(#rp.moves == 0, "re-planning a desc-sorted bag descending -> no moves (fixed point)")
+end
+
 function Sort.RunSelfTests(verbose)
     local suites = {
         { name = "merge pour (exhaustive)", fn = testMergePour },
@@ -863,6 +948,7 @@ function Sort.RunSelfTests(verbose)
         { name = "plan: merge + group sort", fn = testPlanMergeAndSort },
         { name = "plan: idempotent + locked", fn = testPlanIdempotentAndLocked },
         { name = "plan: family + multi-bag", fn = testPlanFamilyAndMultiBag },
+        { name = "plan: direction inversion", fn = testPlanDirection },
         { name = "wave partition",          fn = testPartitionWaves },
     }
     local allPass = true

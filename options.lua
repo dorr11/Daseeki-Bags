@@ -76,7 +76,7 @@ function Options.Build(flow)
     disp:Hint("How the bag window is arranged and what it shows.")
 
     -- Combined vs split-bag-groups (design D3: both are first-class). Drives the
-    -- live layout switch — same setter the toolbar segmented control uses.
+    -- live layout switch (also reachable by right-clicking the window title bar).
     local layoutRow = disp:AddRow({ vAlign = "center" })
     layoutRow:Label("Layout");
     register(layoutRow:SegmentedChoice({
@@ -94,11 +94,29 @@ function Options.Build(flow)
         set = function(v) local db = DB(); if db then db.showMoney = v and true or false end regrid() end,
     }).Refresh)
 
+    -- Same-faction-only Money tooltip filter (audit §4.4). Additive; default OFF (shows every
+    -- character's gold, the current 2.0 behavior). Only changes the hover tooltip, not the bar.
+    register(disp:Checkbox({
+        label = "Money tooltip: same faction only",
+        tooltip = "On the gold hover, list only characters of your own faction (and their total).",
+        get = function() local db = DB(); return db and db.moneyTooltipFaction == true end,
+        set = function(v) local db = DB(); if db then db.moneyTooltipFaction = v and true or false end end,
+    }).Refresh)
+
     register(disp:Checkbox({
         label = "Show keyring",
         tooltip = "Include the keyring as a container in the bag window.",
         get = function() local db = DB(); return db == nil or db.showKeyring ~= false end,
         set = function(v) local db = DB(); if db then db.showKeyring = v and true or false end regrid() end,
+    }).Refresh)
+
+    -- Frame lock (audit §9.8). Additive; default OFF (draggable). When on, the title-bar drag
+    -- is suppressed so the window can't be moved by accident.
+    register(disp:Checkbox({
+        label = "Lock window position",
+        tooltip = "Prevent dragging the bag window by its title bar.",
+        get = function() local db = DB(); return db and db.frameLock == true end,
+        set = function(v) local db = DB(); if db then db.frameLock = v and true or false end end,
     }).Refresh)
 
     -- ── Categories ──────────────────────────────────────────────────────────────
@@ -156,6 +174,16 @@ function Options.Build(flow)
     }).Refresh)
     ib:Hint("Unusable gear (your class can't equip it, or it's below its required level) always shows a red border.")
 
+    -- Equipment-set marker (audit §2.8, Daseeki-Armory). A subtle bronze corner tick on items
+    -- that belong to one of your saved gear sets — NOT a border, so quality/unusable borders
+    -- keep precedence. Additive; default ON, but INERT unless Daseeki-Armory is installed.
+    register(ib:Checkbox({
+        label = "Show equipment-set markers",
+        tooltip = "Mark bag items that belong to a Daseeki-Armory equipment set with a bronze corner tick. Search with set:<name> (or bare set: for any set). Requires Daseeki-Armory.",
+        get = function() local db = DB(); return db == nil or db.setMarkers ~= false end,
+        set = function(v) local db = DB(); if db then db.setMarkers = v and true or false end regrid() end,
+    }).Refresh)
+
     -- ── Sorting ───────────────────────────────────────────────────────────────
     local sorting = flow:AddSection("Sorting")
     sorting:Hint("Groups items by type, then name; merges partial stacks; leaves locked slots in place.")
@@ -169,13 +197,22 @@ function Options.Build(flow)
     })
     sorting:Hint("Or click the Sort button in the bag window's toolbar. Bank sorting arrives with the bank view.")
 
+    -- Sort direction (audit §6.3). Additive; default OFF = ascending (categories A→Z). When on,
+    -- the item groups sort in the opposite order; within an item, fuller stacks stay first.
+    register(sorting:Checkbox({
+        label = "Sort descending",
+        tooltip = "Reverse the category order when sorting (Z→A groups).",
+        get = function() local db = DB(); return db and db.sortDescending == true end,
+        set = function(v) local db = DB(); if db then db.sortDescending = v and true or false end end,
+    }).Refresh)
+
     -- ── Auto-open ───────────────────────────────────────────────────────────────
     -- Open the bags automatically at these interactions and close them after —
     -- the ns.Features auto-display set (audit §1.5). All default ON, matching 1.x.
     -- Reads/writes DaseekiBags2DB.autoDisplay.* (defaults applied by Features on
     -- STORE_READY); a missing/true sub-key = enabled, only explicit false disables.
     local auto = flow:AddSection("Auto-open")
-    auto:Hint("Show the bags automatically at the merchant, bank and mailbox — and hide them again after.")
+    auto:Hint("Show the bags automatically at these interactions — and hide them again after.")
 
     local function adGet(key)
         local db = DB(); local ad = db and db.autoDisplay
@@ -198,6 +235,18 @@ function Options.Build(flow)
     register(auto:Checkbox({
         label = "At the mailbox", tooltip = "Open the bags when you open the mail.",
         get = function() return adGet("mail") end, set = function(v) adSet("mail", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "At the auction house", tooltip = "Open the bags when you open the auction house.",
+        get = function() return adGet("auction") end, set = function(v) adSet("auction", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "When trading", tooltip = "Open the bags when a trade window opens.",
+        get = function() return adGet("trade") end, set = function(v) adSet("trade", v) end,
+    }).Refresh)
+    register(auto:Checkbox({
+        label = "At the crafting window", tooltip = "Open the bags when a tradeskill/crafting window opens.",
+        get = function() return adGet("craft") end, set = function(v) adSet("craft", v) end,
     }).Refresh)
     register(auto:Checkbox({
         label = "Close when combat starts", tooltip = "Hide the bags when you enter combat.",

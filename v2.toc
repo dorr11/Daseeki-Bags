@@ -47,3 +47,6 @@ options.lua
 # features.lua: tooltip cross-char counts, event auto-display, Alt-click flash-find
 # (self-wires on the core bus; consumes ns.Store / ns.Frame / ns.Search surfaces).
 features.lua
+# Bindings.xml: Toggle Bags / Toggle Bank / Find keybindings (DASEEKIBAGS2_* action names;
+# handler globals + BINDING_ labels set in core.lua). Loads last so the handlers exist.
+Bindings.xml

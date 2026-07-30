@@ -93,6 +93,12 @@ function Search.Tokenize(query)
             if value ~= "" then terms[#terms + 1] = { kind = "type", text = value } end
         elseif prefix == "slot" then
             if value ~= "" then terms[#terms + 1] = { kind = "slot", text = value } end
+        elseif prefix == "set" then
+            -- Equipment-set membership (Daseeki-Armory integration). A bare `set:` (empty
+            -- value) is KEPT — it means "belongs to ANY equipment set"; `set:<name>` matches
+            -- a set whose name contains the fragment. Unlike t:/slot:, the empty form is not
+            -- dropped because it is a meaningful query.
+            terms[#terms + 1] = { kind = "set", text = value }
         else
             -- bare token = a name substring term (prefix-less colons fall here too).
             terms[#terms + 1] = { kind = "name", text = low }
@@ -128,6 +134,11 @@ local function derive(record, resolver)
         local name, _, quality = resolver.info(record.id)
         d.name = name and name:lower() or nil
         if d.quality == nil then d.quality = quality end
+    end
+    -- Equipment-set names (lowercased) this item belongs to, via the injected sets
+    -- resolver (Daseeki-Armory). nil => Armory absent / feature inert (set: never matches).
+    if resolver and resolver.sets then
+        d.sets = resolver.sets(record.id)
     end
     return d
 end
@@ -167,6 +178,16 @@ local function evalTerm(term, d)
         if d.equip == nil and not d.hasInstant then return false, true end
         local frag = equipFragment(d.equip)
         return frag ~= "" and frag:find(term.text, 1, true) ~= nil, false
+    elseif kind == "set" then
+        -- Set membership resolves synchronously from Armory's in-memory db (never pending).
+        -- nil sets = Armory absent / no data => definitive miss (feature inert, never dims-waits).
+        local s = d.sets
+        if type(s) ~= "table" then return false, false end
+        if term.text == "" then return #s > 0, false end       -- bare set: = ANY set
+        for i = 1, #s do
+            if type(s[i]) == "string" and s[i]:find(term.text, 1, true) then return true, false end
+        end
+        return false, false
     end
     return true, false
 end
@@ -206,12 +227,30 @@ end
 -- LIVE CONTROLLER (in-game only)
 -- =====================================================================
 
+-- Read-only Daseeki-Armory consumer: the lowercased names of the equipment sets a
+-- base itemID belongs to, or nil when Armory is absent / uninitialised (feature inert).
+-- Armory publishes DaseekiArmory:GetSetsContainingItem(itemID) -> array of set names,
+-- keyed on base itemID (a number); sets are per-character (its own SVs), so this only
+-- ever reflects the LOGGED-IN character — offline/alt owners get no set data, matching
+-- the live-only nature of the new/quest markers.
+local function armorySets(itemID)
+    local A = _G.DaseekiArmory
+    if not (A and A.GetSetsContainingItem and A.db and A.db.sets) then return nil end
+    local ok, names = pcall(A.GetSetsContainingItem, A, itemID)
+    if not ok or type(names) ~= "table" then return nil end
+    local low = {}
+    for i = 1, #names do low[i] = tostring(names[i]):lower() end
+    return low
+end
+Search._armorySets = armorySets   -- exposed for debugging
+
 -- Injected-live resolver from the game globals (identical path to ui_items).
 local function liveResolver()
     local CI = _G.C_Item or {}
     return {
         instant = CI.GetItemInfoInstant or _G.GetItemInfoInstant,
         info    = CI.GetItemInfo        or _G.GetItemInfo,
+        sets    = armorySets,
     }
 end
 
@@ -302,6 +341,14 @@ local function fakeResolver(db)
             if not e.cached then return nil end
             return e.name, "item:" .. id, e.quality
         end,
+        -- Mirrors the live armorySets resolver: lowercased set names for an id, or nil
+        -- (fixture entry `sets` is an array of names; absent => nil = Armory-absent path).
+        sets = function(id)
+            local e = db[id]; if not (e and e.sets) then return nil end
+            local low = {}
+            for i = 1, #e.sets do low[i] = tostring(e.sets[i]):lower() end
+            return low
+        end,
     }
 end
 
@@ -323,6 +370,11 @@ local function testTokenize(fails)
     -- empty-value / junk prefixes are dropped
     ck(#Search.Tokenize("t: q:") == 0, "empty-value prefix tokens dropped")
     ck(#Search.Tokenize("") == 0, "empty query -> no terms")
+    -- set: membership term — bare form is KEPT (means "any set"), named form carries a fragment
+    local ts = Search.Tokenize("set:tank")
+    ck(#ts == 1 and ts[1].kind == "set" and ts[1].text == "tank", "set:tank -> set term")
+    local tb = Search.Tokenize("set:")
+    ck(#tb == 1 and tb[1].kind == "set" and tb[1].text == "", "bare set: kept as any-set term")
 end
 
 local function testParseQuality(fails)
@@ -397,11 +449,48 @@ local function testMatchMatrix(fails)
     ck(Search.Compile("x"):Match(nil, R) == false, "nil record -> no match")
 end
 
+-- set: membership matching (Daseeki-Armory integration, audit §2.8).
+local function testSetMatcher(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local db = {
+        [1] = { name = "Tank Shield", quality = 3, itype = "Armor", isub = "Shields",
+                equip = "INVTYPE_SHIELD", cached = true, sets = { "Tank Wall", "PvP" } },
+        [2] = { name = "DPS Sword",   quality = 3, itype = "Weapon", isub = "Swords",
+                equip = "INVTYPE_WEAPONMAINHAND", cached = true, sets = { "Raid DPS" } },
+        [3] = { name = "Junk Cloth",  quality = 1, itype = "Armor", isub = "Cloth",
+                equip = "INVTYPE_CHEST", cached = true },   -- belongs to NO set (no `sets`)
+    }
+    local R = fakeResolver(db)
+    local function rec(id, q) return { id = id, count = 1, quality = q } end
+    local function matched(query, id, q) return (Search.Compile(query):Match(rec(id, q), R)) end
+
+    -- bare set: = belongs to ANY equipment set
+    ck(matched("set:", 1) == true,  "bare set: matches an item in a set")
+    ck(matched("set:", 2) == true,  "bare set: matches a second set member")
+    ck(matched("set:", 3) == false, "bare set: rejects an item in no set")
+    -- named set: matches on a case-insensitive name fragment
+    ck(matched("set:tank", 1) == true,  "set:tank matches 'Tank Wall'")
+    ck(matched("set:pvp", 1) == true,   "set:pvp matches the second set on the item")
+    ck(matched("set:raid", 2) == true,  "set:raid matches 'Raid DPS'")
+    ck(matched("set:tank", 2) == false, "set:tank rejects a non-tank item")
+    ck(matched("set:tank", 3) == false, "set:tank rejects an item in no set")
+    -- AND with other kinds
+    ck(matched("set:tank t:armor", 1) == true,  "set AND type -> match")
+    ck(matched("set:tank t:weapon", 1) == false, "set AND wrong type -> fail")
+    -- Armory-absent path: a resolver with NO sets fn => set: is a definitive, non-pending miss
+    local noSets = { instant = R.instant, info = R.info }   -- no .sets
+    local m, p = Search.Compile("set:"):Match(rec(1), noSets)
+    ck(m == false and p == false, "Armory absent -> set: is inert (miss, not pending)")
+    local m2, p2 = Search.Compile("set:tank"):Match(rec(1), noSets)
+    ck(m2 == false and p2 == false, "Armory absent -> named set: inert too")
+end
+
 function Search.RunSelfTests(verbose)
     local suites = {
         { name = "tokenize",       fn = testTokenize },
         { name = "parse quality",  fn = testParseQuality },
         { name = "match matrix",   fn = testMatchMatrix },
+        { name = "set matcher",    fn = testSetMatcher },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

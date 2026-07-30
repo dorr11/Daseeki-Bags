@@ -216,6 +216,21 @@ end
 -- true enables the trigger; only an explicit false disables it (additive-safe).
 ----------------------------------------------------------------------
 
+-- Each open event pairs with a close event of the same setting so a close only
+-- hides what we auto-opened (never the user's own window). Catalog-verified against
+-- wow-api-catalog/1.15.9.68808 (systemized Event.* forms):
+--   MERCHANT_SHOW/CLOSED (Event.MerchantFrame.*), BANKFRAME_OPENED/CLOSED (Event.Bank.*),
+--   MAIL_SHOW/CLOSED (Event.MailInfo.*), AUCTION_HOUSE_SHOW/CLOSED (Event.AuctionHouse.*),
+--   TRADE_SHOW/CLOSED (Event.TradeInfo.*), TRADE_SKILL_SHOW/CLOSE (Event.TradeSkillUI.*;
+--   note the close form is TRADE_SKILL_CLOSE — no "D"), PLAYER_REGEN_DISABLED (combat).
+-- Deliberately NOT wired (catalog verdicts):
+--   * Gem SOCKETING — SOCKET_INFO_UPDATE/CLOSE ARE catalogued (Event.ItemSocketInfo.*) but
+--     gem sockets are a TBC+ gameplay feature absent from Classic Era, so the trigger would
+--     never fire; wiring it would only add a dead toggle. Skipped.
+--   * WORLD MAP close — no WORLD_MAP_OPEN/CLOSE/UPDATE event exists on 1.15 at all (ABSENT);
+--     the Era map has no open/close signal to hang an auto-close on. Skipped.
+--   * VEHICLE close — UNIT_ENTERED_VEHICLE etc. ARE catalogued (Event.Vehicle.*) but vehicles
+--     do not exist in Classic Era gameplay, so the events never fire. Skipped.
 Features.DISPLAY_MATRIX = {
     MERCHANT_SHOW         = { setting = "merchant",    action = "open"  },
     MERCHANT_CLOSED       = { setting = "merchant",    action = "close" },
@@ -223,6 +238,12 @@ Features.DISPLAY_MATRIX = {
     BANKFRAME_CLOSED      = { setting = "bank",        action = "close" },
     MAIL_SHOW             = { setting = "mail",        action = "open"  },
     MAIL_CLOSED           = { setting = "mail",        action = "close" },
+    AUCTION_HOUSE_SHOW    = { setting = "auction",     action = "open"  },
+    AUCTION_HOUSE_CLOSED  = { setting = "auction",     action = "close" },
+    TRADE_SHOW            = { setting = "trade",       action = "open"  },
+    TRADE_CLOSED          = { setting = "trade",       action = "close" },
+    TRADE_SKILL_SHOW      = { setting = "craft",       action = "open"  },
+    TRADE_SKILL_CLOSE     = { setting = "craft",       action = "close" },
     PLAYER_REGEN_DISABLED = { setting = "combatClose", action = "close" },
 }
 
@@ -243,6 +264,9 @@ function Features.ApplyDefaults(db)
     if ad.merchant    == nil then ad.merchant    = true end
     if ad.bank        == nil then ad.bank        = true end
     if ad.mail        == nil then ad.mail        = true end
+    if ad.auction     == nil then ad.auction     = true end
+    if ad.trade       == nil then ad.trade       = true end
+    if ad.craft       == nil then ad.craft       = true end
     if ad.combatClose == nil then ad.combatClose = true end
     return db
 end
@@ -406,16 +430,31 @@ local function testDisplayMatrix(fails)
     ck(Features.ResolveDisplayAction("PLAYER_REGEN_DISABLED", S) == "close", "combat -> close")
     ck(Features.ResolveDisplayAction("SOMETHING_ELSE", S) == nil, "non-trigger event -> nil")
     ck(Features.ResolveDisplayAction("MAIL_SHOW", nil) == "open", "nil settings default ON")
+    -- extended trigger set (audit §1.5 residual): AH / trade / tradeskill (crafting)
+    ck(Features.ResolveDisplayAction("AUCTION_HOUSE_SHOW", S) == "open",   "AH show -> open")
+    ck(Features.ResolveDisplayAction("AUCTION_HOUSE_CLOSED", S) == "close", "AH closed -> close")
+    ck(Features.ResolveDisplayAction("TRADE_SHOW", S) == "open",           "trade show -> open")
+    ck(Features.ResolveDisplayAction("TRADE_CLOSED", S) == "close",        "trade closed -> close")
+    ck(Features.ResolveDisplayAction("TRADE_SKILL_SHOW", S) == "open",     "tradeskill show -> open")
+    ck(Features.ResolveDisplayAction("TRADE_SKILL_CLOSE", S) == "close",   "tradeskill close -> close (note: CLOSE, no D)")
+    -- verdict-absent events must never resolve to an action (skipped by design)
+    ck(Features.ResolveDisplayAction("SOCKET_INFO_UPDATE", S) == nil, "socket not wired (dormant on Era)")
+    ck(Features.ResolveDisplayAction("WORLD_MAP_OPEN", S) == nil,     "world-map not wired (no such event on 1.15)")
+    ck(Features.ResolveDisplayAction("UNIT_ENTERED_VEHICLE", S) == nil, "vehicle not wired (dormant on Era)")
     -- explicit off
     ck(Features.ResolveDisplayAction("MERCHANT_SHOW", { merchant = false }) == nil, "merchant off -> nil")
+    ck(Features.ResolveDisplayAction("AUCTION_HOUSE_SHOW", { auction = false }) == nil, "auction off -> nil")
+    ck(Features.ResolveDisplayAction("TRADE_SKILL_SHOW", { craft = false }) == nil, "craft off -> nil")
     ck(Features.ResolveDisplayAction("PLAYER_REGEN_DISABLED", { combatClose = false }) == nil, "combat off -> nil")
     -- every close event pairs with an open of the same setting (matrix symmetry)
     local opens, closes = {}, {}
     for evt, m in pairs(Features.DISPLAY_MATRIX) do
         if m.action == "open" then opens[m.setting] = true elseif m.action == "close" then closes[m.setting] = true end
     end
-    ck(opens.merchant and opens.bank and opens.mail, "open triggers for merchant/bank/mail")
-    ck(closes.merchant and closes.bank and closes.mail and closes.combatClose, "close triggers present")
+    ck(opens.merchant and opens.bank and opens.mail and opens.auction and opens.trade and opens.craft,
+        "open triggers for merchant/bank/mail/auction/trade/craft")
+    ck(closes.merchant and closes.bank and closes.mail and closes.auction and closes.trade and closes.craft
+        and closes.combatClose, "close triggers present for all settings")
 end
 
 local function testDefaultsAdditive(fails)
@@ -423,8 +462,10 @@ local function testDefaultsAdditive(fails)
     local db = {}
     Features.ApplyDefaults(db)
     ck(db.autoDisplay.merchant == true and db.autoDisplay.bank == true
-        and db.autoDisplay.mail == true and db.autoDisplay.combatClose == true,
-        "auto-display defaults all ON")
+        and db.autoDisplay.mail == true and db.autoDisplay.auction == true
+        and db.autoDisplay.trade == true and db.autoDisplay.craft == true
+        and db.autoDisplay.combatClose == true,
+        "auto-display defaults all ON (merchant/bank/mail/auction/trade/craft/combat)")
     local pre = { autoDisplay = { merchant = false } }
     Features.ApplyDefaults(pre)
     ck(pre.autoDisplay.merchant == false, "existing merchant=false preserved")

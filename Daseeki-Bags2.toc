@@ -43,3 +43,5 @@ sort.lua
 ui_find.lua
 options.lua
 features.lua
+# Bindings.xml: Toggle Bags / Toggle Bank / Find keybindings (DASEEKIBAGS2_* action names).
+Bindings.xml
