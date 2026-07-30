@@ -47,8 +47,8 @@ local Store = ns.Store
 ----------------------------------------------------------------------
 
 Items.DEFAULT_SIZE    = 37
-Items.DEFAULT_GAP     = 4
-Items.DEFAULT_COLUMNS = 12
+Items.DEFAULT_GAP     = 2    -- 1.0 cell pitch 39 = 37 + 2 (skin\defaults spacing=2)
+Items.DEFAULT_COLUMNS = 11   -- 1.0 inventory density (owner DaseekiBagsSets columns=11)
 Items.MIN_CELL        = 30   -- 720p floor (C): below this the 1px quality edge + count numeral degrade together
 Items.HEADER_HEIGHT   = 16   -- split-mode per-bag header band (sits ABOVE the grid)
 Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
@@ -1677,9 +1677,43 @@ local function testBelowLevel(fails)
     ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, nil) == false, "unknown player level -> safe (no wash)")
 end
 
+-- 1.0-LOOK PARITY (cell treatment on the Daseeki theme): the rare+ quality edge (Layer 1,
+-- borders.lua) must stay clearly distinguishable from the theme's RED-BROWN cell borders on
+-- the near-black ground — a rare next to a common must never read as "the same rim". Bakes
+-- the "Daseeki" Core theme token values (theme.lua game facts) + its cream `text` token (the
+-- live desaturation target), and checks the color distance for every rare+ tier. Also asserts
+-- the two-layer invariant that rules out a SAME-cell collision (a rare+ cell hides its calm
+-- hairline in favor of the quality edge — setWellBorder — so the two never co-render on a cell).
+local function testDaseekiCellVsQualityEdge(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local B = ns.Borders
+    if not B then fails[#fails + 1] = "ns.Borders not loaded"; return end
+    local border  = { 0.2275, 0.1176, 0.1176 }   -- #3A1E1E  per-cell hairline (`border`)
+    local ctrlBrd = { 0.4314, 0.2275, 0.2118 }    -- #6E3A36  brighter red-brown (`controlBorder`)
+    local cream   = { 0.9294, 0.9020, 0.8706 }    -- #EDE6DE  `text` (edge desaturates toward this)
+    local function dist(a, b)
+        local dr, dg, db = a[1] - b[1], a[2] - b[2], a[3] - b[3]
+        return math.sqrt(dr * dr + dg * dg + db * db)
+    end
+    local worst = 99
+    for _, q in ipairs({ 3, 4, 5, 6 }) do
+        local r, g, b = B.QualityRGB(q)   -- static fallback (headless == live hues)
+        local dr, dg, db = B.Desaturate(r, g, b, B.PARCHMENT_PULL, cream[1], cream[2], cream[3])
+        local edge = { dr, dg, db }
+        local d1, d2 = dist(edge, border), dist(edge, ctrlBrd)
+        ck(d1 >= 0.35, "q" .. q .. " edge vs #3A1E1E cell border distinguishable (" .. string.format("%.2f", d1) .. ")")
+        ck(d2 >= 0.30, "q" .. q .. " edge vs #6E3A36 strip border distinguishable (" .. string.format("%.2f", d2) .. ")")
+        worst = math.min(worst, d1, d2)
+    end
+    ck(worst >= 0.30, "closest quality-edge/red-brown pairing clears the separability floor (" .. string.format("%.2f", worst) .. ")")
+    ck(B.ShouldShow(3, true) == true and B.ShouldShow(2, true) == false,
+        "quality edge replaces the hairline only at rare+ (sub-rare keeps the red-brown cell border)")
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
+        { name = "daseeki cell vs edge", fn = testDaseekiCellVsQualityEdge },
         { name = "proficiency matrix", fn = testProficiency },
         { name = "below-level gate",   fn = testBelowLevel },
         { name = "entry building",     fn = testEntryBuilding },

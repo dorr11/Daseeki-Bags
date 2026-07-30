@@ -53,11 +53,14 @@ local Store = ns.Store
 -- Window chrome bands (px) — kept beside the pure size math so both agree.
 ----------------------------------------------------------------------
 
-Bank.PAD       = 10
-Bank.TITLE_H   = 28
+-- 1.0-LOOK PARITY: mirror the inventory chrome metrics so the two windows read as
+-- siblings (gold "<Char>'s Bank" title, tight red-brown grid via the shared Frame.Gap,
+-- bottom bar = small icon L · free/total C · money R).
+Bank.PAD       = 8
+Bank.TITLE_H   = 26
 Bank.STRIP_H   = 22   -- bank-bag purchase/toggle strip
 Bank.MONEY_H   = 20
-Bank.VGAP      = 8
+Bank.VGAP      = 6
 
 ----------------------------------------------------------------------
 -- PURE: bank container ordering (bank main first, then bank bags ascending)
@@ -162,6 +165,30 @@ function Bank.ComputeWindowSize(owner, opts)
     return { width = w, height = h }
 end
 
+-- Window title, 1.x TitleBank format ("<Character>'s Bank"). Blank/nil -> "Bank".
+function Bank.WindowTitle(name)
+    if type(name) == "string" and name ~= "" then return name .. "'s Bank" end
+    return "Bank"
+end
+
+-- Free / total bank slot counts for the bottom-bar "N/M" counter (mirrors the inventory
+-- SlotCount, over the bank containers). Pure: reads the store snapshot, so it works for a
+-- cached bank view too. total = Σ size; free = empty slots.
+function Bank.SlotCounts(owner)
+    local free, total = 0, 0
+    if owner and type(owner.containers) == "table" then
+        for _, cid in ipairs(Bank.BankContainerOrder(owner)) do
+            local c = owner.containers[cid]
+            if c then
+                local size = c.size or 0
+                total = total + size
+                for s = 1, size do if not (c.slots and c.slots[s]) then free = free + 1 end end
+            end
+        end
+    end
+    return free, total
+end
+
 -- =====================================================================
 -- FRAME LAYER (in-game only; guarded on _G.CreateFrame)
 -- =====================================================================
@@ -245,6 +272,11 @@ function Bank.Ensure()
     titleBar:RegisterForDrag("LeftButton")
     titleBar:SetScript("OnDragStart", function() win:StartMoving() end)
     titleBar:SetScript("OnDragStop",  function() win:StopMovingOrSizing() end)
+    titleBar:SetScript("OnMouseUp", function(_, mb)
+        if mb == "RightButton" and ns.Frame and ns.Frame.SetLayout then
+            ns.Frame.SetLayout(ns.Frame.Layout() == "split" and "combined" or "split")
+        end
+    end)
     local tbBg = titleBar:CreateTexture(nil, "BACKGROUND")
     tbBg:SetPoint("TOPLEFT", titleBar, "TOPLEFT", 1, -1)
     tbBg:SetPoint("BOTTOMRIGHT", titleBar, "BOTTOMRIGHT", -1, 0)
@@ -253,14 +285,16 @@ function Bank.Ensure()
     -- Maker's mark — the ONE diamond on the bank window (its own, per BRAND_SPEC §5).
     local mark
     if UI.MakerMark then
-        mark = UI.MakerMark(titleBar, { size = 18 })
-        mark:SetPoint("LEFT", titleBar, "LEFT", 8, 0)
+        mark = UI.MakerMark(titleBar, { size = 16 })
+        mark:SetPoint("LEFT", titleBar, "LEFT", 7, 0)
     end
+    -- Gold "<Character>'s Bank" (1.x TitleBank). Text filled per viewed owner in Rebuild.
     local title = titleBar:CreateFontString(nil, "OVERLAY")
     title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
-    if mark then title:SetPoint("LEFT", mark, "RIGHT", 8, 0)
-    else         title:SetPoint("LEFT", titleBar, "LEFT", 10, 0) end
-    title:SetText("Bank")
+    if mark then title:SetPoint("LEFT", mark, "RIGHT", 7, 0)
+    else         title:SetPoint("LEFT", titleBar, "LEFT", 9, 0) end
+    title:SetText(Bank.WindowTitle(nil))
+    UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
     -- Owner selector (shared viewed-owner; flipping it re-renders both windows).
@@ -281,14 +315,15 @@ function Bank.Ensure()
     win.stamp = stamp
 
     local closeBtn = _G.CreateFrame("Button", nil, titleBar)
-    closeBtn:SetSize(24, 24)
+    closeBtn:SetSize(22, 22)
     closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
     local cx = closeBtn:CreateFontString(nil, "OVERLAY")
     cx:SetFontObject(UI.fonts.body)
     cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
     cx:SetText("X")
+    UI.Skin(cx, function(self) self:SetTextColor(UI.Color("danger")) end)   -- red X (1.0)
     closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body); if cx.SetTextColor then cx:SetTextColor(UI.Color("danger")) end end)
     closeBtn:SetScript("OnClick", function() Bank.Close() end)
 
     -- One entry-head hairline under the titlebar (§3).
@@ -341,6 +376,22 @@ function Bank.Ensure()
     money:SetScript("OnEnter", function(self) showMoneyTooltip(self) end)
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
     win.money, win.moneyFS = money, moneyFS
+
+    -- Free/total bank-slot counter, bottom-CENTER (sibling of the inventory SlotCount).
+    local slotCount = win:CreateFontString(nil, "OVERLAY")
+    slotCount:SetFontObject(UI.fonts.numeral or UI.fonts.body)
+    slotCount:SetPoint("BOTTOM", win, "BOTTOM", 0, PAD)
+    slotCount:SetJustifyH("CENTER")
+    UI.Skin(slotCount, function(self) self:SetTextColor(UI.Color("muted")) end)
+    win.slotCount = slotCount
+
+    -- Small icon, bottom-LEFT (1.0 sibling): a quiet bank glyph (decorative anchor).
+    local footIcon = win:CreateTexture(nil, "ARTWORK")
+    footIcon:SetSize(18, 18)
+    footIcon:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", PAD, PAD)
+    footIcon:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
+    UI.Skin(footIcon, function(self) self:SetVertexColor(UI.Color("muted")) end)
+    win.footIcon = footIcon
 
     win._group = nil   -- pooled ns.Items group (built on first Rebuild)
     Bank.window = win
@@ -504,8 +555,24 @@ function Bank.Rebuild()
     -- owner selector face
     if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector.Refresh() end
 
+    -- Gold title "<Character>'s Bank" for the VIEWED owner (1.0 TitleBank).
+    if win.title then
+        local nm = viewed and viewed.name
+        if not nm then
+            local key = Frame and Frame.ViewedOwnerKey and Frame.ViewedOwnerKey()
+            nm = (key and Store.SplitNameRealm and Store.SplitNameRealm(key)) or nil
+        end
+        win.title:SetText(Bank.WindowTitle(nm))
+    end
+
     -- money (viewed owner)
     if win.moneyFS then win.moneyFS:SetText(moneyString(viewed and viewed.money or 0)) end
+
+    -- free/total bank-slot counter, bottom-center (sibling of the inventory SlotCount)
+    if win.slotCount then
+        local free, total = Bank.SlotCounts(viewed)
+        win.slotCount:SetText(free .. "/" .. total)
+    end
 
     -- offline stamp: shown when this is a cached view (not live self at the bank)
     if win.stamp then
@@ -725,9 +792,27 @@ local function testBankEntriesAndSizing(fails)
     ck(wz2.height >= wz.height, "populated bank at least as tall as empty")
 end
 
+-- 1.0-LOOK PARITY: bank title format + free/total counter (bottom-center sibling).
+local function testBankTitleAndCounts(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Bank.WindowTitle("Daseeki") == "Daseeki's Bank", "title = <name>'s Bank")
+    ck(Bank.WindowTitle(nil) == "Bank", "nil name -> Bank")
+    ck(Bank.WindowTitle("")  == "Bank", "blank name -> Bank")
+    local o = makeOwner({
+        [-1] = { size = 4, slots = { [1] = { id = 4306, count = 20 } } },
+        [5]  = { size = 2, link = "item:1", slots = { [1] = { id = 4338, count = 8 } } },
+        [0]  = { size = 16, slots = { [1] = { id = 6948, count = 1 } } },  -- carried, must be excluded
+    })
+    local free, total = Bank.SlotCounts(o)
+    ck(total == 6, "bank slot total = bank main(4)+bank bag(2), carried excluded, got " .. total)
+    ck(free == 4, "bank free = total - filled (4), got " .. free)
+    ck(select(2, Bank.SlotCounts(nil)) == 0, "nil owner -> 0 total")
+end
+
 function Bank.RunSelfTests(verbose)
     local suites = {
         { name = "bank container order",   fn = testBankContainerOrder },
+        { name = "title + slot counts",    fn = testBankTitleAndCounts },
         { name = "purchase-state matrix",  fn = testPurchaseStateMatrix },
         { name = "cached-view proxy",      fn = testCachedViewProxy },
         { name = "bank entries + sizing",  fn = testBankEntriesAndSizing },

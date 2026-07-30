@@ -48,22 +48,29 @@ local Store = ns.Store
 -- Metrics / default settings (all ADDITIVE keys on DaseekiBags2DB)
 ----------------------------------------------------------------------
 
--- Grid cell metrics. buttonSize matches the Classic item-button footprint (37);
--- gap kept tight for Drew's compact directive. columns is the fixed band width
--- (stable layout > responsive reflow): the window hugs a fixed column count.
-Frame.DEFAULT_COLUMNS    = 12
+-- Grid cell metrics (1.0-LOOK PARITY). buttonSize matches the Classic item-button
+-- footprint (37); gap is 1.x's cell pitch fact: skin\defaults spacing=2 => 39px pitch
+-- = 37 + 2, the tight red-brown grid of the owner's 1.0 window. columns is the fixed
+-- band width (stable layout > responsive reflow); 11 mirrors the owner's real 1.x
+-- DaseekiBagsSets config (inventory columns = 11).
+Frame.DEFAULT_COLUMNS    = 11
 Frame.DEFAULT_BUTTONSIZE = 37
-Frame.DEFAULT_GAP        = 4
+Frame.DEFAULT_GAP        = 2
 
--- Window chrome bands (px). Kept in one place so the pure size math and the
--- in-game arrange agree exactly.
-Frame.PAD         = 10   -- window inner padding
-Frame.TITLE_H     = 28   -- title bar
-Frame.TOOLBAR_H   = 26   -- layout toggle + owner selector stub + search box row
-Frame.STRIP_H     = 20   -- bag-slot toggle strip
+-- Window chrome bands (px). Kept in one place so the pure size math and the in-game
+-- arrange agree exactly. 1.0 anatomy: a compact TITLE row (gold "<Char>'s Inventory"
+-- + top-right utility icon buttons + red X), then the equipped-bag ICON STRIP
+-- (top-left cluster, wraps to rows), the tight item grid, and a bottom bar
+-- (small icon L · "N/M" free/total counter C · money R). The 1.x modern toolbar band
+-- is GONE — its controls relocated into the title-row icon cluster.
+Frame.PAD         = 8    -- window inner padding (1.x inset ~8)
+Frame.TITLE_H     = 26   -- title row: gold title + right-cluster icon buttons + close
+Frame.STRIP_ICON  = 28   -- equipped-bag icon button (1.x Bag.Size 32, tightened to suite)
+Frame.STRIP_GAP   = 4    -- 1.x bag pitch 36 = 32 + 4
+Frame.ICONBTN     = 20   -- top-right utility icon buttons (search/owner/find/sort)
 Frame.STRIP_ICON_TRIM = 0.08   -- SetTexCoord trim to crop an icon's built-in border (suite icon treatment)
-Frame.MONEY_H     = 20   -- bottom money bar
-Frame.VGAP        = 8     -- vertical gap between chrome bands
+Frame.MONEY_H     = 20   -- bottom bar (slot icon · free/total · money)
+Frame.VGAP        = 6     -- vertical gap between chrome bands
 Frame.GROUP_HDR_H = 16   -- small per-bag header (split layout)
 Frame.GROUP_GAP   = 8    -- vertical gap between split groups
 -- Category-section chrome (combined-with-categories, W4.5). Same footprint as the
@@ -366,16 +373,83 @@ function Frame.ComputeContentSize(owner, layout, opts)
     return { width = bandW, height = gd.height }
 end
 
--- Full window size (content + all chrome bands). Returns { width, height }.
--- The in-game arrange positions bands to these exact numbers, so a static test
--- of this function proves the rendered window is never zero-sized.
+----------------------------------------------------------------------
+-- PURE: 1.0-anatomy helpers (title text, free/total counter, bag-strip geometry).
+-- All headless-tested so the window self-size and the rendered chrome agree exactly.
+----------------------------------------------------------------------
+
+-- Window title, 1.x TitleBags format ("<Character>'s Inventory"). A blank/nil name
+-- (pre-capture / headless) falls back to the plain wordmark.
+function Frame.WindowTitle(name)
+    if type(name) == "string" and name ~= "" then return name .. "'s Inventory" end
+    return "Bags"
+end
+
+-- Free / total carried slot counts for the bottom-bar "N/M" counter (1.x SlotCount:
+-- text = free .. "/" .. total). Counts the SAME containers the grid shows (respects the
+-- hidden set + keyring gate via CarriedContainerOrder). Pure: reads the store snapshot,
+-- no live C_Container — so it works for a cached alt too. total = Σ size; free = empties.
+function Frame.SlotCounts(owner, opts)
+    local free, total = 0, 0
+    if owner and type(owner.containers) == "table" then
+        for _, cid in ipairs(Frame.CarriedContainerOrder(owner, opts)) do
+            local c = owner.containers[cid]
+            local size = c.size or 0
+            total = total + size
+            for s = 1, size do if c.slots[s] == nil then free = free + 1 end end
+        end
+    end
+    return free, total
+end
+
+-- How many bag-strip icon buttons fit across a band of width `bandW`. >= 1 always.
+function Frame.StripPerRow(bandW, iconSize, gap)
+    iconSize = iconSize or Frame.STRIP_ICON
+    gap      = gap or Frame.STRIP_GAP
+    if not bandW or bandW <= 0 then return 1 end
+    return math.max(1, math.floor((bandW + gap) / (iconSize + gap)))
+end
+
+-- Row count for `nStrip` bag buttons at `perRow` (min one row so the band is never 0-tall).
+function Frame.StripRows(nStrip, perRow)
+    nStrip = math.max(0, nStrip or 0)
+    perRow = math.max(1, perRow or 1)
+    if nStrip <= perRow then return 1 end
+    return math.ceil(nStrip / perRow)
+end
+
+-- Bag-strip band height for `nStrip` buttons across a `bandW`-wide window. The 1.0
+-- cluster wraps to a second row only when the bags overflow the band (usually one row).
+function Frame.StripBandHeight(nStrip, bandW, iconSize, gap)
+    iconSize = iconSize or Frame.STRIP_ICON
+    gap      = gap or Frame.STRIP_GAP
+    local rows = Frame.StripRows(nStrip, Frame.StripPerRow(bandW, iconSize, gap))
+    return rows * iconSize + (rows - 1) * gap
+end
+
+-- The bag-strip button count for window sizing — same enumeration the render uses
+-- (StripSlots), so the pre-computed band height matches the laid-out cluster.
+function Frame.StripCount(owner, opts)
+    opts = opts or {}
+    return #Frame.StripSlots(owner, {
+        live        = opts.live,
+        showKeyring = (opts.showKeyring ~= false),
+        numBagSlots = opts.numBagSlots,
+    })
+end
+
+-- Full window size (content + all 1.0 chrome bands). Returns { width, height }.
+-- The in-game arrange positions bands to these exact numbers, so a static test of
+-- this function proves the rendered window is never zero-sized. Bands (top→bottom):
+--   TITLE_H · VGAP · [bag strip, dynamic rows] · VGAP · content · VGAP · MONEY_H · PAD
 function Frame.ComputeWindowSize(owner, layout, opts)
+    opts = opts or {}
     local content = Frame.ComputeContentSize(owner, layout, opts)
+    local stripH  = Frame.StripBandHeight(Frame.StripCount(owner, opts), content.width)
     local w = content.width + Frame.PAD * 2
     local h = Frame.TITLE_H
-            + Frame.PAD                       -- gap under title
-            + Frame.TOOLBAR_H + Frame.VGAP
-            + Frame.STRIP_H   + Frame.VGAP
+            + Frame.VGAP
+            + stripH          + Frame.VGAP
             + content.height  + Frame.VGAP
             + Frame.MONEY_H
             + Frame.PAD
@@ -534,7 +608,10 @@ function Frame.Ensure()
     -- ESC closes it (FrameXML special-frame list; proven by Daseeki-Core hub).
     if _G.UISpecialFrames then table.insert(_G.UISpecialFrames, WINDOW_NAME) end
 
-    -- ── Title bar (drag to move) ──────────────────────────────────────────────
+    -- ── Title row (1.0 anatomy): gold "<Char>'s Inventory" + top-right icon cluster
+    --    (search · owner · find · sort) + red X. Drag to move; RIGHT-CLICK flips the
+    --    combined/split layout (the modern segmented control relocated here — see
+    --    Frame.SetLayout; also reachable from the options panel). ────────────────
     local titleBar = _G.CreateFrame("Frame", nil, win)
     titleBar:SetPoint("TOPLEFT", win, "TOPLEFT", 0, 0)
     titleBar:SetPoint("TOPRIGHT", win, "TOPRIGHT", 0, 0)
@@ -543,92 +620,140 @@ function Frame.Ensure()
     titleBar:RegisterForDrag("LeftButton")
     titleBar:SetScript("OnDragStart", function() win:StartMoving() end)
     titleBar:SetScript("OnDragStop",  function() win:StopMovingOrSizing(); saveGeometry(win) end)
+    titleBar:SetScript("OnMouseUp", function(_, mb)
+        if mb == "RightButton" then
+            Frame.SetLayout(Frame.Layout() == "split" and "combined" or "split")
+        end
+    end)
     local tbBg = titleBar:CreateTexture(nil, "BACKGROUND")
     tbBg:SetPoint("TOPLEFT", titleBar, "TOPLEFT", 1, -1)
     tbBg:SetPoint("BOTTOMRIGHT", titleBar, "BOTTOMRIGHT", -1, 0)
     UI.Skin(tbBg, function(self) self:SetColorTexture(UI.Color("panel")) end)
 
-    -- Maker's mark — the ONE diamond on this window (BRAND_SPEC §4/§5), titlebar
-    -- only. Bank/keyring (W3) each get their own single mark.
+    -- Maker's mark — the ONE diamond on this window (BRAND_SPEC §4/§5), titlebar only.
     local mark
     if UI.MakerMark then
-        mark = UI.MakerMark(titleBar, { size = 18 })
-        mark:SetPoint("LEFT", titleBar, "LEFT", 8, 0)
+        mark = UI.MakerMark(titleBar, { size = 16 })
+        mark:SetPoint("LEFT", titleBar, "LEFT", 7, 0)
         win.makerMark = mark
     end
 
+    -- Title in warm GOLD (1.x TitleBags: GameFontNormalLeft gold). The framework ships
+    -- no gold-tinted font object, so we set the "warn" token (#FFD100) explicitly on the
+    -- ceremonial wordmark. Text is filled per viewed owner in Rebuild (WindowTitle).
     local title = titleBar:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)   -- MORPHEUS wordmark (§3)
-    if mark then title:SetPoint("LEFT", mark, "RIGHT", 8, 0)
-    else         title:SetPoint("LEFT", titleBar, "LEFT", 10, 0) end
-    title:SetText("Bags")
+    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
+    if mark then title:SetPoint("LEFT", mark, "RIGHT", 7, 0)
+    else         title:SetPoint("LEFT", titleBar, "LEFT", 9, 0) end
+    title:SetText(Frame.WindowTitle(nil))
+    UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
+    -- Small square icon button factory for the title-row utility cluster. Each is a
+    -- theme-skinned BackdropTemplate button rendering either a texture or a glyph, with
+    -- a naming tooltip (1.0 had small icon menu buttons). Pure child textures — no
+    -- protected op. Returns the button.
+    local function makeIconButton(spec)
+        local b = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
+        b:SetSize(Frame.ICONBTN, Frame.ICONBTN)
+        b:RegisterForClicks("LeftButtonUp")
+        local face
+        if spec.texture then
+            face = b:CreateTexture(nil, "ARTWORK")
+            face:SetPoint("TOPLEFT", b, "TOPLEFT", 3, -3)
+            face:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -3, 3)
+            face:SetTexture(spec.texture)
+        else
+            face = b:CreateFontString(nil, "OVERLAY")
+            face:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+            face:SetPoint("CENTER", b, "CENTER", 0, 0)
+            face:SetText(spec.glyph or "?")
+        end
+        b._face = face
+        b._applySkin = function()
+            b:SetBackdrop(UI.FLAT_BACKDROP)
+            b:SetBackdropColor(UI.Color("control"))
+            b:SetBackdropBorderColor(UI.Color("controlBorder"))
+            if face.SetVertexColor and spec.texture then face:SetVertexColor(UI.Color("muted"))
+            elseif face.SetTextColor then face:SetTextColor(UI.Color("muted")) end
+        end
+        UI.Skin(b, function() b._applySkin() end)
+        b:SetScript("OnEnter", function(self)
+            self:SetBackdropBorderColor(UI.Color("brand"))
+            if _G.GameTooltip and spec.tooltip then
+                _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+                _G.GameTooltip:SetText(spec.tooltip, UI.Color("text"))
+                if spec.tooltip2 then _G.GameTooltip:AddLine(spec.tooltip2, UI.Color("muted")) end
+                _G.GameTooltip:Show()
+            end
+        end)
+        b:SetScript("OnLeave", function(self)
+            self:SetBackdropBorderColor(UI.Color("controlBorder"))
+            if _G.GameTooltip then _G.GameTooltip:Hide() end
+        end)
+        if spec.onClick then b:SetScript("OnClick", spec.onClick) end
+        return b
+    end
+
     local closeBtn = _G.CreateFrame("Button", nil, titleBar)
-    closeBtn:SetSize(24, 24)
+    closeBtn:SetSize(22, 22)
     closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
     local cx = closeBtn:CreateFontString(nil, "OVERLAY")
     cx:SetFontObject(UI.fonts.body)
     cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
     cx:SetText("X")
+    UI.Skin(cx, function(self) self:SetTextColor(UI.Color("danger")) end)   -- red X (1.0)
     closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
+    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body); if cx.SetTextColor then cx:SetTextColor(UI.Color("danger")) end end)
     closeBtn:SetScript("OnClick", function() Frame.Close() end)
 
-    -- One entry-head hairline under the titlebar (§3), pixel-snapped when the
-    -- Phase-0 kit is present so it stays crisp at 720p; plain texture otherwise.
-    local titleRule
-    if UI.Hairline then
-        titleRule = UI.Hairline(win, { token = "borderLite", layer = "ARTWORK" })
-    else
-        titleRule = win:CreateTexture(nil, "ARTWORK")
-        titleRule:SetHeight(1)
-        UI.Skin(titleRule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
-    end
-    titleRule:SetPoint("TOPLEFT", win, "TOPLEFT", 1, -TITLE_H)
-    titleRule:SetPoint("TOPRIGHT", win, "TOPRIGHT", -1, -TITLE_H)
-    win.titleRule = titleRule
-
-    -- ── Toolbar: layout toggle + owner stub + search placeholder ──────────────
-    local toolbar = _G.CreateFrame("Frame", nil, win)
-    toolbar:SetPoint("TOPLEFT", win, "TOPLEFT", PAD, -(TITLE_H + PAD))
-    toolbar:SetPoint("TOPRIGHT", win, "TOPRIGHT", -PAD, -(TITLE_H + PAD))
-    toolbar:SetHeight(Frame.TOOLBAR_H)
-    win.toolbar = toolbar
-
-    -- Combined/Split live switch (segmented). SetLayout persists + rebuilds.
-    local seg = UI.MakeSegmented(toolbar, {
-        compact = true,
-        choices = { { value = "combined", text = "Combined" }, { value = "split", text = "Split" } },
-        get = function() return Frame.Layout() end,
-        set = function(v) Frame.SetLayout(v) end,
+    -- Right cluster, laid right→left from the close button: search · sort · find · owner.
+    local magBtn = makeIconButton({
+        texture = "Interface\\Common\\UI-Searchbox-Icon",   -- the game's own magnifier (1.0 look)
+        tooltip = "Search these bags", tooltip2 = "Filter the grid as you type",
+        onClick = function() Frame.ToggleSearch() end,
     })
-    seg:SetPoint("LEFT", toolbar, "LEFT", 0, 0)
-    win.layoutSeg = seg
+    magBtn:SetPoint("RIGHT", closeBtn, "LEFT", -4, 0)
+    win.magBtn = magBtn
 
-    -- Owner selector (W3): the titlebar flyout listing every cached owner. Selecting
-    -- an alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
-    -- re-rendering this window (and the bank) read-only. Falls back to a plain label
-    -- if ui_owner.lua is somehow absent.
-    local ownerLbl = toolbar:CreateFontString(nil, "OVERLAY")
-    ownerLbl:SetFontObject(UI.fonts.muted)
-    ownerLbl:SetPoint("LEFT", seg, "RIGHT", 10, 0)
-    win.ownerLabel = ownerLbl
+    local sortBtn = makeIconButton({
+        glyph = "\226\134\147",   -- down-arrow ↓
+        tooltip = "Sort bags", tooltip2 = "Merge stacks and arrange by type",
+        onClick = function() if ns.Sort and ns.Sort.Run then ns.Sort.Run(ns.Sort.CarriedBagIDs()) end end,
+    })
+    sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -4, 0)
+    win.sortBtn = sortBtn
+
+    local findBtn = makeIconButton({
+        glyph = "\226\137\161",   -- triple-bar ≡ (list across characters)
+        tooltip = "Find an item", tooltip2 = "Search across all your characters",
+        onClick = function() if ns.Find and ns.Find.Toggle then ns.Find.Toggle(win.searchBox and win.searchBox:GetText()) end end,
+    })
+    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -4, 0)
+    win.findBtn = findBtn
+
+    -- Owner selector (W3): compact flyout trigger in the icon cluster. Selecting an
+    -- alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
+    -- re-rendering this window (and the bank) read-only.
     if ns.Owner and ns.Owner.CreateSelector then
-        local sel = ns.Owner.CreateSelector(toolbar, {
+        local sel = ns.Owner.CreateSelector(titleBar, {
+            width = 26,   -- compact: reads as an icon-ish pip+caret trigger
             onSelect = function(key) Frame.SetViewedOwner(key) end,
         })
         if sel then
-            sel:SetPoint("LEFT", seg, "RIGHT", 10, 0)
+            sel:ClearAllPoints()
+            sel:SetPoint("RIGHT", findBtn, "LEFT", -4, 0)
+            sel:SetHeight(Frame.ICONBTN)
             win.ownerSelector = sel
-            ownerLbl:Hide()
         end
     end
 
-    -- Search box PLACEHOLDER (inert; W4 wires the matcher). Right-pinned.
-    local searchWrap = UI.FlatFrame(toolbar, "inset", "controlBorder")
-    searchWrap:SetSize(150, 22)
-    searchWrap:SetPoint("RIGHT", toolbar, "RIGHT", 0, 0)
+    -- Collapsed inline SEARCH box (1.0: search lived behind a toggle, not a standing
+    -- toolbar). Hidden until the magnifier opens it; grows leftward from the cluster.
+    local searchWrap = UI.FlatFrame(titleBar, "inset", "controlBorder")
+    searchWrap:SetSize(150, 18)
+    searchWrap:SetPoint("RIGHT", magBtn, "LEFT", -4, 0)
+    searchWrap:Hide()
     local search = _G.CreateFrame("EditBox", nil, searchWrap)
     search:SetPoint("TOPLEFT", searchWrap, "TOPLEFT", 6, 0)
     search:SetPoint("BOTTOMRIGHT", searchWrap, "BOTTOMRIGHT", -6, 0)
@@ -638,6 +763,7 @@ function Frame.Ensure()
         self:SetText("")                                   -- clear + restore all items
         if ns.Search then ns.Search.SetQuery("") end
         self:ClearFocus()
+        Frame.ToggleSearch(false)
     end)
     search:SetScript("OnEnterPressed",  function(self) self:ClearFocus() end)
     local searchHint = search:CreateFontString(nil, "ARTWORK")
@@ -651,62 +777,32 @@ function Frame.Ensure()
         searchHint:SetShown(text == "")
         if ns.Search then ns.Search.SetQuery(text) end
     end)
-    win.searchBox = search
+    win.searchBox  = search
+    win.searchWrap = searchWrap
 
-    -- Sort button (W4): arrange the carried bags via the sort engine (ns.Sort).
-    local sortBtn = UI.MakeButton(toolbar, {
-        text = "Sort", width = 52,
-        onClick = function()
-            if ns.Sort and ns.Sort.Run then ns.Sort.Run(ns.Sort.CarriedBagIDs()) end
-        end,
-    })
-    sortBtn:SetPoint("RIGHT", searchWrap, "LEFT", -6, 0)
-    win.sortBtn = sortBtn
-
-    -- Find button (W3): open the cross-character Find window, seeded with the current
-    -- search text so "search everywhere" is one click from the in-bag search.
-    local findBtn = UI.MakeButton(toolbar, {
-        text = "Find", width = 48,
-        onClick = function()
-            if ns.Find and ns.Find.Toggle then ns.Find.Toggle(win.searchBox and win.searchBox:GetText()) end
-        end,
-    })
-    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -6, 0)
-    win.findBtn = findBtn
-
-    -- Re-anchor the owner selector to FLEX in the gap between the layout toggle (left)
-    -- and the right cluster (Find/Sort/Search). The beta packed a fixed 150px selector
-    -- + 150px search + Sort + Find with no overflow control, so on real window widths
-    -- the selector overran the cluster and covered the Find button (owner report: "no
-    -- Find button"). Binding the selector LEFT->seg and RIGHT->findBtn guarantees Find/
-    -- Sort/Search are never overlapped and the selector simply takes the remaining width.
-    if win.ownerSelector then
-        win.ownerSelector:ClearAllPoints()
-        win.ownerSelector:SetPoint("LEFT", seg, "RIGHT", 10, 0)
-        win.ownerSelector:SetPoint("RIGHT", findBtn, "LEFT", -10, 0)
-    elseif win.ownerLabel then
-        win.ownerLabel:ClearAllPoints()
-        win.ownerLabel:SetPoint("LEFT", seg, "RIGHT", 10, 0)
-        win.ownerLabel:SetPoint("RIGHT", findBtn, "LEFT", -10, 0)
-        win.ownerLabel:SetJustifyH("LEFT")
+    -- One entry-head hairline under the titlebar (§3), pixel-snapped when the Phase-0
+    -- kit is present so it stays crisp at 720p; plain texture otherwise.
+    local titleRule
+    if UI.Hairline then
+        titleRule = UI.Hairline(win, { token = "borderLite", layer = "ARTWORK" })
+    else
+        titleRule = win:CreateTexture(nil, "ARTWORK")
+        titleRule:SetHeight(1)
+        UI.Skin(titleRule, function(self) self:SetColorTexture(UI.Color("borderLite")) end)
     end
+    titleRule:SetPoint("TOPLEFT", win, "TOPLEFT", 1, -TITLE_H)
+    titleRule:SetPoint("TOPRIGHT", win, "TOPRIGHT", -1, -TITLE_H)
+    win.titleRule = titleRule
 
-    -- ── Bag-slot toggle strip (show/hide a container's slots) ─────────────────
+    -- ── Bag-slot ICON STRIP (1.0 top-left cluster): equipped-bag icons with counts;
+    --    also the bag-slot manager (equip / toggle). Wraps to rows; height set in
+    --    RebuildStrip from the pure StripBandHeight math. ────────────────────────
     local strip = _G.CreateFrame("Frame", nil, win)
-    strip:SetPoint("TOPLEFT", toolbar, "BOTTOMLEFT", 0, -Frame.VGAP)
-    strip:SetPoint("TOPRIGHT", toolbar, "BOTTOMRIGHT", 0, -Frame.VGAP)
-    strip:SetHeight(Frame.STRIP_H)
+    strip:SetPoint("TOPLEFT", win, "TOPLEFT", PAD, -(TITLE_H + Frame.VGAP))
+    strip:SetPoint("TOPRIGHT", win, "TOPRIGHT", -PAD, -(TITLE_H + Frame.VGAP))
+    strip:SetHeight(Frame.STRIP_ICON)
     win.strip = strip
     win._stripButtons = {}
-
-    -- One section hairline separating the toggle strip from the grid (§3/§9 budget:
-    -- titlebar + strip = two rules total).
-    if UI.Hairline then
-        local stripRule = UI.Hairline(win, { token = "border", layer = "ARTWORK" })
-        stripRule:SetPoint("TOPLEFT", strip, "BOTTOMLEFT", 0, -math.floor(Frame.VGAP / 2))
-        stripRule:SetPoint("TOPRIGHT", strip, "BOTTOMRIGHT", 0, -math.floor(Frame.VGAP / 2))
-        win.stripRule = stripRule
-    end
 
     -- ── Content host (the grid area) ──────────────────────────────────────────
     local content = _G.CreateFrame("Frame", nil, win)
@@ -745,6 +841,46 @@ function Frame.Ensure()
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
     win.money   = money
     win.moneyFS = moneyFS
+
+    -- Free/total slot counter, bottom-CENTER (1.x SlotCount: "free/total"). Condensed
+    -- numerals, muted so the grid stays the focus (attention inversion). Filled per
+    -- viewed owner in Rebuild via the pure Frame.SlotCounts.
+    local slotCount = win:CreateFontString(nil, "OVERLAY")
+    slotCount:SetFontObject(UI.fonts.numeral or UI.fonts.body)   -- ARIALN numerals (§3)
+    slotCount:SetPoint("BOTTOM", win, "BOTTOM", 0, PAD)
+    slotCount:SetJustifyH("CENTER")
+    UI.Skin(slotCount, function(self) self:SetTextColor(UI.Color("muted")) end)
+    win.slotCount = slotCount
+
+    -- Small icon, bottom-LEFT (1.0): a quiet bag glyph that opens the options panel.
+    local footIcon = _G.CreateFrame("Button", nil, win)
+    footIcon:SetSize(18, 18)
+    footIcon:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", PAD, PAD)
+    local fi = footIcon:CreateTexture(nil, "ARTWORK")
+    fi:SetAllPoints(footIcon)
+    fi:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
+    footIcon:SetScript("OnEnter", function(self)
+        if fi.SetVertexColor then fi:SetVertexColor(UI.Color("text")) end
+        if _G.GameTooltip then
+            _G.GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            _G.GameTooltip:SetText("Bag options", UI.Color("text"))
+            _G.GameTooltip:AddLine("Open settings · right-click title toggles combined/split", UI.Color("muted"))
+            _G.GameTooltip:Show()
+        end
+    end)
+    footIcon:SetScript("OnLeave", function() if fi.SetVertexColor then fi:SetVertexColor(UI.Color("muted")) end if _G.GameTooltip then _G.GameTooltip:Hide() end end)
+    footIcon:SetScript("OnClick", function()
+        -- Options live in the Daseeki suite hub (options.lua RegisterAddon id="bags").
+        -- Try the hub's open surface defensively; guarded so a name mismatch just no-ops.
+        local S = _G.DaseekiSuite
+        if S then
+            if     S.OpenTo then S:OpenTo("bags")
+            elseif S.Open   then S:Open("bags")
+            elseif S.Toggle then S:Toggle("bags") end
+        end
+    end)
+    UI.Skin(fi, function(self) self:SetVertexColor(UI.Color("muted")) end)
+    win.footIcon = footIcon
 
     Frame.window = win
     restoreGeometry(win)
@@ -892,7 +1028,12 @@ function Frame.RebuildStrip()
     for _, b in ipairs(win._stripButtons) do b:Hide() end
 
     local slots = Frame.StripSlots(owner, { live = live, showKeyring = Frame.KeyringEnabled() })
-    local x, SIZE, GAP = 0, Frame.STRIP_H, 4
+    local SIZE, GAP = Frame.STRIP_ICON, Frame.STRIP_GAP
+    -- 1.0 top-left cluster: wrap the bag icons across the band, growing downward.
+    local bandW  = (win.strip:GetWidth() or 0)
+    if bandW <= 0 then bandW = Frame.GridDims(0, Frame.Columns(), Frame.ButtonSize(), Frame.Gap()).width end
+    local perRow = Frame.StripPerRow(bandW, SIZE, GAP)
+    win.strip:SetHeight(Frame.StripBandHeight(#slots, bandW, SIZE, GAP))
     for i, entry in ipairs(slots) do
         local cid = entry.cid
         local b = win._stripButtons[i]
@@ -932,6 +1073,13 @@ function Frame.RebuildStrip()
             plus:SetText("+")
             plus:Hide()
             b._plus = plus
+            -- Item COUNT (1.0: "bag/keyring icon buttons WITH counts") — the filled-slot
+            -- tally for this container, bottom-right corner over the icon. Condensed numeral.
+            local cnt = b:CreateFontString(nil, "OVERLAY")
+            cnt:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+            cnt:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
+            cnt:Hide()
+            b._count = cnt
             b._applySkin = function()
                 local on = b._on and true or false
                 b:SetBackdrop(UI.FLAT_BACKDROP)
@@ -942,6 +1090,7 @@ function Frame.RebuildStrip()
                 b._underline:SetColorTexture(UI.Color("bronze"))
                 b._underline:SetShown(on)
                 b._plus:SetTextColor(UI.Color("bronze"))
+                b._count:SetTextColor(UI.Color("muted"))
             end
             UI.Skin(b, function() if b._applySkin then b._applySkin() end end)
             -- Hover: contextual tooltip + reveal the equip "+" on an empty slot.
@@ -979,15 +1128,24 @@ function Frame.RebuildStrip()
         b._role       = entry.role
         b._manageable = entry.manageable and true or false
         b._slot       = entry.manageable and bagInventorySlot(cid) or nil
+        b:SetSize(SIZE, SIZE)
+        -- Row/col placement (top-left cluster wrapping downward at perRow).
+        local col = (i - 1) % perRow
+        local row = math.floor((i - 1) / perRow)
         b:ClearAllPoints()
-        b:SetPoint("LEFT", win.strip, "LEFT", x, 0)
-        x = x + SIZE + GAP
+        b:SetPoint("TOPLEFT", win.strip, "TOPLEFT", col * (SIZE + GAP), -(row * (SIZE + GAP)))
         -- glyph label (fallback / non-icon slots): backpack "B", keyring "K", bags by number
         local lbl = (cid == Store.BACKPACK_CONTAINER and "B")
                  or (cid == Store.KEYRING_CONTAINER  and "K")
                  or tostring(cid)
         b._fs:SetText(lbl)
         b._plus:Hide()
+        -- Filled-slot count for this container (from the viewed owner's store snapshot),
+        -- shown as a corner numeral (1.0 "icon buttons with counts"). Hidden when 0/empty.
+        local c = owner and owner.containers and owner.containers[cid]
+        local filled = 0
+        if c and c.slots then for s = 1, (c.size or 0) do if c.slots[s] then filled = filled + 1 end end end
+        if c and filled > 0 then b._count:SetText(tostring(filled)); b._count:Show() else b._count:Hide() end
         -- "shown" (underline/raised) only when a bag actually occupies the slot and isn't hidden.
         local equipped = b._manageable and (bagEquippedLink(b._slot) ~= nil)
                       or (not b._manageable and owner and owner.containers and owner.containers[cid] ~= nil)
@@ -1067,13 +1225,14 @@ function Frame.DebugToolbar()
             (f.GetLeft and f:GetLeft()) or -1, (f.GetRight and f:GetRight()) or -1,
             tostring(f.GetFrameLevel and f:GetFrameLevel())))
     end
-    P("[toolbar] control geometry (left/right in screen px; overlaps => crowding):")
-    d("layoutSeg", win.layoutSeg)
+    P("[title-row] control geometry (left/right in screen px; overlaps => crowding):")
+    d("magBtn(search)", win.magBtn)
     d("ownerSelector", win.ownerSelector)
-    d("ownerLabel", win.ownerLabel)
     d("findBtn", win.findBtn)
     d("sortBtn", win.sortBtn)
-    d("searchBox", win.searchBox)
+    d("searchWrap", win.searchWrap)
+    d("slotCount", win.slotCount)
+    d("footIcon", win.footIcon)
     P("  ns.Find present=" .. tostring(ns.Find ~= nil) .. " ns.Sort present=" .. tostring(ns.Sort ~= nil))
 end
 
@@ -1167,17 +1326,26 @@ function Frame.Rebuild()
     local layout = Frame.Layout()
     local cols, bs, gap = Frame.Columns(), Frame.ButtonSize(), Frame.Gap()
     local opts = { columns = cols, buttonSize = bs, gap = gap, showKeyring = Frame.KeyringEnabled(),
+                   live = (ns.Items and ns.Items.IsLive and ns.Items.IsLive(owner)) and true or false,
                    hidden = (Store.db and Store.db.hiddenBags) or {} }
 
-    -- owner label (fallback stub) + owner selector (W3)
-    if win.ownerLabel then
-        local key = Frame.ViewedOwnerKey()
-        win.ownerLabel:SetText(owner and (owner.name or key) or key)
+    -- Gold title "<Character>'s Inventory" for the VIEWED owner (1.0 TitleBags).
+    if win.title then
+        local nm = owner and owner.name
+        if not nm then
+            local key = Frame.ViewedOwnerKey()
+            nm = (key and Store.SplitNameRealm and Store.SplitNameRealm(key)) or nil
+        end
+        win.title:SetText(Frame.WindowTitle(nm))
     end
     if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
     -- money (viewed owner)
     if win.moneyFS then win.moneyFS:SetText(moneyString(owner and owner.money or 0)) end
-    if win.layoutSeg and win.layoutSeg.Refresh then win.layoutSeg:Refresh() end
+    -- free/total slot counter, bottom-center (1.x SlotCount: "free/total")
+    if win.slotCount then
+        local free, total = Frame.SlotCounts(owner, opts)
+        win.slotCount:SetText(free .. "/" .. total)
+    end
 
     Frame.RebuildStrip()
 
@@ -1300,6 +1468,25 @@ function Frame.SetSearch(text)
     win.searchBox:SetText(text)
     if win.searchBox.HighlightText then win.searchBox:HighlightText() end
     if win.searchBox.SetCursorPosition then win.searchBox:SetCursorPosition(#text) end
+end
+
+-- Collapsed search toggle (1.0: search behind the magnifier). force nil => toggle;
+-- force=true/false => show/hide. Hiding clears the query so the grid restores.
+function Frame.ToggleSearch(force)
+    local win = Frame.window
+    if not win or not win.searchWrap then return end
+    local show
+    if force == nil then show = not win.searchWrap:IsShown() else show = force and true or false end
+    win.searchWrap:SetShown(show)
+    if show then
+        if win.searchBox and win.searchBox.SetFocus then win.searchBox:SetFocus() end
+    else
+        if win.searchBox then
+            win.searchBox:SetText("")
+            if ns.Search then ns.Search.SetQuery("") end
+            if win.searchBox.ClearFocus then win.searchBox:ClearFocus() end
+        end
+    end
 end
 
 -- Live combined<->split switch (D3): persist + rebuild, no reload.
@@ -1715,8 +1902,57 @@ local function testMoneyLines(fails)
     ck(Frame.BuildMoneyLines(nil, nil)[1].copper == 0, "nil total -> 0 copper")
 end
 
+-- 1.0-LOOK PARITY: the new anatomy helpers — title format, free/total counter, and the
+-- bag-strip band geometry — plus the toolbar-free window math. All pure/headless.
+local function testParityAnatomy(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- Title (1.x TitleBags "%s's Inventory").
+    ck(Frame.WindowTitle("Daseeki") == "Daseeki's Inventory", "title = <name>'s Inventory")
+    ck(Frame.WindowTitle(nil) == "Bags", "nil name -> plain wordmark")
+    ck(Frame.WindowTitle("")  == "Bags", "blank name -> plain wordmark")
+
+    -- Tight-grid density facts (1.x pitch 39 = 37 + 2, owner columns 11).
+    ck(Frame.DEFAULT_GAP == 2, "default gap tightened to 2 (1.0 density)")
+    ck(Frame.DEFAULT_BUTTONSIZE == 37, "cell stays 37 (Classic footprint)")
+    ck(Frame.DEFAULT_COLUMNS == 11, "columns = 11 (owner 1.x config)")
+
+    -- Free/total counter over the fixture owner: 16+14+6+12 = 48 slots; filled = bp(3)+bag1(1)+keyring(1) = 5.
+    local o = fixtureOwner()
+    local free, total = Frame.SlotCounts(o, { showKeyring = true })
+    ck(total == 48, "slot counter total = sum of container sizes (48), got " .. total)
+    ck(free == 48 - 5, "slot counter free = total - filled (43), got " .. free)
+    local _, t2 = Frame.SlotCounts(o, { showKeyring = true, hidden = { [1] = true } })
+    ck(t2 == 48 - 14, "hiding bag1 (14 slots) drops them from the total")
+    local _, t3 = Frame.SlotCounts(o, { showKeyring = false })
+    ck(t3 == 48 - 12, "keyring off drops its 12 slots from the total")
+    ck(select(2, Frame.SlotCounts(nil, {})) == 0, "nil owner -> 0 total")
+
+    -- Bag-strip band geometry: perRow / rows / height (single row unless overflow).
+    ck(Frame.StripPerRow(500, 28, 4) >= 6, "wide band fits many strip icons in one row")
+    ck(Frame.StripPerRow(0, 28, 4) == 1, "degenerate band width -> at least 1 per row")
+    ck(Frame.StripRows(6, 15) == 1, "6 bags in a 15-wide row -> 1 row")
+    ck(Frame.StripRows(6, 4)  == 2, "6 bags at 4/row -> 2 rows")
+    ck(Frame.StripRows(0, 4)  == 1, "no bags -> still one (empty) row band")
+    ck(Frame.StripBandHeight(6, 500, 28, 4) == 28, "single-row strip band = one icon tall (28)")
+    ck(Frame.StripBandHeight(6, 4 * 28 + 3 * 4, 28, 4) == 2 * 28 + 4, "wrapped strip band = 2 rows + gap")
+
+    -- Window math dropped the (removed) toolbar band: height = TITLE + VGAP + strip + VGAP
+    -- + content + VGAP + MONEY + PAD; width = band + 2*PAD.
+    local opts = { columns = 11, buttonSize = 37, gap = 2, showKeyring = true, live = false }
+    local content = Frame.ComputeContentSize(o, "combined", opts)
+    local stripH  = Frame.StripBandHeight(Frame.StripCount(o, opts), content.width)
+    local expH = Frame.TITLE_H + Frame.VGAP + stripH + Frame.VGAP
+               + content.height + Frame.VGAP + Frame.MONEY_H + Frame.PAD
+    local sz = Frame.ComputeWindowSize(o, "combined", opts)
+    ck(sz.height == expH, "window height = title+strip+content+money bands (no toolbar), got " .. sz.height .. " exp " .. expH)
+    ck(sz.width == content.width + Frame.PAD * 2, "window width = band + 2*pad")
+    ck(Frame.TOOLBAR_H == nil, "the modern toolbar band metric is gone (controls relocated)")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
+        { name = "1.0 anatomy",         fn = testParityAnatomy },
         { name = "container order",     fn = testContainerOrder },
         { name = "cursor is bag",       fn = testCursorIsBag },
         { name = "money lines",         fn = testMoneyLines },
