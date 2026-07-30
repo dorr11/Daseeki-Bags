@@ -68,6 +68,11 @@ Frame.TITLE_H     = 26   -- title row: gold title + right-cluster icon buttons +
 Frame.STRIP_ICON  = 28   -- equipped-bag icon button (1.x Bag.Size 32, tightened to suite)
 Frame.STRIP_GAP   = 4    -- 1.x bag pitch 36 = 32 + 4
 Frame.ICONBTN     = 20   -- top-right utility icon buttons (search/owner/find/sort)
+Frame.WINDOW_BG_ALPHA = 0.94   -- 1.0-parity near-solid dark ground (Bags-side, not theme-wide)
+-- 1.0-parity strip icons (1.x Bag.StaticIcons): the backpack + keyring use their canonical
+-- game textures instead of "B"/"K" glyphs. Backpack = fileID 130716 = Button-Backpack-Up.
+Frame.ICON_BACKPACK = "Interface\\Buttons\\Button-Backpack-Up"
+Frame.ICON_KEYRING  = "Interface\\ContainerFrame\\KeyRing-Bag-Icon"
 Frame.STRIP_ICON_TRIM = 0.08   -- SetTexCoord trim to crop an icon's built-in border (suite icon treatment)
 Frame.MONEY_H     = 20   -- bottom bar (slot icon · free/total · money)
 Frame.VGAP        = 6     -- vertical gap between chrome bands
@@ -297,6 +302,63 @@ function Frame.BuildMoneyLines(total, byAccount)
     end)
     for _, a in ipairs(accts) do lines[#lines + 1] = a end
     return lines
+end
+
+-- PURE: the 1.0 Money-tooltip structure (playerMoney.lua parity). Builds an ordered row
+-- list from per-character descriptors:
+--   chars = { { name, class, account, copper }, ... }
+--   opts  = { selfAccount, minCopper (default 0, from moneyTooltipMinGold*10000),
+--             maxPerGroup (default 5) }
+-- Behavior matched from 1.x: characters split into THIS account ("mine") vs OTHER accounts;
+-- within each group, money>0 AND >=minCopper, sorted by copper DESC then name; the first
+-- `maxPerGroup` shown, the rest summed into one "Others" rollup line; the Other-Accounts
+-- group is preceded by a spacer + an "Other Accounts" section header; a "Total" footer holds
+-- the grand total of every character. Row kinds: "char" | "others" | "spacer" | "section" |
+-- "total". Harness-locked so the tooltip content is provable; the live render only colors +
+-- coin-formats.
+function Frame.BuildMoneyReport(chars, opts)
+    opts = opts or {}
+    local selfAccount = opts.selfAccount
+    local minCopper   = opts.minCopper or 0
+    local maxPerGroup = opts.maxPerGroup or 5
+    local haveSelf    = (selfAccount ~= nil and selfAccount ~= "")
+
+    local mine, others, total = {}, {}, 0
+    for _, c in ipairs(chars or {}) do
+        local copper = c.copper or 0
+        total = total + copper
+        if copper > 0 and copper >= minCopper then
+            local acct = c.account or ""
+            local isMine = (not haveSelf) or (acct == selfAccount)
+            local row = { kind = "char", name = c.name or "?", class = c.class, account = acct, copper = copper }
+            if isMine then mine[#mine + 1] = row else others[#others + 1] = row end
+        end
+    end
+    local function sortGroup(g)
+        table.sort(g, function(a, b)
+            if a.copper ~= b.copper then return a.copper > b.copper end
+            return tostring(a.name):lower() < tostring(b.name):lower()
+        end)
+    end
+    sortGroup(mine); sortGroup(others)
+
+    local rows = {}
+    local function emitGroup(g)
+        local overflow = 0
+        for i, row in ipairs(g) do
+            if i <= maxPerGroup then rows[#rows + 1] = row
+            else overflow = overflow + row.copper end
+        end
+        if overflow > 0 then rows[#rows + 1] = { kind = "others", copper = overflow } end
+    end
+    emitGroup(mine)
+    if #others > 0 then
+        rows[#rows + 1] = { kind = "spacer" }
+        rows[#rows + 1] = { kind = "section", label = "Other Accounts" }
+        emitGroup(others)
+    end
+    rows[#rows + 1] = { kind = "total", copper = total }
+    return rows
 end
 
 ----------------------------------------------------------------------
@@ -585,11 +647,65 @@ local UI  -- DaseekiUI, bound lazily in-game
 
 local WINDOW_NAME = "DaseekiBags2Window"
 
--- Format copper as a coin-icon string in-game; plain g/s/c headless-safe.
+-- Format copper as a coin-ICON string in-game (g/s/c coin textures — 1.0 parity); plain
+-- g/s/c headless-safe.
 local function moneyString(copper)
     if _G.GetCoinTextureString then return _G.GetCoinTextureString(copper or 0) end
     local g, s, c = Store.MoneyParts(copper or 0)
     return string.format("%dg %ds %dc", g, s, c)
+end
+
+-- Class-color for a money row's character name (RAID_CLASS_COLORS; cream fallback).
+local function classColor(class)
+    local c = class and _G.RAID_CLASS_COLORS and _G.RAID_CLASS_COLORS[class]
+    if c then return c.r, c.g, c.b end
+    if UI and UI.Color then return UI.Color("text") end
+    return 0.9294, 0.9020, 0.8706
+end
+
+-- Live per-character money descriptors from the store (for the Money tooltip).
+function Frame.MoneyChars()
+    local out = {}
+    if Store and Store.ForEachOwner then
+        Store.ForEachOwner(function(_, o)
+            out[#out + 1] = { name = o.name or "?", class = o.class, account = o.account or "", copper = o.money or 0 }
+        end)
+    end
+    return out
+end
+
+-- Render the 1.0-format cross-character Money tooltip into GT: "Money" header, class-colored
+-- per-character rows with right-aligned coin-icon amounts, an "Others" rollup, an "Other
+-- Accounts" section, and a grey "Total" footer. Shared by the inventory + bank money bars so
+-- the two read identically. Content comes from the pure Frame.BuildMoneyReport.
+function Frame.RenderMoneyTooltip(GT)
+    if not GT then return end
+    local function tok(name) if UI and UI.Color then return UI.Color(name) end return 1, 1, 1 end
+    GT:ClearLines()
+    GT:AddLine(_G.MONEY or "Money", tok("text"))
+    local selfAccount = Store and Store.data and Store.data.selfAccount
+    local minGold     = (Store and Store.db and Store.db.moneyTooltipMinGold) or 0
+    local rows = Frame.BuildMoneyReport(Frame.MoneyChars(), {
+        selfAccount = selfAccount, minCopper = (minGold or 0) * 10000, maxPerGroup = 5,
+    })
+    for _, row in ipairs(rows) do
+        if row.kind == "char" then
+            local r, g, b = classColor(row.class)
+            GT:AddDoubleLine(row.name, moneyString(row.copper), r, g, b, r, g, b)
+        elseif row.kind == "others" then
+            local mr, mg, mb = tok("muted")
+            GT:AddDoubleLine("Others", moneyString(row.copper), mr, mg, mb, mr, mg, mb)
+        elseif row.kind == "spacer" then
+            GT:AddLine(" ")
+        elseif row.kind == "section" then
+            local fr, fg, fb = tok("faint")
+            GT:AddLine(row.label, fr, fg, fb)
+        elseif row.kind == "total" then
+            local mr, mg, mb = tok("muted")
+            GT:AddDoubleLine(_G.TOTAL or "Total", moneyString(row.copper), mr, mg, mb, mr, mg, mb)
+        end
+    end
+    GT:Show()
 end
 
 -- Save the live window position into settings.
@@ -630,7 +746,10 @@ function Frame.Ensure()
     win:Hide()
     UI.Skin(win, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("ground"))
+        -- 1.0 PARITY (opacity): force a near-solid dark ground (Bags-side alpha, so the
+        -- theme's ground token stays frosted for other addons). 1.x read almost solid at
+        -- black @0.85α; 0.94 matches that heavier, "not see-through" body.
+        self:SetBackdropColor(UI.Color("ground", Frame.WINDOW_BG_ALPHA))
         -- Dark edge under the bronze keyline; borderLite was the beta's bright-rim
         -- culprit (§1), so the visible frame edge is the aged keyline, not this.
         self:SetBackdropBorderColor(UI.Color("border"))
@@ -860,16 +979,11 @@ function Frame.Ensure()
     moneyFS:SetJustifyH("RIGHT")
     -- Warm cream, not bright white — "gold is sacred" but rendered on-brand (§2/§3).
     UI.Skin(moneyFS, function(self) self:SetTextColor(UI.Color("text")) end)
-    -- cross-account totals are sacred (D1): grand total + per-account, from the pure,
-    -- harness-locked line builder (Frame.BuildMoneyLines).
+    -- 1.0-format cross-character Money tooltip (D1 sacred): "Money" header · class-colored
+    -- per-character coin rows · Others rollup · Other Accounts section · Total footer.
     money:SetScript("OnEnter", function(self)
         _G.GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        _G.GameTooltip:AddLine("Gold", UI.Color("text"))
-        for _, ln in ipairs(Frame.BuildMoneyLines(Store.TotalMoney(), Store.MoneyByAccount())) do
-            local r, g, b = UI.Color(ln.isTotal and "text" or "muted")
-            _G.GameTooltip:AddDoubleLine(ln.label, moneyString(ln.copper), r, g, b, 1, 1, 1)
-        end
-        _G.GameTooltip:Show()
+        Frame.RenderMoneyTooltip(_G.GameTooltip)
     end)
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
     win.money   = money
@@ -1184,13 +1298,18 @@ function Frame.RebuildStrip()
                       or (not b._manageable and owner and owner.containers and owner.containers[cid] ~= nil)
         b._on = equipped and not hidden[cid]
 
-        -- R3: resolve the strip icon. A carried bag equipped in this slot renders the
-        -- equipped bag's inventory texture (live self). Backpack keeps its "B", keyring
-        -- its "K", and empty/cached slots keep their glyph (no icon resolved).
+        -- Resolve the strip icon. A carried bag equipped in this slot renders the equipped
+        -- bag's inventory texture (live self). 1.0-PARITY (item 6): the BACKPACK and KEYRING
+        -- get their proper game icons (1.x Bag.StaticIcons) instead of the "B"/"K" glyphs.
+        -- Empty/cached carried slots keep their number glyph (no icon resolved).
         local isHidden = hidden[cid] and true or false
         local iconTex
         if b._slot and equipped and _G.GetInventoryItemTexture then
             iconTex = _G.GetInventoryItemTexture("player", b._slot)
+        elseif b._role == "backpack" then
+            iconTex = Frame.ICON_BACKPACK
+        elseif b._role == "keyring" then
+            iconTex = Frame.ICON_KEYRING
         end
         if iconTex then
             b._icon:SetTexture(iconTex)
@@ -1974,6 +2093,52 @@ local function testMoneyLines(fails)
     ck(Frame.BuildMoneyLines(nil, nil)[1].copper == 0, "nil total -> 0 copper")
 end
 
+-- 1.0-PARITY money tooltip (item 2): per-character rows, Others rollup at >5, Other Accounts
+-- section, grand-total footer, and the moneyTooltipMinGold display filter.
+local function testMoneyReport(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local G = 10000
+    local chars = {
+        { name = "Zed", class = "MAGE",    account = "A", copper = 100 * G },
+        { name = "Bob", class = "WARRIOR", account = "A", copper = 50 * G },
+        { name = "Amy", class = "PRIEST",  account = "A", copper = 10 * G },
+        { name = "Ann", class = "ROGUE",   account = "A", copper = 4 * G },
+        { name = "Abe", class = "DRUID",   account = "A", copper = 3 * G },
+        { name = "Ada", class = "SHAMAN",  account = "A", copper = 2 * G },   -- 6th in A -> overflow
+        { name = "Cid", class = "ROGUE",   account = "B", copper = 200 * G },
+        { name = "Rex", class = "HUNTER",  account = "B", copper = 5 * G },
+        { name = "Zip", class = "MAGE",    account = "A", copper = 0 },        -- money 0 -> excluded
+    }
+    local expTotal = (100 + 50 + 10 + 4 + 3 + 2 + 200 + 5 + 0) * G
+    local rows = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 5 })
+    -- self (A) group, copper desc: Zed, Bob, Amy, Ann, Abe (5 shown), then Others = Ada (2g).
+    ck(rows[1].kind == "char" and rows[1].name == "Zed", "richest self char first")
+    ck(rows[5].name == "Abe", "5th self char shown (cap)")
+    ck(rows[6].kind == "others" and rows[6].copper == 2 * G, "6th self char rolled into Others (2g)")
+    ck(rows[7].kind == "spacer" and rows[8].kind == "section" and rows[8].label == "Other Accounts",
+        "spacer + Other Accounts header before the other-account group")
+    ck(rows[9].kind == "char" and rows[9].name == "Cid" and rows[9].copper == 200 * G, "other-account richest first")
+    ck(rows[10].name == "Rex", "other-account second char")
+    ck(rows[#rows].kind == "total" and rows[#rows].copper == expTotal,
+        "Total footer = grand total of everyone, got " .. rows[#rows].copper)
+
+    -- moneyTooltipMinGold = 20g: only >=20g chars DISPLAYED (A: Zed,Bob; B: Cid); Total unchanged.
+    local rows2 = Frame.BuildMoneyReport(chars, { selfAccount = "A", minCopper = 20 * G, maxPerGroup = 5 })
+    ck(rows2[1].name == "Zed" and rows2[2].name == "Bob", "minGold: only >=20g self chars shown")
+    ck(rows2[3].kind == "spacer" and rows2[4].kind == "section", "minGold: no self Others (under cap)")
+    ck(rows2[5].kind == "char" and rows2[5].name == "Cid", "minGold: other-account Cid shown, Rex filtered")
+    ck(rows2[#rows2].kind == "total" and rows2[#rows2].copper == expTotal, "minGold: Total still counts everyone")
+
+    -- No self account known -> a single group, NO Other Accounts section, still a Total footer.
+    local rows3 = Frame.BuildMoneyReport(chars, { selfAccount = "", maxPerGroup = 99 })
+    for _, r in ipairs(rows3) do ck(r.kind ~= "section", "no self account -> no Other Accounts section") end
+    ck(rows3[#rows3].kind == "total", "single-group still has a Total footer")
+
+    -- Empty -> just a Total(0).
+    local empty = Frame.BuildMoneyReport({}, {})
+    ck(#empty == 1 and empty[1].kind == "total" and empty[1].copper == 0, "no chars -> Total 0 only")
+end
+
 -- 1.0-LOOK PARITY: the new anatomy helpers — title format, free/total counter, and the
 -- bag-strip band geometry — plus the toolbar-free window math. All pure/headless.
 local function testParityAnatomy(fails)
@@ -2028,6 +2193,7 @@ function Frame.RunSelfTests(verbose)
         { name = "container order",     fn = testContainerOrder },
         { name = "cursor is bag",       fn = testCursorIsBag },
         { name = "money lines",         fn = testMoneyLines },
+        { name = "money report (1.0)",  fn = testMoneyReport },
         { name = "combined entries",    fn = testCombinedEntries },
         { name = "split groups",        fn = testSplitGroups },
         { name = "grid + window size",  fn = testGridAndWindowSize },

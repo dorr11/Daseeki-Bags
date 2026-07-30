@@ -85,12 +85,80 @@ function Find.Search(owners, query, resolver, opts)
 end
 
 -- Plain-copy result line: "Poonyx — Bank: 12 · Bags: 40" (only non-zero parts shown).
+-- (Retained for callers/tests; the window now renders per-ITEM rows via Find.BuildRows.)
 function Find.FormatOwnerResult(result)
     local parts = {}
     if (result.bankCount or 0) > 0 then parts[#parts + 1] = "Bank: " .. result.bankCount end
     if (result.bagsCount or 0) > 0 then parts[#parts + 1] = "Bags: " .. result.bagsCount end
     if #parts == 0 then parts[1] = "0" end
     return result.name .. " — " .. table.concat(parts, " \194\183 ")   -- \194\183 = middot
+end
+
+----------------------------------------------------------------------
+-- PURE: 1.0 Find-Item ROW model (searchResults.lua parity).
+--
+-- 1.x renders ONE row per (item, character, location): "[icon] <qualityColor>ItemName -
+-- <Character> (Bags|Bank) xN". This flattens the per-owner Search results into that row
+-- list, aggregating identical items in the same location on the same character into one
+-- count. Rows stay GROUPED by owner (the Search order — self first, then total desc, then
+-- name); within an owner they sort by item name, then location (Bags before Bank).
+--   results  = Find.Search output
+--   resolver = { instant=<GetItemInfoInstant>, info=<GetItemInfo> }
+-- Row = { key, ownerName, class, isSelf, itemID, itemName, quality, icon, location, count }.
+----------------------------------------------------------------------
+
+function Find.BuildRows(results, resolver)
+    local rows = {}
+    for _, res in ipairs(results or {}) do
+        local agg, order = {}, {}
+        for _, mt in ipairs(res.matches or {}) do
+            local data = mt.data
+            local id = data and data.id
+            if id then
+                local loc = Store.IsBankContainer(mt.cid) and "Bank" or "Bags"
+                local k = id .. "\0" .. loc
+                local row = agg[k]
+                if not row then
+                    local name, quality, icon = nil, data.quality, nil
+                    if resolver then
+                        if resolver.instant then local _, _, _, _, ic = resolver.instant(id); icon = ic end
+                        if resolver.info then
+                            local nm, _, q = resolver.info(id)
+                            name = nm
+                            if quality == nil then quality = q end
+                        end
+                    end
+                    row = {
+                        key = res.key, ownerName = res.name, class = res.class, isSelf = res.isSelf,
+                        itemID = id, itemName = name or data.link or ("item:" .. id),
+                        quality = quality, icon = icon, location = loc, count = 0,
+                    }
+                    agg[k] = row
+                    order[#order + 1] = row
+                end
+                row.count = row.count + (data.count or 1)
+            end
+        end
+        table.sort(order, function(a, b)
+            local an, bn = tostring(a.itemName):lower(), tostring(b.itemName):lower()
+            if an ~= bn then return an < bn end
+            return a.location < b.location   -- "Bags" < "Bank"
+        end)
+        for _, row in ipairs(order) do rows[#rows + 1] = row end
+    end
+    return rows
+end
+
+-- 1.x row string: "<qualityHex>ItemName|r  -  <classHex>Character|r  (Location)  xN"
+-- (the "  xN" count tag is omitted when the count is 1). Hex prefixes are injected so the
+-- string is testable headless; the live render passes real quality/class hex codes.
+function Find.FormatItemRow(row, qualityHex, classHex)
+    qualityHex = qualityHex or ""
+    classHex   = classHex or ""
+    local nameStr  = qualityHex .. (row.itemName or "?") .. (qualityHex ~= "" and "|r" or "")
+    local ownerStr = classHex .. (row.ownerName or "?") .. (classHex ~= "" and "|r" or "")
+    local countTag = (row.count and row.count > 1) and ("  x" .. row.count) or ""
+    return nameStr .. "  -  " .. ownerStr .. "  (" .. (row.location or "Bags") .. ")" .. countTag
 end
 
 -- =====================================================================
@@ -123,7 +191,7 @@ function Find.Ensure()
     if not UI then return nil end
 
     local win = _G.CreateFrame("Frame", WINDOW_NAME, _G.UIParent, "BackdropTemplate")
-    win:SetSize(320, 260)
+    win:SetSize(380, 320)   -- wider/taller for the 1.0 per-item rows (icon + name + holder)
     win:SetFrameStrata("DIALOG")
     win:SetToplevel(true)
     win:SetMovable(true)
@@ -132,7 +200,8 @@ function Find.Ensure()
     win:Hide()
     UI.Skin(win, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("ground"))
+        -- 1.0 PARITY (opacity): near-solid dark ground (Bags-side alpha; sibling of inventory).
+        self:SetBackdropColor(UI.Color("ground", (ns.Frame and ns.Frame.WINDOW_BG_ALPHA) or 0.94))
         self:SetBackdropBorderColor(UI.Color("border"))
     end)
     if UI.PaintLedgerGround then UI.PaintLedgerGround(win) end
@@ -198,19 +267,47 @@ function Find.Ensure()
     return win
 end
 
+-- Quality hex ("|cffRRGGBB") for the item name; class hex for the character name.
+local function qualityHex(quality)
+    local q = quality or 1
+    local c = _G.ITEM_QUALITY_COLORS and _G.ITEM_QUALITY_COLORS[q]
+    if c and c.hex then return c.hex end
+    local r, g, b
+    if _G.C_Item and _G.C_Item.GetItemQualityColor then r, g, b = _G.C_Item.GetItemQualityColor(q) end
+    if not r then r, g, b = 1, 1, 1 end
+    return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+end
+local function classHex(class)
+    local r, g, b = classRGB(class)
+    return string.format("|cff%02x%02x%02x", r * 255, g * 255, b * 255)
+end
+
 local function acquireRow(win, i)
     local row = win._rows[i]
     if row then return row end
     row = _G.CreateFrame("Button", nil, win.list)
-    row:SetHeight(22)
+    row:SetHeight(20)
     local hl = row:CreateTexture(nil, "BACKGROUND"); hl:SetAllPoints(); hl:Hide()
     UI.Skin(hl, function(self) self:SetColorTexture(UI.Color("brand", 0.18)) end)
     row._hl = hl
+    -- 1.0 row icon: 16px item icon at the left (not cropped, per 1.x searchResults).
+    local ic = row:CreateTexture(nil, "ARTWORK"); ic:SetSize(16, 16)
+    ic:SetPoint("LEFT", row, "LEFT", 2, 0)
+    row._icon = ic
     local nm = row:CreateFontString(nil, "OVERLAY"); nm:SetFontObject(UI.fonts.body)
-    nm:SetPoint("LEFT", row, "LEFT", 4, 0); nm:SetJustifyH("LEFT"); nm:SetWordWrap(false)
+    nm:SetPoint("LEFT", ic, "RIGHT", 5, 0); nm:SetPoint("RIGHT", row, "RIGHT", -2, 0)
+    nm:SetJustifyH("LEFT"); nm:SetWordWrap(false)
     row._label = nm
-    row:SetScript("OnEnter", function(self) self._hl:Show() end)
-    row:SetScript("OnLeave", function(self) self._hl:Hide() end)
+    row:SetScript("OnEnter", function(self)
+        self._hl:Show()
+        -- 1.x parity: hovering a row shows the item's tooltip.
+        if _G.GameTooltip and self._link then
+            _G.GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            if _G.GameTooltip.SetHyperlink then _G.GameTooltip:SetHyperlink(self._link) end
+            _G.GameTooltip:Show()
+        end
+    end)
+    row:SetScript("OnLeave", function(self) self._hl:Hide(); if _G.GameTooltip then _G.GameTooltip:Hide() end end)
     win._rows[i] = row
     return row
 end
@@ -242,18 +339,23 @@ function Find.Refresh(text)
     end
     win.emptyFS:Hide()
 
+    -- 1.0 per-item rows: [icon] qualityColor(name) - Character (Bags|Bank) xN.
+    local itemRows = Find.BuildRows(results, liveResolver())
     local y = 0
-    for i, res in ipairs(results) do
+    for i, r in ipairs(itemRows) do
         local row = acquireRow(win, i)
         row:ClearAllPoints()
         row:SetPoint("TOPLEFT", win.list, "TOPLEFT", 0, -y)
         row:SetPoint("RIGHT", win.list, "RIGHT", 0, 0)
-        row._label:SetText(Find.FormatOwnerResult(res))
-        row._label:SetTextColor(classRGB(res.class))
-        row:SetScript("OnClick", function() Find.JumpTo(res.key, text) end)
+        row._icon:SetTexture(r.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
+        row._label:SetText(Find.FormatItemRow(r, qualityHex(r.quality), classHex(r.class)))
+        row._label:SetTextColor(1, 1, 1)   -- the embedded color escapes carry the coloring
+        row._link = r.itemID and ("item:" .. r.itemID) or nil
+        row:SetScript("OnClick", function() Find.JumpTo(r.key, text) end)   -- keep click-to-jump
         row:Show()
-        y = y + 22
+        y = y + 20
     end
+    for i = #itemRows + 1, #win._rows do win._rows[i]:Hide() end
 end
 
 Find._searchQueued = false
@@ -361,9 +463,48 @@ local function testFindAcrossOwners(fails)
     for _, r in ipairs(res) do ck(r.source == "full", "only full owners in results") end
 end
 
+-- 1.0 FIND ROWS (item 1): per-(item, character, location) rows with quality-colored name,
+-- holder + location + count; grouped by owner; identical items in a location summed.
+local function testFindRows(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local db = {
+        [100] = { name = "Songflower Serenade Petal", quality = 1, itype = "Consumable" },
+        [200] = { name = "Arcanite Bar", quality = 3, itype = "Trade Goods" },
+    }
+    local R = fakeResolver(db)
+    local owners = {
+        ["Poonyx-R"] = { name = "Poonyx", class = "MAGE", source = "full", containers = {
+            [0]  = { slots = { [1] = { id = 100, count = 20 }, [2] = { id = 100, count = 20 } } }, -- 2 bag stacks
+            [-1] = { slots = { [1] = { id = 100, count = 12 } } },                                  -- bank
+        } },
+        ["Zug-R"] = { name = "Zug", class = "WARRIOR", source = "full", containers = {
+            [5] = { slots = { [1] = { id = 100, count = 5 } } },   -- bank bag
+        } },
+    }
+    local q = ns.Search.Compile("songflower")
+    local res = Find.Search(owners, q, R, { selfKey = "Poonyx-R" })
+    local rows = Find.BuildRows(res, R)
+    -- Poonyx first (self): one Bags row (2 stacks summed = 40) + one Bank row (12); Bags before Bank.
+    ck(#rows == 3, "3 item rows (Poonyx Bags + Poonyx Bank + Zug Bank), got " .. #rows)
+    ck(rows[1].ownerName == "Poonyx" and rows[1].location == "Bags" and rows[1].count == 40,
+        "Poonyx Bags row aggregates the 2 stacks to 40")
+    ck(rows[1].itemName == "Songflower Serenade Petal" and rows[1].quality == 1, "row carries item identity + quality")
+    ck(rows[2].ownerName == "Poonyx" and rows[2].location == "Bank" and rows[2].count == 12, "Poonyx Bank row = 12")
+    ck(rows[3].ownerName == "Zug" and rows[3].location == "Bank" and rows[3].count == 5, "Zug (grouped after self) bank = 5")
+    -- format string: "<qHex>Name|r  -  <cHex>Owner|r  (Loc)  xN"
+    local s = Find.FormatItemRow(rows[1], "|cffFFFFFF", "|cff69CCF0")
+    ck(s == "|cffFFFFFFSongflower Serenade Petal|r  -  |cff69CCF0Poonyx|r  (Bags)  x40", "row string matches 1.0 format, got: " .. s)
+    -- count == 1 omits the xN tag
+    local one = Find.FormatItemRow({ itemName = "Hearthstone", ownerName = "Zed", location = "Bags", count = 1 }, "", "")
+    ck(one == "Hearthstone  -  Zed  (Bags)", "count 1 omits the xN tag")
+    -- empty input -> no rows
+    ck(#Find.BuildRows({}, R) == 0, "no results -> no rows")
+end
+
 function Find.RunSelfTests(verbose)
     local suites = {
         { name = "find across owners", fn = testFindAcrossOwners },
+        { name = "find rows (1.0)",    fn = testFindRows },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

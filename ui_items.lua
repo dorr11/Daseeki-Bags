@@ -229,24 +229,27 @@ end
 
 -- PURE: two-layer STATE resolver (Layer 2). Given a slot's live facts, decide the icon
 -- treatment (mutually exclusive) and the corner markers (independent), with precedence:
---   icon:  dimmed  >  unusable  >  junk(quality 0)  >  normal
+--   icon:  dimmed  >  junk(quality 0)  >  normal
 --   markers: new-item wax dot + quest tab show ONLY when NOT dimmed (dim recedes all)
--- This is the attention-inversion law at slot scale (BRAND_SPEC §5): quality is quiet
--- identity (Layer 1 edge); saturated state is EARNED (new loot / quest / can't-use).
+-- 1.0-PARITY change (glowUnusable): UNUSABLE no longer greys the icon — 1.x kept the icon
+-- FULL-COLOR and drew a RED BORDER instead (RED_FONT_COLOR). So unusable now yields
+-- redBorder=true (drawn by borders.Apply, winning over the quality edge on that cell) while
+-- the icon stays normal. `unusableTint` is retired (kept false for back-compat readers).
 --   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>, isUnusable=<bool> }
--- returns { icon, iconDesat, unusableTint, showNewDot, showQuestTab, dressAlpha }.
+-- returns { icon, iconDesat, redBorder, unusableTint, showNewDot, showQuestTab, dressAlpha }.
 function Items.ResolveState(ctx)
     ctx = ctx or {}
     local dimmed = ctx.dimmed and true or false
+    local unusable = ctx.isUnusable and true or false
     local icon
     if dimmed then icon = "dimmed"
-    elseif ctx.isUnusable then icon = "unusable"
     elseif ctx.quality == 0 then icon = "junk"
     else icon = "normal" end
     return {
         icon         = icon,
-        iconDesat    = (icon ~= "normal"),
-        unusableTint = (icon == "unusable"),
+        iconDesat    = (icon ~= "normal"),      -- junk/dimmed desaturate; unusable does NOT
+        redBorder    = (unusable and not dimmed),-- 1.0 glowUnusable: red border, icon full-color
+        unusableTint = false,                    -- retired (1.x kept the icon full-color)
         showNewDot   = (ctx.isNew and not dimmed) and true or false,
         showQuestTab = (ctx.isQuest and not dimmed) and true or false,
         dressAlpha   = Items.DressAlpha(dimmed),
@@ -577,7 +580,9 @@ local function applyDressState(button)
     if hasItem and live then
         isNew      = slotIsNew(button)
         isQuest    = slotIsQuest(button)
-        isUnusable = slotIsUnusable(button)
+        -- reuse the unusable verdict paintButton already computed (avoids a second
+        -- proficiency/level scan); recompute only if this path ran standalone.
+        if button._unusable ~= nil then isUnusable = button._unusable else isUnusable = slotIsUnusable(button) end
     end
     local spec = Items.ResolveState({
         quality    = button._quality,
@@ -922,15 +927,21 @@ local function paintButton(button)
     if _G.SetItemButtonCount then _G.SetItemButtonCount(button, (visual and visual.count) or 1) end
 
     local quality = visual and visual.quality
-    if ns.Borders then ns.Borders.Apply(button, quality) end
+    -- 1.0-PARITY: an UNUSABLE (class-can't-equip / below-level) item draws a RED border that
+    -- WINS over the quality edge (borders.Apply precedence). Computed once here (live only)
+    -- and cached so applyDressState/setWellBorder agree without recomputing.
+    local unusable = (button._live and slotIsUnusable(button)) or false
+    button._unusable = unusable
+    if ns.Borders then ns.Borders.Apply(button, quality, unusable) end
     button._quality = quality
 
-    -- FILLED -> raised card backing. The 1px hairline yields to the quality edge on rare+
-    -- (borders.lua draws it) so a cell never carries both rims.
+    -- FILLED -> raised card backing. The 1px hairline yields to ANY drawn edge — the quality
+    -- edge (uncommon+) OR the unusable red border — so a cell never carries both rims.
     setWellState(button, true)
-    local edgeShown = ns.Borders and ns.Borders.ShouldShow
-        and ns.Borders.ShouldShow(quality, ns.Borders.Enabled()) or false
-    setWellBorder(button, edgeShown)
+    local qualityEdge = ns.Borders and ns.Borders.ShouldShow
+        and ns.Borders.ShouldShow(quality, ns.Borders.Enabled(),
+            ns.Borders.MinQuality and ns.Borders.MinQuality()) or false
+    setWellBorder(button, (unusable or qualityEdge) and true or false)
 
     if button._live then
         updateCooldown(button)
@@ -1335,14 +1346,15 @@ local function testCellClamp(fails)
 end
 
 -- STATE-marker precedence matrix (Layer 2). Verifies the icon precedence
---   dimmed > unusable > junk > normal
--- and that markers show only when NOT dimmed.
+--   dimmed > junk > normal   (1.0: unusable no longer greys the icon — it flags redBorder)
+-- and that markers / the red border show only when NOT dimmed.
 local function testStatePrecedence(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
     -- normal rare item: no treatment, no markers
     local s = Items.ResolveState({ quality = 3 })
     ck(s.icon == "normal" and s.iconDesat == false and s.unusableTint == false, "normal rare -> clean icon")
+    ck(s.redBorder == false, "normal -> no red border")
     ck(s.showNewDot == false and s.showQuestTab == false, "normal -> no markers")
     ck(s.dressAlpha == 1.0, "normal -> full dress alpha")
 
@@ -1350,21 +1362,23 @@ local function testStatePrecedence(fails)
     local j = Items.ResolveState({ quality = 0 })
     ck(j.icon == "junk" and j.iconDesat == true and j.unusableTint == false, "junk -> desat, no tint")
 
-    -- unusable OUTRANKS junk: an unusable poor item reads as unusable (tint), not junk
-    local u = Items.ResolveState({ quality = 0, isUnusable = true })
-    ck(u.icon == "unusable" and u.unusableTint == true, "unusable outranks junk")
+    -- 1.0 UNUSABLE: icon stays FULL-COLOR (no grey/tint); a RED BORDER is flagged instead.
+    local u = Items.ResolveState({ quality = 4, isUnusable = true })
+    ck(u.icon == "normal" and u.iconDesat == false, "unusable epic -> icon stays normal (no grey)")
+    ck(u.redBorder == true and u.unusableTint == false, "unusable -> red border flagged, no tint")
 
-    -- unusable OUTRANKS normal quality too
-    local u2 = Items.ResolveState({ quality = 4, isUnusable = true })
-    ck(u2.icon == "unusable" and u2.iconDesat == true and u2.unusableTint == true, "unusable epic -> desat + tint")
+    -- unusable JUNK: junk still desaturates the icon; the red border is still flagged.
+    local uj = Items.ResolveState({ quality = 0, isUnusable = true })
+    ck(uj.icon == "junk" and uj.redBorder == true, "unusable junk -> junk icon + red border")
 
     -- markers are independent of icon treatment (a new, quest, unusable item shows both)
     local m = Items.ResolveState({ quality = 3, isNew = true, isQuest = true, isUnusable = true })
     ck(m.showNewDot == true and m.showQuestTab == true, "new+quest markers show alongside unusable")
 
-    -- DIMMED outranks everything: icon=dimmed, markers suppressed, alpha 0.25
+    -- DIMMED outranks everything: icon=dimmed, markers + red border suppressed, alpha 0.25
     local d = Items.ResolveState({ quality = 0, isNew = true, isQuest = true, isUnusable = true, dimmed = true })
-    ck(d.icon == "dimmed" and d.iconDesat == true, "dimmed outranks unusable/junk")
+    ck(d.icon == "dimmed" and d.iconDesat == true, "dimmed outranks junk")
+    ck(d.redBorder == false, "dimmed suppresses the unusable red border")
     ck(d.showNewDot == false and d.showQuestTab == false, "dimmed suppresses all markers")
     ck(d.dressAlpha == 0.25, "dimmed -> 0.25 dress alpha")
 
@@ -1677,37 +1691,43 @@ local function testBelowLevel(fails)
     ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, nil) == false, "unknown player level -> safe (no wash)")
 end
 
--- 1.0-LOOK PARITY (cell treatment on the Daseeki theme): the rare+ quality edge (Layer 1,
--- borders.lua) must stay clearly distinguishable from the theme's RED-BROWN cell borders on
--- the near-black ground — a rare next to a common must never read as "the same rim". Bakes
--- the "Daseeki" Core theme token values (theme.lua game facts) + its cream `text` token (the
--- live desaturation target), and checks the color distance for every rare+ tier. Also asserts
--- the two-layer invariant that rules out a SAME-cell collision (a rare+ cell hides its calm
--- hairline in favor of the quality edge — setWellBorder — so the two never co-render on a cell).
+-- 1.0-LOOK PARITY (cell treatment on the Daseeki theme, ROUND 2): quality edges are now
+-- FULL-SATURATION and drop to UNCOMMON+, and the UNUSABLE red border wins over the quality
+-- edge. This bakes the REAL "Daseeki" theme tokens (theme.lua: pure-crimson cell borders
+-- #3A0E12 / #6E0E1C, green `ok` #5FB86B) and verifies full-sat separability on the near-black
+-- ground: every rarity color stays clearly apart from the crimson cell borders, the uncommon
+-- green stays apart from the `ok` green, and the pure-red unusable border stays apart from
+-- Legendary orange. Also asserts the SAME-cell invariant (a drawn edge hides the hairline).
 local function testDaseekiCellVsQualityEdge(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local B = ns.Borders
     if not B then fails[#fails + 1] = "ns.Borders not loaded"; return end
-    local border  = { 0.2275, 0.1176, 0.1176 }   -- #3A1E1E  per-cell hairline (`border`)
-    local ctrlBrd = { 0.4314, 0.2275, 0.2118 }    -- #6E3A36  brighter red-brown (`controlBorder`)
-    local cream   = { 0.9294, 0.9020, 0.8706 }    -- #EDE6DE  `text` (edge desaturates toward this)
+    local border  = { 0.2275, 0.0549, 0.0706 }   -- #3A0E12  pure-crimson per-cell hairline (`border`)
+    local ctrlBrd = { 0.4314, 0.0549, 0.1098 }   -- #6E0E1C  brighter crimson (`controlBorder`)
+    local okGreen = { 0.3725, 0.7216, 0.4196 }   -- #5FB86B  theme `ok` (positive green)
     local function dist(a, b)
         local dr, dg, db = a[1] - b[1], a[2] - b[2], a[3] - b[3]
         return math.sqrt(dr * dr + dg * dg + db * db)
     end
+    -- FULL-SATURATION rarity edges (no desaturation now) vs the crimson cell borders.
     local worst = 99
-    for _, q in ipairs({ 3, 4, 5, 6 }) do
-        local r, g, b = B.QualityRGB(q)   -- static fallback (headless == live hues)
-        local dr, dg, db = B.Desaturate(r, g, b, B.PARCHMENT_PULL, cream[1], cream[2], cream[3])
-        local edge = { dr, dg, db }
+    for _, q in ipairs({ 2, 3, 4, 5, 6 }) do
+        local r, g, b = B.QualityRGB(q)   -- static fallback (headless == live full-sat hues)
+        local edge = { r, g, b }
         local d1, d2 = dist(edge, border), dist(edge, ctrlBrd)
-        ck(d1 >= 0.35, "q" .. q .. " edge vs #3A1E1E cell border distinguishable (" .. string.format("%.2f", d1) .. ")")
-        ck(d2 >= 0.30, "q" .. q .. " edge vs #6E3A36 strip border distinguishable (" .. string.format("%.2f", d2) .. ")")
+        ck(d1 >= 0.35, "q" .. q .. " full-sat edge vs #3A0E12 cell border distinguishable (" .. string.format("%.2f", d1) .. ")")
+        ck(d2 >= 0.30, "q" .. q .. " full-sat edge vs #6E0E1C strip border distinguishable (" .. string.format("%.2f", d2) .. ")")
         worst = math.min(worst, d1, d2)
     end
-    ck(worst >= 0.30, "closest quality-edge/red-brown pairing clears the separability floor (" .. string.format("%.2f", worst) .. ")")
-    ck(B.ShouldShow(3, true) == true and B.ShouldShow(2, true) == false,
-        "quality edge replaces the hairline only at rare+ (sub-rare keeps the red-brown cell border)")
+    ck(worst >= 0.30, "closest full-sat rarity/crimson pairing clears the floor (" .. string.format("%.2f", worst) .. ")")
+    -- Uncommon green vs the `ok` green (owner's cross-check): different surfaces, still apart.
+    ck(dist({ B.QualityRGB(2) }, okGreen) >= 0.30, "uncommon green distinguishable from the ok-token green")
+    -- Unusable pure-red vs Legendary orange: the unusable cue never reads as legendary.
+    ck(dist({ B.UnusableRGB() }, { B.QualityRGB(5) }) >= 0.30, "unusable red distinguishable from Legendary orange")
+    -- SAME-cell invariant: any drawn edge (uncommon+ OR unusable) hides the calm hairline
+    -- (ui_items setWellBorder), so a crimson cell border and a colored edge never co-render.
+    ck(B.ShouldShow(2, true) == true and B.ShouldShow(1, true) == false,
+        "edge replaces the hairline at uncommon+ (common/poor keep the crimson cell border)")
 end
 
 function Items.RunSelfTests(verbose)

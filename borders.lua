@@ -37,21 +37,41 @@ ns.Borders = Borders
 
 local Store = ns.Store
 
--- Rare and up. Below this a slot shows no colored edge (suite-quiet aesthetic).
-local MIN_QUALITY = 3
-Borders.MIN_QUALITY = MIN_QUALITY
+-- 1.0-PARITY floor: UNCOMMON and up (1.x glowQuality: quality > 1). Below this a slot
+-- shows no colored edge. The floor is now CONFIGURABLE (db.qualityBorderMin) via the
+-- "Item borders" options group; this is the default when unset.
+local DEFAULT_MIN_QUALITY = 2
+Borders.DEFAULT_MIN_QUALITY = DEFAULT_MIN_QUALITY
+Borders.MIN_QUALITY = DEFAULT_MIN_QUALITY   -- back-compat alias (== the default floor)
 -- Epic and up render a 2px snapped edge (the only 2px in the grid).
 local EPIC_QUALITY = 4
 Borders.EPIC_QUALITY = EPIC_QUALITY
 
--- Desaturation toward parchment: retain ~85% chroma (pull 15% toward the cream text
--- tone) so the edge reads as tinted ink. Kept small so hue survives at 1px.
+-- Desaturation util retained for callers/tests; the quality edge no longer uses it —
+-- 1.0 parity (and CII) shows FULL-SATURATION rarity colors, since the old ~15%
+-- parchment pull read grey on the near-black Daseeki ground (owner report).
 local PARCHMENT_PULL = 0.15
 Borders.PARCHMENT_PULL = PARCHMENT_PULL
--- Default parchment target for the headless/pure path (= the default "text" cream).
--- The live path passes the active theme's text token instead.
 local PARCHMENT = { 0.9137, 0.8784, 0.8039 }
 Borders._parchment = PARCHMENT
+
+-- Live min-quality floor: db.qualityBorderMin (Uncommon 2 / Rare 3 / Epic 4), default 2.
+function Borders.MinQuality()
+    local db = Store and Store.db
+    local v = db and db.qualityBorderMin
+    if type(v) == "number" and v >= 0 then return v end
+    return DEFAULT_MIN_QUALITY
+end
+
+-- UNUSABLE red — the exact 1.x glowUnusable color: RED_FONT_COLOR (~ {1, 0.1, 0.1}).
+-- Deliberately NOT the Daseeki `danger` token: that token is an ORANGE-red (#E05528) that
+-- sits close to Legendary orange, whereas a pure bright red is the unmistakable "can't use"
+-- cue and stays maximally distinct from every rarity color. Fall back to a literal red.
+function Borders.UnusableRGB()
+    local rc = _G.RED_FONT_COLOR
+    if rc and rc.r then return rc.r, rc.g, rc.b end
+    return 1, 0.1, 0.1
+end
 
 ----------------------------------------------------------------------
 -- Public quality colors (Blizzard's ITEM_QUALITY_COLORS values; game facts, not
@@ -88,19 +108,20 @@ function Borders.QualityRGB(quality, provider)
     return nil
 end
 
--- True when a colored edge should be shown for this quality given the toggle.
-function Borders.ShouldShow(quality, enabled)
+-- True when a colored edge should be shown for this quality given the toggle and the
+-- (configurable) minimum-quality floor. minQuality defaults to the Uncommon+ default.
+function Borders.ShouldShow(quality, enabled, minQuality)
     if not enabled then return false end
     if quality == nil then return false end
-    return quality >= MIN_QUALITY
+    return quality >= (minQuality or DEFAULT_MIN_QUALITY)
 end
 
--- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, rare = 1. Only meaningful
--- when ShouldShow is true. (The frame layer multiplies this by one physical pixel.)
+-- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, uncommon/rare = 1. Only
+-- meaningful when ShouldShow is true. (The frame layer multiplies by one physical pixel.)
 function Borders.TierPx(quality)
     if quality == nil then return 0 end
     if quality >= EPIC_QUALITY then return 2 end
-    if quality >= MIN_QUALITY then return 1 end
+    if quality >= DEFAULT_MIN_QUALITY then return 1 end
     return 0
 end
 
@@ -142,13 +163,6 @@ local function liveProvider(quality)
     end
     local c = _G.ITEM_QUALITY_COLORS and _G.ITEM_QUALITY_COLORS[quality]
     if c then return c.r, c.g, c.b end
-end
-
--- Live parchment target = the active theme's "text" cream (so the desaturation warms
--- toward the real substrate under any theme). Falls back to the default cream.
-local function liveParchment()
-    if _G.DaseekiUI and _G.DaseekiUI.Color then return _G.DaseekiUI.Color("text") end
-    return PARCHMENT[1], PARCHMENT[2], PARCHMENT[3]
 end
 
 -- One physical pixel in `frame`'s local coordinate units (game fact; mirrors Blizzard's
@@ -251,19 +265,39 @@ function Borders.Attach(button)
     return b
 end
 
--- Color (or hide) a button's quality edge. Honors the store toggle live. Recolor/resize/
--- show/hide of the edge textures only — safe to call on every repaint, even in combat.
-function Borders.Apply(button, quality)
+-- Color (or hide) a button's edge. `unusable` (1.x glowUnusable) draws a RED border that
+-- WINS over the quality edge (1.x precedence: unusable > quality). Otherwise a FULL-
+-- SATURATION quality edge is drawn when the quality clears the configurable floor. Honors
+-- the store toggle live. Recolor/resize/show/hide of the edge textures only — safe on
+-- every repaint, even in combat.
+function Borders.Apply(button, quality, unusable)
     local b = Borders.Attach(button)
     if not b then return end
-    if not Borders.ShouldShow(quality, Borders.Enabled()) then
+    local enabled = Borders.Enabled()
+
+    -- UNUSABLE red border — the "can't use" cue, overriding rarity on that cell. A prominent
+    -- 2px so it reads at a glance. Gated by the same Item-borders toggle as the quality edge.
+    if enabled and unusable then
+        local ur, ug, ub = Borders.UnusableRGB()
+        b._pxTier = 2
+        layoutEdges(b)
+        forEachEdge(b, function(t)
+            if t.SetVertexColor then t:SetVertexColor(ur, ug, ub, 1) end
+            t:Show()
+        end)
+        if b.SetAlpha then b:SetAlpha(1) end
+        b:Show()
+        return
+    end
+
+    if not Borders.ShouldShow(quality, enabled, Borders.MinQuality()) then
         b:Hide()
         return
     end
+    -- FULL SATURATION (1.x glowQuality / CII): true rarity color, no parchment pull —
+    -- the desaturated edges read grey on the near-black ground.
     local r, g, bl = Borders.QualityRGB(quality, liveProvider)
     if not r then b:Hide(); return end
-    local tr, tg, tb = liveParchment()
-    r, g, bl = Borders.Desaturate(r, g, bl, PARCHMENT_PULL, tr, tg, tb)
     b._pxTier = Borders.TierPx(quality)
     layoutEdges(b)
     forEachEdge(b, function(t)
@@ -381,11 +415,16 @@ local function testShouldShow(fails)
     ck(Borders.ShouldShow(nil, true) == false, "nil quality -> no edge")
     ck(Borders.ShouldShow(0, true)   == false, "poor -> no edge")
     ck(Borders.ShouldShow(1, true)   == false, "common -> no edge")
-    ck(Borders.ShouldShow(2, true)   == false, "uncommon -> NO edge (rare+ floor)")
+    ck(Borders.ShouldShow(2, true)   == true,  "uncommon -> edge (1.0 Uncommon+ floor)")
     ck(Borders.ShouldShow(3, true)   == true,  "rare -> edge")
     ck(Borders.ShouldShow(4, true)   == true,  "epic -> edge")
     ck(Borders.ShouldShow(5, true)   == true,  "legendary -> edge")
     ck(Borders.ShouldShow(4, false)  == false, "disabled -> no edge even for epic")
+    -- configurable floor: raising the min to Rare hides uncommon; Epic hides rare.
+    ck(Borders.ShouldShow(2, true, 3) == false, "min=Rare hides uncommon")
+    ck(Borders.ShouldShow(3, true, 3) == true,  "min=Rare shows rare")
+    ck(Borders.ShouldShow(3, true, 4) == false, "min=Epic hides rare")
+    ck(Borders.DEFAULT_MIN_QUALITY == 2, "default floor is Uncommon (2)")
 end
 
 -- Quality-floor matrix incl. per-tier thickness and the hue table.
@@ -395,7 +434,7 @@ local function testQualityFloorMatrix(fails)
     ck(Borders.TierPx(nil) == 0, "nil -> 0px")
     ck(Borders.TierPx(0)   == 0, "poor -> 0px")
     ck(Borders.TierPx(1)   == 0, "common -> 0px")
-    ck(Borders.TierPx(2)   == 0, "uncommon -> 0px (below floor)")
+    ck(Borders.TierPx(2)   == 1, "uncommon -> 1px (1.0 Uncommon+ floor)")
     ck(Borders.TierPx(3)   == 1, "rare -> 1px")
     ck(Borders.TierPx(4)   == 2, "epic -> 2px")
     ck(Borders.TierPx(5)   == 2, "legendary -> 2px")
@@ -473,7 +512,7 @@ end
 -- UI-Quickslot2 ring, killed in ui_items._neutralizeSlotArt — not this mapping).
 local function testMixedBagMapping(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    -- 12 slots: poor, commons, uncommons, one rare, one epic, an empty (nil quality).
+    -- 12 slots: poor, commons, three uncommons, one rare, one epic, an empty (nil quality).
     local bag = { 0, 1, 1, 1, 2, 2, 1, 3, 1, 2, 4, nil }
     local rimmed, px1, px2 = 0, 0, 0
     for slot = 1, 12 do
@@ -483,16 +522,18 @@ local function testMixedBagMapping(fails)
             local p = Borders.TierPx(q)
             if p == 1 then px1 = px1 + 1 elseif p == 2 then px2 = px2 + 1 end
         else
-            ck(Borders.TierPx(q) == 0, "sub-rare slot (q=" .. tostring(q) .. ") -> 0px")
+            ck(Borders.TierPx(q) == 0, "sub-uncommon slot (q=" .. tostring(q) .. ") -> 0px")
         end
     end
-    ck(rimmed == 2, "mixed bag: exactly 2 of 12 slots rimmed (the rare + the epic), got " .. rimmed)
-    ck(px1 == 1, "exactly one 1px edge (the rare)")
+    -- 1.0 Uncommon+ floor: the three greens + the rare + the epic are rimmed (5 of 12).
+    ck(rimmed == 5, "mixed bag: 5 of 12 rimmed (3 uncommon + rare + epic), got " .. rimmed)
+    ck(px1 == 4, "four 1px edges (the three uncommons + the rare), got " .. px1)
     ck(px2 == 1, "exactly one 2px edge (the epic)")
-    -- The commons/uncommons that dominate the bag are explicitly quiet.
-    ck(Borders.ShouldShow(1, true) == false and Borders.ShouldShow(2, true) == false,
-        "commons + uncommons stay edgeless (bag reads calm)")
-    -- Disabling the toggle silences even the rare+ pair.
+    -- Poor + commons stay quiet; uncommons NOW carry the 1.0 green border.
+    ck(Borders.ShouldShow(0, true) == false and Borders.ShouldShow(1, true) == false,
+        "poor + commons stay edgeless")
+    ck(Borders.ShouldShow(2, true) == true, "uncommons carry the 1.0 green border")
+    -- Disabling the toggle silences everything.
     local silenced = 0
     for slot = 1, 12 do if Borders.ShouldShow(bag[slot], false) then silenced = silenced + 1 end end
     ck(silenced == 0, "toggle off -> no slot rimmed at all")
@@ -509,11 +550,27 @@ local function testPhysicalThickness(fails)
     ck(Borders.PhysicalThickness(-3, 0.5) == 0, "negative px clamps to 0")
 end
 
+-- 1.0-PARITY: configurable minimum-quality floor + the unusable red.
+local function testMinQualityConfig(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local saved = Store.db
+    Store.db = nil;  ck(Borders.MinQuality() == 2, "no store -> default Uncommon (2)")
+    Store.db = {};   ck(Borders.MinQuality() == 2, "unset -> default Uncommon (2)")
+    Store.db = { qualityBorderMin = 3 }; ck(Borders.MinQuality() == 3, "explicit Rare floor honored")
+    Store.db = { qualityBorderMin = 4 }; ck(Borders.MinQuality() == 4, "explicit Epic floor honored")
+    Store.db = { qualityBorderMin = "x" }; ck(Borders.MinQuality() == 2, "non-number -> default")
+    Store.db = saved
+    -- Unusable red is red-dominant (headless: falls back to a literal red).
+    local r, g, b = Borders.UnusableRGB()
+    ck(r and r > g and r > b, "unusable red is red-dominant")
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
+        { name = "min-quality + unusable", fn = testMinQualityConfig },
         { name = "quality color",        fn = testQualityRGB },
         { name = "enabled toggle",       fn = testEnabledToggle },
         { name = "physical thickness",   fn = testPhysicalThickness },

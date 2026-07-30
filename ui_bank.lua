@@ -221,16 +221,19 @@ local function bankRenderModel()
     return viewed, false, false, viewed            -- alt / summary -> already read-only
 end
 
--- The cross-account gold tooltip (D1 sacred; identical content to the inventory bar).
+-- The cross-character gold tooltip (D1 sacred). Uses the SAME 1.0-format renderer as the
+-- inventory money bar (Frame.RenderMoneyTooltip) so the two windows read identically;
+-- falls back to a plain total line if ui_frame is somehow absent.
 local function showMoneyTooltip(anchor)
     local GT = _G.GameTooltip
     if not GT then return end
     GT:SetOwner(anchor, "ANCHOR_LEFT")
-    GT:AddLine("Gold", UI.Color("text"))
-    GT:AddDoubleLine("All characters", moneyString(Store.TotalMoney()), 1,1,1, 1,1,1)
-    for acct, copper in pairs(Store.MoneyByAccount()) do
-        GT:AddDoubleLine(acct ~= "" and acct or "Unlinked", moneyString(copper))
+    if ns.Frame and ns.Frame.RenderMoneyTooltip then
+        ns.Frame.RenderMoneyTooltip(GT)
+        return
     end
+    GT:AddLine(_G.MONEY or "Money", UI.Color("text"))
+    GT:AddDoubleLine(_G.TOTAL or "Total", moneyString(Store.TotalMoney()), 1,1,1, 1,1,1)
     GT:Show()
 end
 
@@ -257,7 +260,8 @@ function Bank.Ensure()
     win:Hide()
     UI.Skin(win, function(self)
         self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("ground"))
+        -- 1.0 PARITY (opacity): near-solid dark ground (Bags-side alpha; sibling of inventory).
+        self:SetBackdropColor(UI.Color("ground", (ns.Frame and ns.Frame.WINDOW_BG_ALPHA) or 0.94))
         self:SetBackdropBorderColor(UI.Color("border"))
     end)
     if UI.PaintLedgerGround then UI.PaintLedgerGround(win) end

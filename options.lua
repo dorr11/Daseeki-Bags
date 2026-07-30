@@ -95,13 +95,6 @@ function Options.Build(flow)
     }).Refresh)
 
     register(disp:Checkbox({
-        label = "Quality borders",
-        tooltip = "Color item slots by quality (uncommon and above).",
-        get = function() local db = DB(); return db == nil or db.qualityBorders ~= false end,
-        set = function(v) local db = DB(); if db then db.qualityBorders = v and true or false end regrid() end,
-    }).Refresh)
-
-    register(disp:Checkbox({
         label = "Show keyring",
         tooltip = "Include the keyring as a container in the bag window.",
         get = function() local db = DB(); return db == nil or db.showKeyring ~= false end,
@@ -141,6 +134,27 @@ function Options.Build(flow)
         get = function() local db = DB(); return (db and db.gap) or (ns.Frame and ns.Frame.DEFAULT_GAP) or 2 end,
         set = function(v) local db = DB(); if db then db.gap = math.floor(v + 0.5); db.densityUserChose = true end regrid() end,
     }).Refresh)
+
+    -- ── Item borders (1.0 / CII-style) ──────────────────────────────────────────
+    -- Full-saturation quality borders with a configurable minimum quality (default
+    -- Uncommon, matching 1.x's Uncommon+ floor). Unusable gear always shows a red border.
+    local ib = flow:AddSection("Item borders")
+    ib:Hint("Color item slots by quality (full-saturation, like 1.0 / ColoredInventoryItems).")
+    register(ib:Checkbox({
+        label = "Show quality borders",
+        tooltip = "Draw a colored border on items at or above the minimum quality below.",
+        get = function() local db = DB(); return db == nil or db.qualityBorders ~= false end,
+        set = function(v) local db = DB(); if db then db.qualityBorders = v and true or false end regrid() end,
+    }).Refresh)
+    local minRow = ib:AddRow({ vAlign = "center" })
+    minRow:Label("Minimum quality")
+    register(minRow:SegmentedChoice({
+        compact = true,
+        choices = { { value = 2, text = "Uncommon" }, { value = 3, text = "Rare" }, { value = 4, text = "Epic" } },
+        get = function() local db = DB(); return (db and db.qualityBorderMin) or (ns.Borders and ns.Borders.DEFAULT_MIN_QUALITY) or 2 end,
+        set = function(v) local db = DB(); if db then db.qualityBorderMin = tonumber(v) or 2 end regrid() end,
+    }).Refresh)
+    ib:Hint("Unusable gear (your class can't equip it, or it's below its required level) always shows a red border.")
 
     -- ── Sorting ───────────────────────────────────────────────────────────────
     local sorting = flow:AddSection("Sorting")
