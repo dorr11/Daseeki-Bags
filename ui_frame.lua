@@ -5,6 +5,7 @@
 --
 --   G = ns.Items.CreateGroup(parent)
 --   G:SetGrid(columns, buttonSize, gap)
+--   G:SetRunSplit(bool)          -- 1.0 keyring row-break (combined grid only)
 --   G:ShowSlots(entries)         -- entries = array of { owner, cid, slot, data|nil }
 --   G:Clear()
 --   (G self-sizes)
@@ -16,6 +17,10 @@
 --   "combined": one continuous grid — every carried container's slots flow
 --               together (backpack cid 0, bags 1..N in cid order, keyring last),
 --               per-container identity preserved on each entry (never flattened).
+--               The ROW breaks at the bag-family boundary (1.0 parity): the keyring
+--               starts at column 0 of a fresh row with a small gap above it. That is a
+--               positioning rule (ns.Items run split), not an entry-list change — the
+--               combined list stays one flat cid-ordered array.
 --   "split":    one small-headered group per container, stacked in a column.
 -- Switched live via DaseekiBags2DB.layout; Rebuild() re-derives entry lists and
 -- re-groups without a /reload.
@@ -477,8 +482,20 @@ function Frame.ComputeContentSize(owner, layout, opts)
 
     -- combined
     local entries = Frame.BuildCombinedEntries(owner, opts)
-    local gd = Frame.GridDims(#entries, columns, bs, gap)
-    return { width = bandW, height = gd.height }
+    return { width = bandW, height = Frame.CombinedGridHeight(entries, columns, bs, gap) }
+end
+
+-- PURE: height of the flat combined grid, RUN-SPLIT aware (1.0 keyring row-break — the
+-- keys start a fresh row with a small gap above, so the window is a little taller
+-- whenever the bag run doesn't end on a column boundary). The run math itself lives in
+-- ns.Items (single source of truth with the renderer that positions the cells); the plain
+-- grid height is the fallback for the chrome-only degrade path where ns.Items is absent.
+function Frame.CombinedGridHeight(entries, columns, bs, gap)
+    local I = ns.Items
+    if I and I.SplitRuns and I.RunLayout then
+        return I.RunLayout(I.SplitRuns(entries), columns, bs, gap, I.RUN_GAP).height
+    end
+    return Frame.GridDims(#(entries or {}), columns, bs, gap).height
 end
 
 ----------------------------------------------------------------------
@@ -1605,6 +1622,7 @@ function Frame.Rebuild()
             for i, s in ipairs(sections) do
                 local g = acquireGroup(win, i)
                 if g.SetHeader then g:SetHeader(nil) end   -- clear any split bag-header on a reused group
+                if g.SetRunSplit then g:SetRunSplit(false) end  -- sections are deliberately mixed-cid
                 g:SetGrid(cols, bs, gap)
                 g:ClearAllPoints()
                 g:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, -(y + Frame.SECTION_HDR_H))
@@ -1628,6 +1646,7 @@ function Frame.Rebuild()
             local y = 0
             for i, grp in ipairs(groups) do
                 local g = acquireGroup(win, i)
+                if g.SetRunSplit then g:SetRunSplit(false) end  -- one container per group already
                 g:SetGrid(cols, bs, gap)
                 g:ClearAllPoints()
                 -- header sits above each group; group grid below it
@@ -1644,6 +1663,10 @@ function Frame.Rebuild()
             local entries = Frame.BuildCombinedEntries(owner, opts)
             local g = acquireGroup(win, 1)
             if g.SetHeader then g:SetHeader(nil) end   -- clear any leftover split bag-header on a reused group
+            -- 1.0 KEYRING ROW-BREAK: the flat list stays flat (entry order + click identity
+            -- unchanged); ns.Items breaks the ROW at the generic->keyring family boundary so
+            -- the keys start at column 0 of a fresh row, as 1.x's itemGroup break does.
+            if g.SetRunSplit then g:SetRunSplit(true) end
             g:SetGrid(cols, bs, gap)
             g:ClearAllPoints()
             g:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, 0)
@@ -1921,9 +1944,32 @@ local function testGridAndWindowSize(fails)
     local hC = Frame.ComputeWindowSize(o, "combined", optsC).height
     local hS = Frame.ComputeWindowSize(o, "split", optsC).height
     ck(hS > hC, "split window taller than combined (headers + group gaps)")
-    -- Exact combined content height check: 48 slots @12 = 4 rows = 160.
+    -- Exact combined content height, RUN-SPLIT (1.0 keyring row-break). The fixture is
+    -- 16+14+6 = 36 bag slots + a 12-slot keyring. At 12 columns the bag run is 3 full rows
+    -- and the keyring starts a FRESH row below it, so the height is NOT the old flat
+    -- ceil(48/12) = 4 rows (160) but 3 rows + gap + RUN_GAP + 1 row.
+    local runGap = (ns.Items and ns.Items.RUN_GAP) or 12
+    local expFlat = Frame.GridDims(36, 12, 37, 4).height + 4 + runGap
+                  + Frame.GridDims(12, 12, 37, 4).height
     local content = Frame.ComputeContentSize(o, "combined", optsC)
-    ck(content.height == 160, "combined content height 160 (4 rows)")
+    ck(content.height == expFlat,
+        "combined content height = bag run + break gap + keyring run, got " .. content.height .. " exp " .. expFlat)
+    -- 36 already fills 3 rows of 12 exactly, so here the break costs ONLY the extra air.
+    ck(content.height == 160 + runGap, "row-aligned boundary -> old 4-row height + RUN_GAP")
+    -- With the keyring hidden there is only ONE run, so the plain grid math is restored.
+    local noKey = Frame.ComputeContentSize(o, "combined",
+        { columns = 12, buttonSize = 37, gap = 4, showKeyring = false })
+    ck(noKey.height == Frame.GridDims(36, 12, 37, 4).height, "single run -> plain grid height (no break)")
+
+    -- The owner's REAL config (11 columns, gap 2) is the case the defect showed up in:
+    -- 36 bag slots leave the row 3 cells in, so the old flat flow started the keys mid-row.
+    -- The break costs a WHOLE extra row there, not just the gap.
+    local live = { columns = 11, buttonSize = 37, gap = 2, showKeyring = true }
+    local hLive = Frame.ComputeContentSize(o, "combined", live).height
+    local expLive = Frame.GridDims(36, 11, 37, 2).height + 2 + runGap
+                  + Frame.GridDims(12, 11, 37, 2).height
+    ck(hLive == expLive, "11-col content height = 4 bag rows + break + 2 keyring rows, got " .. hLive)
+    ck(hLive > Frame.GridDims(48, 11, 37, 2).height, "the mid-row break makes the window taller (intended 1.0 look)")
 end
 
 local function testGeometryRoundTrip(fails)

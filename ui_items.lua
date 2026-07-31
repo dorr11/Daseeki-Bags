@@ -8,13 +8,20 @@
 --                                              the frame agent consumes (per-container
 --                                              grouping AND combined flatten)
 --     Items.GridMetrics / Items.SlotPosition — grid math (cols/rows/self-size/xy)
+--     Items.FlowClass / SplitRuns / RunLayout / RunSlotPosition — the 1.0 keyring
+--                                              ROW-BREAK: the flat list is split into
+--                                              runs at the bag-family boundary and each
+--                                              later run restarts at column 0
+--     Items.MarkerArt                       — the per-slot marker ART contract
+--                                              (quest bang glyph / round token pips)
 --     Items.ResolveVisual                   — icon/quality/name derivation with the
 --                                              nil-quality (migrated) -> pending path
 --     Items.DimValues / Items.FormatCachedAge
 --
 --   FRAME layer (in-game only; every WoW API call guarded on _G):
 --     Items.CreateButton -> B:SetSlot / B:SetEmpty / B:Clear / B:SetDimmed
---     Items.CreateGroup  -> G:SetGrid / G:ShowSlots / G:Clear (self-sizing, never 0)
+--     Items.CreateGroup  -> G:SetGrid / G:SetRunSplit / G:ShowSlots / G:Clear
+--                           (self-sizing, never 0)
 --
 -- Interface contract (shared with the sibling ui_frame.lua):
 --   entries = array of { owner=<ownerRec>, cid=<containerID>, slot=<n>, data=<slot|nil> }
@@ -52,6 +59,60 @@ Items.DEFAULT_COLUMNS = 11   -- 1.0 inventory density (owner DaseekiBagsSets col
 Items.MIN_CELL        = 30   -- 720p floor (C): below this the 1px quality edge + count numeral degrade together
 Items.HEADER_HEIGHT   = 16   -- split-mode per-bag header band (sits ABOVE the grid)
 Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
+
+----------------------------------------------------------------------
+-- MARKER ART (defect #2: the corner markers were literal SetColorTexture squares)
+--
+-- Every marker is ADDON-OWNED art. It has to be: _killTemplateArt hides the template's
+-- own NewItemTexture / IconQuestTexture / JunkIcon and re-hides them on every repaint
+-- and on the SetItemButtonTexture/Quality hooks, so anything drawn into a native region
+-- is erased on the next paint. Our regions are created by ensureDress and are not in the
+-- kill registry, so they survive.
+--
+--   QUEST — the real bang glyph, 1.x-faithful. 1.x fact (core/classes/item.lua:39-47):
+--     QuestBang IS the template's IconQuestTexture region and is painted with the
+--     FrameXML constant TEXTURE_ITEM_QUEST_BANG. We reference the SAME constant from our
+--     own region (with the literal Era path as a guard so a nil constant can never leave
+--     an untextured object), anchored over the whole cell like the native region — so the
+--     glyph lands exactly where 1.x puts it. (WHEN it shows is unchanged by this fix:
+--     slotIsQuest's isQuestItem-or-questID trigger still marks every quest item, where
+--     1.x reserves the bang for quest STARTERS and tints the border for the rest.)
+--   NEW / SET — token-tinted pips, but round: a WHITE8X8 fill clipped by our shipped
+--     circular stencil (art/dot-mask.tga). Same size and same tokens as before; only the
+--     SHAPE changes (hard square -> anti-aliased dot). Masking degrades to the old square
+--     if CreateMaskTexture is unavailable, never to an invisible marker.
+----------------------------------------------------------------------
+
+Items.TEX_WHITE    = "Interface\\Buttons\\WHITE8X8"
+-- Shipped stencil, addressed through the LIVE addon folder name (ADDON is the folder), so
+-- the path is correct whether the install is Daseeki-Bags or the Daseeki-Bags2 beta.
+Items.TEX_DOT_MASK = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\dot-mask"
+-- Era path behind TEXTURE_ITEM_QUEST_BANG; used only if the FrameXML constant is missing.
+Items.TEX_QUEST_BANG = "Interface\\ContainerFrame\\UI-Icon-QuestBang"
+
+function Items.QuestBangTexture()
+    return _G.TEXTURE_ITEM_QUEST_BANG or Items.TEX_QUEST_BANG
+end
+
+-- PURE: the art contract for one per-slot marker.  kind = "quest" | "new" | "set".
+-- Returns { texture, mask, token, sizeRatio, anchor, glyph } or nil for an unknown kind.
+-- Harness-locked: a marker may never again be a raw color fill (texture is always a real
+-- path), and every non-glyph pip must carry a shape mask.
+function Items.MarkerArt(kind)
+    if kind == "quest" then
+        -- Native glyph: no token tint (1.x shows the bang in its own gold), full-cell
+        -- footprint = the native IconQuestTexture geometry 1.x paints.
+        return { texture = Items.QuestBangTexture(), mask = nil, token = nil,
+                 sizeRatio = 1, anchor = "CELL", glyph = true }
+    elseif kind == "new" then
+        return { texture = Items.TEX_WHITE, mask = Items.TEX_DOT_MASK, token = "brand",
+                 sizeRatio = 0.24, anchor = "TOPRIGHT", glyph = false }
+    elseif kind == "set" then
+        return { texture = Items.TEX_WHITE, mask = Items.TEX_DOT_MASK, token = "bronze",
+                 sizeRatio = 0.20, anchor = "BOTTOMLEFT", glyph = false }
+    end
+    return nil
+end
 
 -- Human labels per container class for the split-view bag header (fallback when the
 -- bag item's real name is not resolvable from a link).
@@ -168,6 +229,94 @@ function Items.SlotPosition(index, columns, size, gap)
     local col = i % columns
     local row = math.floor(i / columns)
     return col * (size + gap), -(row * (size + gap))
+end
+
+----------------------------------------------------------------------
+-- PURE: RUN SPLITTING (1.0 keyring row-break parity)
+--
+-- 1.x never flows the keyring into the running row. The keyring is its own bag
+-- FAMILY (frames/inventory/inventory.lua family 9; normal bags + backpack are 0), and
+-- core/classes/itemGroup.lua records a BREAK at every family boundary, then resets the
+-- column to 0 and drops y by `breakSpace` (1.3 rows — one normal row plus a ~0.3-row
+-- gap) when it crosses one. So the keys start a FRESH ROW with a small gap above,
+-- still inside the same single button array — no separate frame, no header.
+--
+-- v2's combined view is one flat cid-ordered entry list (kept exactly as-is — the
+-- entry list is the click-identity contract). The break therefore lives HERE, where
+-- positions are assigned: the flat list is split into RUNS at the flow-class boundary
+-- and each run after the first starts at column 0 of a new row, `RUN_GAP` px lower.
+----------------------------------------------------------------------
+
+-- Extra vertical space above a run that follows another (on top of the normal row gap).
+-- 1.x fact: breakSpace 1.3 rows => 0.3 of a row-pitch of extra air. At the 2.0 default
+-- pitch (37 cell + 2 gap = 39) that is 0.3 * 39 = 11.7px, so 12.
+Items.RUN_GAP = 12
+
+-- Layout FLOW CLASS of a container: "keyring" or "generic".
+-- Derived from the cid CLASS (Store.ContainerClass), NEVER from a captured `family`
+-- field — capture never stores one for cid <= 0, so a naive family read returns nil,
+-- collapses the keyring back into the main run and silently restores the defect.
+-- (1.x also breaks for quiver/soul/herb special bags; Era carries none by default and
+-- v2 captures no family, so those stay generic until a family fact exists to read.)
+function Items.FlowClass(cid)
+    return (Store.ContainerClass(cid) == "keyring") and "keyring" or "generic"
+end
+
+-- Split a flat entry list into maximal runs of one flow class, in list order.
+-- Returns { { from = <1-based flat index of the run's first cell>, n = <cells>,
+--             class = <flow class> }, ... }.  Empty list -> {}.
+function Items.SplitRuns(entries)
+    local runs, cur = {}, nil
+    entries = entries or {}
+    for i = 1, #entries do
+        local cls = Items.FlowClass(entries[i] and entries[i].cid)
+        if cur and cur.class == cls then
+            cur.n = cur.n + 1
+        else
+            cur = { from = i, n = 1, class = cls }
+            runs[#runs + 1] = cur
+        end
+    end
+    return runs
+end
+
+-- Stack runs into one grid. Run 1 starts at (0, 0); every later run starts at COLUMN 0
+-- of a fresh row, separated from the run above by the normal row gap PLUS `runGap`.
+-- Returns { rows, height, width, runs = { { from, n, class, y } } } where `y` is the
+-- run's top offset (<= 0). Pure: the renderer and the window size math both use it.
+function Items.RunLayout(runs, columns, size, gap, runGap)
+    columns = math.max(1, columns or Items.DEFAULT_COLUMNS)
+    size    = size or Items.DEFAULT_SIZE
+    gap     = gap or Items.DEFAULT_GAP
+    runGap  = runGap or Items.RUN_GAP
+    local out = { runs = {}, rows = 0, height = 0, width = 0 }
+    local y = 0
+    for i, r in ipairs(runs or {}) do
+        if i > 1 then y = y - gap - runGap end
+        local m = Items.GridMetrics(r.n, columns, size, gap)
+        out.runs[i] = { from = r.from, n = r.n, class = r.class, y = y }
+        out.rows  = out.rows + m.rows
+        if m.width > out.width then out.width = m.width end
+        y = y - m.height
+    end
+    out.height = -y
+    return out
+end
+
+-- (x, y) of the flat cell `index` inside a run-split layout `L` (from RunLayout).
+-- An index outside every run falls back to the plain flat grid position.
+function Items.RunSlotPosition(L, index, columns, size, gap)
+    local rs = L and L.runs
+    if rs then
+        for i = 1, #rs do
+            local r = rs[i]
+            if index >= r.from and index < r.from + r.n then
+                local x, y = Items.SlotPosition(index - r.from + 1, columns, size, gap)
+                return x, y + r.y
+            end
+        end
+    end
+    return Items.SlotPosition(index, columns, size, gap)
 end
 
 ----------------------------------------------------------------------
@@ -413,12 +562,20 @@ local TOKEN_FALLBACK = {
     brand      = { 0.7529, 0.2824, 0.2353 }, -- crimson wax (Field Ledger)
     warn       = { 0.9600, 0.7600, 0.1800 },
     danger     = { 0.8118, 0.3647, 0.2902 },
+    -- Core-less parity (latent white-square bug): tokenRGB returns {1,1,1} for an unknown
+    -- key, so any token used by the dress that was NOT listed here rendered PURE WHITE on
+    -- an install without Daseeki-Core (which is OptionalDeps, not Dependencies). `bronze`
+    -- is the set marker; `idle` is used by the owner selector. Values mirror
+    -- Daseeki-Core/theme.lua's Field Ledger defaults (bronze = accentDim, idle = faint).
+    bronze     = { 0.5412, 0.4471, 0.2235 }, -- metallic keyline / ornament
+    idle       = { 0.4275, 0.3922, 0.3137 }, -- calm / owned neutral
 }
 local function tokenRGB(name)
     if _G.DaseekiUI and _G.DaseekiUI.Color then return _G.DaseekiUI.Color(name) end
     local c = TOKEN_FALLBACK[name] or { 1, 1, 1 }
     return c[1], c[2], c[3]
 end
+Items._tokenRGB = tokenRGB   -- exposed so the harness can prove the Core-less fallbacks
 
 -- Subtle danger tint for an UNUSABLE icon: danger mixed toward white so a desaturated
 -- (greyscale) icon reads warm-red — the classic "can't use" cue — not a solid red block.
@@ -566,7 +723,8 @@ function Items._applyDress(button, spec)
     -- count numeral recedes with the dim
     if button._dsCount and button._dsCount.SetAlpha then button._dsCount:SetAlpha(a) end
 
-    -- keep the template's native quest bang suppressed (our warn tab replaces it)
+    -- keep the template's native quest region suppressed (we draw the bang ourselves, on
+    -- an addon-owned region the kill sweep can't reach)
     if button._dsNativeQuest then button._dsNativeQuest:Hide() end
 
     -- NEW-ITEM wax dot: one-shot 120ms fade-in on the rising edge (arrival), then still.
@@ -586,7 +744,7 @@ function Items._applyDress(button, spec)
         end
     end
 
-    -- QUEST warn tab
+    -- QUEST bang glyph
     local tab = button._dsQuestTab
     if tab then
         if spec.showQuestTab then tab:SetAlpha(a); tab:Show() else tab:Hide() end
@@ -691,7 +849,8 @@ end
 --   IconOverlay(2)     azerite/corruption ring (retail-only; absent in Classic) — off if present.
 --   SearchOverlay      the template's OWN dark search dim — we run our own dim cascade; killing
 --                      it prevents a double-dark muddy overlay (a "dull" contributor).
---   IconQuestTexture   yellow "!" quest ring — our warn tab replaces it.
+--   IconQuestTexture   the template's quest region — killed because the sweep re-hides it
+--                      on every repaint; we paint the SAME bang art on our own region.
 --   Stock              merchant stock count — never valid in bags, hidden.
 --   Cooldown edge/bling  the cooldown swipe's bright edge ring + finish flash — quieted
 --                      (SetDrawEdge/SetDrawBling false); the dark swipe itself stays (ours).
@@ -866,9 +1025,28 @@ function Items.CellBorderKind(quality, unusable, enabled, minQuality)
     return "none"                                     -- common / poor / empty -> clean cell
 end
 
+-- Paint a marker PIP from its Items.MarkerArt spec: a flat WHITE8X8 fill, tinted to the
+-- spec's theme token, clipped to the shipped round stencil so it reads as a DOT and not a
+-- box. Mirrors the suite's mask primitive (Daseeki-Core ledgerkit UI.MaskTexture: a
+-- CreateMaskTexture host + AddMaskTexture, CLAMPTOBLACKADDITIVE both axes so everything
+-- outside the stencil is clipped) but implemented locally — Core is OptionalDeps and a
+-- core visual must not depend on it. `host` is the frame that owns the mask (masks are
+-- frame-level objects); when masking is unavailable the pip simply stays a square — the
+-- old look, never an invisible marker.
+local function paintPip(tex, host, art)
+    if tex.SetTexture then tex:SetTexture(art.texture) end
+    if art.token and tex.SetVertexColor then tex:SetVertexColor(tokenRGB(art.token)) end
+    if not (art.mask and host and host.CreateMaskTexture and tex.AddMaskTexture) then return nil end
+    local mask = host:CreateMaskTexture()
+    mask:SetAllPoints(tex)
+    mask:SetTexture(art.mask, "CLAMPTOBLACKADDITIVE", "CLAMPTOBLACKADDITIVE")
+    tex:AddMaskTexture(mask)
+    return mask
+end
+
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
--- combat-deferred layout): quiet inset well + 1px cell hairline + new-item wax dot +
--- quest warn tab. All are non-secure children; nothing here (or at runtime) is a protected
+-- combat-deferred layout): quiet inset well + round new-item wax dot + quest bang glyph +
+-- round set pip. All are non-secure children; nothing here (or at runtime) is a protected
 -- op on the button. Also installs the global defensive re-kill hooks (once) and restyles
 -- the kept click feedback to a quiet wash.
 local function ensureDress(button)
@@ -897,36 +1075,40 @@ local function ensureDress(button)
     local sz = button:GetWidth() or Items.DEFAULT_SIZE
 
     -- NEW-ITEM wax dot (brand crimson), top-right corner. A Frame (so UI.Animate.FadeIn can
-    -- play a one-shot 120ms reveal on arrival) holding a filled texture.
+    -- play a one-shot 120ms reveal on arrival) holding the round pip texture.
+    local newArt = Items.MarkerArt("new")
     local dot = _G.CreateFrame("Frame", nil, button)
-    local dsz = math.max(5, math.floor(sz * 0.24))
+    local dsz = math.max(5, math.floor(sz * newArt.sizeRatio))
     dot:SetSize(dsz, dsz)
     dot:SetPoint("TOPRIGHT", button, "TOPRIGHT", -1, -1)
     if dot.SetFrameLevel then dot:SetFrameLevel((button:GetFrameLevel() or 1) + 2) end
     local dt = dot:CreateTexture(nil, "OVERLAY")
     dt:SetAllPoints(dot)
-    dt:SetColorTexture(tokenRGB("brand"))
+    paintPip(dt, dot, newArt)
     dot:Hide()
     button._dsNewDot = dot
 
-    -- QUEST warn tab (warn token), top-left corner — WoW's "!" convention without the
-    -- yellow bang art (the native quest ring is already killed in _killTemplateArt).
+    -- QUEST bang glyph, over the cell — the real 1.x marker (item.lua:47 paints the
+    -- template's IconQuestTexture with TEXTURE_ITEM_QUEST_BANG). Ours is an addon-owned
+    -- OVERLAY region on the same footprint, because _killTemplateArt permanently hides
+    -- the native one. No token tint: the bang keeps its own gold, exactly as in 1.0.
+    local questArt = Items.MarkerArt("quest")
     local tab = button:CreateTexture(nil, "OVERLAY")
-    local tsz = math.max(5, math.floor(sz * 0.26))
-    tab:SetSize(tsz, tsz)
     tab:SetPoint("TOPLEFT", button, "TOPLEFT", 1, -1)
-    tab:SetColorTexture(tokenRGB("warn"))
+    tab:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
+    tab:SetTexture(questArt.texture)
     tab:Hide()
     button._dsQuestTab = tab
 
     -- EQUIPMENT-SET tick (bronze), bottom-LEFT corner — the one free corner (new=top-right,
-    -- quest=top-left, count numeral=bottom-right). A small filled square reads as a quiet
-    -- "belongs to a gear set" tick; deliberately subtler than the crimson new dot.
+    -- quest glyph=over the cell, count numeral=bottom-right). A small round pip reads as a
+    -- quiet "belongs to a gear set" tick; deliberately subtler than the crimson new dot.
+    local setArt = Items.MarkerArt("set")
     local setMark = button:CreateTexture(nil, "OVERLAY")
-    local ssz = math.max(4, math.floor(sz * 0.20))
+    local ssz = math.max(4, math.floor(sz * setArt.sizeRatio))
     setMark:SetSize(ssz, ssz)
     setMark:SetPoint("BOTTOMLEFT", button, "BOTTOMLEFT", 1, 1)
-    setMark:SetColorTexture(tokenRGB("bronze"))
+    paintPip(setMark, button, setArt)
     setMark:Hide()
     button._dsSetMark = setMark
 
@@ -1131,6 +1313,10 @@ local function layoutGroup(G, entries)
     end
 
     local cols, size, gap = G._columns, G._size, G._gap
+    -- Run-split geometry (keyring row-break). OFF unless the caller opted in, so split
+    -- groups (one cid each), category sections (deliberately mixed-cid) and the bank keep
+    -- exactly the flat flow they had; with one run the math is identical to the old path.
+    local L = G._runSplit and Items.RunLayout(Items.SplitRuns(entries), cols, size, gap, Items.RUN_GAP) or nil
     for i = 1, n do
         local e = entries[i]
         local live = Items.IsLive(e.owner)
@@ -1143,7 +1329,9 @@ local function layoutGroup(G, entries)
         elseif live then
             button:SetParent(holderFor(G, e.cid))   -- keep the bag holder current
         end
-        local x, y = Items.SlotPosition(i, cols, size, gap)
+        local x, y
+        if L then x, y = Items.RunSlotPosition(L, i, cols, size, gap)
+        else x, y = Items.SlotPosition(i, cols, size, gap) end
         button:ClearAllPoints()
         button:SetPoint("TOPLEFT", G, "TOPLEFT", x, y)
         button:SetSize(size, size)
@@ -1153,7 +1341,7 @@ local function layoutGroup(G, entries)
     end
     for i = n + 1, #G._buttons do G._buttons[i]:Hide() end
 
-    local m = Items.GridMetrics(n, cols, size, gap)
+    local m = L or Items.GridMetrics(n, cols, size, gap)
     G:SetSize(math.max(m.width, size), math.max(m.height, size))  -- never zero-size
 end
 
@@ -1187,6 +1375,18 @@ function Items.CreateGroup(parent)
         if buttonSize then self._size = Items.ClampCell(buttonSize) end  -- 720p cell floor (C)
         if gap ~= nil then self._gap = gap end
         -- Re-flow the current contents so a grid change is immediately visible.
+        if self._lastEntries then layoutGroup(self, self._lastEntries) end
+    end
+
+    -- Opt in to the 1.0 keyring ROW-BREAK for this group: the entry list is split into
+    -- runs at the generic->keyring boundary and each later run starts at column 0 of a
+    -- fresh row, Items.RUN_GAP px lower. Only the flat COMBINED grid wants this (split
+    -- groups are already one container each; category sections are deliberately mixed).
+    -- Default OFF, so every other consumer keeps the flat flow unchanged.
+    function G:SetRunSplit(enabled)
+        local want = enabled and true or false
+        if self._runSplit == want then return end
+        self._runSplit = want
         if self._lastEntries then layoutGroup(self, self._lastEntries) end
     end
 
@@ -1792,9 +1992,135 @@ local function testCellBorderMatrix(fails)
     ck(K(2, false, false, 2)  == "none", "borders off -> uncommon draws no ring")
 end
 
+-- RUN SPLIT (1.0 keyring row-break). The defect: the keyring began at flat index
+-- (Σ bag slots)+1 and therefore at column (Σ bag slots) % columns — mid-row, "floating".
+-- The fix breaks the row at the generic->keyring family boundary. These cases pin the
+-- exact geometry at the owner's real 11-column config.
+local function testRunSplit(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local COLS, SZ, GAP = 11, 37, 2
+    local PITCH = SZ + GAP                     -- 39
+    local RG = Items.RUN_GAP
+
+    -- flow class comes from the cid CLASS, never a captured family field
+    ck(Items.FlowClass(0) == "generic",  "backpack is generic")
+    ck(Items.FlowClass(1) == "generic",  "carried bag is generic")
+    ck(Items.FlowClass(-2) == "keyring", "keyring (-2) is its own flow class")
+
+    -- N generic slots + M keys => exactly two runs, the keyring run starting at N+1
+    local function entries(nGeneric, mKeys)
+        local e = {}
+        for i = 1, nGeneric do e[#e + 1] = { cid = (i <= 16) and 0 or 1, slot = i } end
+        for i = 1, mKeys do e[#e + 1] = { cid = -2, slot = i } end
+        return e
+    end
+    local N, M = 36, 12                        -- 36 % 11 = 3 -> the defect's mid-row start
+    local e = entries(N, M)
+    local runs = Items.SplitRuns(e)
+    ck(#runs == 2, "generic+keyring -> 2 runs, got " .. #runs)
+    ck(runs[1].from == 1 and runs[1].n == N and runs[1].class == "generic", "run 1 = the 36 bag slots")
+    ck(runs[2].from == N + 1 and runs[2].n == M and runs[2].class == "keyring", "run 2 = the 12 keyring slots")
+
+    local L = Items.RunLayout(runs, COLS, SZ, GAP)
+    -- run 1: 4 rows (36 = 3*11 + 3). run 2 starts one full row-gap + RUN_GAP below it.
+    local run1H = Items.GridMetrics(N, COLS, SZ, GAP).height
+    ck(L.runs[1].y == 0, "run 1 starts at the top")
+    ck(L.runs[2].y == -(run1H + GAP + RG), "run 2 top = run1 height + gap + RUN_GAP")
+    ck(L.height == run1H + GAP + RG + Items.GridMetrics(M, COLS, SZ, GAP).height,
+       "total height = both runs + the break, got " .. L.height)
+    ck(L.rows == 4 + 2, "4 bag rows + 2 keyring rows")
+
+    -- POSITIONS: the last bag cell sits at column 2 of row 3; the FIRST KEY resets to
+    -- column 0 of a brand-new row (the whole point of the fix).
+    local x36, y36 = Items.RunSlotPosition(L, 36, COLS, SZ, GAP)
+    ck(x36 == 2 * PITCH and y36 == -(3 * PITCH), "bag slot 36 = col 2, row 3")
+    local x37, y37 = Items.RunSlotPosition(L, 37, COLS, SZ, GAP)
+    ck(x37 == 0, "FIRST KEY starts at column 0 (1.0 row break), got x=" .. x37)
+    ck(y37 == -(4 * PITCH + RG), "first key drops a full row + RUN_GAP below the bags")
+    -- flat math would have put it mid-row — the regression guard
+    local fx = Items.SlotPosition(37, COLS, SZ, GAP)
+    ck(fx == 3 * PITCH and x37 ~= fx, "the OLD flat flow put key 1 at column 3 (the defect)")
+    -- the rest of the keyring flows normally inside its own run
+    local x48, y48 = Items.RunSlotPosition(L, 48, COLS, SZ, GAP)
+    ck(x48 == 0 and y48 == -(5 * PITCH + RG), "key 12 wraps to the keyring run's 2nd row, col 0")
+
+    -- A boundary-aligned bag run still gets the gap (1.x adds breakSpace unconditionally).
+    local L2 = Items.RunLayout(Items.SplitRuns(entries(33, 4)), COLS, SZ, GAP)
+    local kx, ky = Items.RunSlotPosition(L2, 34, COLS, SZ, GAP)
+    ck(kx == 0 and ky == -(3 * PITCH + RG), "33 slots end the row; the key still gets the break gap")
+
+    -- Degenerate / single-run inputs behave exactly like the plain grid.
+    ck(#Items.SplitRuns({}) == 0, "empty list -> no runs")
+    ck(Items.RunLayout({}, COLS, SZ, GAP).height == 0, "no runs -> zero height")
+    local only = Items.RunLayout(Items.SplitRuns(entries(20, 0)), COLS, SZ, GAP)
+    ck(only.height == Items.GridMetrics(20, COLS, SZ, GAP).height, "single run -> plain grid height")
+    for i = 1, 20 do
+        local ax, ay = Items.RunSlotPosition(only, i, COLS, SZ, GAP)
+        local bx, by = Items.SlotPosition(i, COLS, SZ, GAP)
+        ck(ax == bx and ay == by, "single run cell " .. i .. " matches the flat position")
+    end
+    -- A keyring-ONLY view (all bags hidden) is one run and never gets a leading gap.
+    local kOnly = Items.RunLayout(Items.SplitRuns(entries(0, 6)), COLS, SZ, GAP)
+    ck(kOnly.runs[1].y == 0, "keyring-only view starts at the top (no leading break)")
+end
+
+-- MARKER ART (defect #2). The markers were literal SetColorTexture squares — an amber box
+-- where 1.0 shows the quest bang. This locks the ART CONTRACT: every marker names a real
+-- texture, the quest marker is the native bang glyph 1.x uses, and the token pips carry a
+-- shape mask so they render round. Also guards the Core-less white-square token gap.
+local function testMarkerArt(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local q = Items.MarkerArt("quest")
+    ck(q ~= nil and type(q.texture) == "string" and q.texture ~= "", "quest marker names a texture")
+    ck(q.glyph == true and q.token == nil, "quest marker is native glyph art, not a token fill")
+    ck(q.texture == Items.QuestBangTexture(), "quest marker uses the resolved bang texture")
+    -- 1.x fact (core/classes/item.lua:47): QuestBang is painted with TEXTURE_ITEM_QUEST_BANG.
+    -- We read the same FrameXML constant, with the Era path as the never-nil guard.
+    local saved = _G.TEXTURE_ITEM_QUEST_BANG
+    _G.TEXTURE_ITEM_QUEST_BANG = nil
+    ck(Items.QuestBangTexture() == Items.TEX_QUEST_BANG, "constant absent -> literal Era bang path")
+    ck(Items.TEX_QUEST_BANG:find("QuestBang", 1, true) ~= nil, "the fallback IS the quest-bang art")
+    _G.TEXTURE_ITEM_QUEST_BANG = "Interface\\SomeOther\\Bang"
+    ck(Items.MarkerArt("quest").texture == "Interface\\SomeOther\\Bang",
+       "constant present -> the game's own value wins")
+    _G.TEXTURE_ITEM_QUEST_BANG = saved
+
+    for _, kind in ipairs({ "new", "set" }) do
+        local a = Items.MarkerArt(kind)
+        ck(a ~= nil, kind .. " marker has an art spec")
+        ck(a.texture == Items.TEX_WHITE, kind .. " pip is a WHITE8X8 fill (theme-tintable)")
+        ck(a.mask == Items.TEX_DOT_MASK, kind .. " pip carries the ROUND mask (not a hard square)")
+        ck(type(a.token) == "string", kind .. " pip is token-tinted")
+        ck(a.sizeRatio > 0 and a.sizeRatio < 1, kind .. " pip stays a corner pip")
+    end
+    -- sizes/tokens/corners unchanged from the squares they replace
+    ck(Items.MarkerArt("new").token == "brand" and Items.MarkerArt("new").sizeRatio == 0.24,
+       "new dot keeps brand @ 0.24")
+    ck(Items.MarkerArt("set").token == "bronze" and Items.MarkerArt("set").sizeRatio == 0.20,
+       "set tick keeps bronze @ 0.20")
+    ck(Items.MarkerArt("new").anchor == "TOPRIGHT" and Items.MarkerArt("set").anchor == "BOTTOMLEFT",
+       "pip corners unchanged")
+    ck(Items.MarkerArt("nope") == nil, "unknown marker kind -> nil")
+    -- the mask is OUR shipped stencil, addressed through the live addon folder
+    ck(Items.TEX_DOT_MASK:find("art\\dot%-mask") ~= nil, "mask path points at the shipped art/dot-mask")
+
+    -- TOKEN FALLBACK: with no Daseeki-Core, an unlisted token returned {1,1,1} => a PURE
+    -- WHITE marker. Every token the dress paints must have a fallback entry.
+    local savedUI = _G.DaseekiUI
+    _G.DaseekiUI = nil
+    for _, tok in ipairs({ "brand", "bronze", "warn", "danger", "inset", "raised", "border", "borderLite", "text", "idle" }) do
+        local r, g, b = Items._tokenRGB(tok)
+        ck(not (r == 1 and g == 1 and b == 1), "Core-less token '" .. tok .. "' is not white")
+    end
+    _G.DaseekiUI = savedUI
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
+        { name = "run split (keyring break)", fn = testRunSplit },
+        { name = "marker art",         fn = testMarkerArt },
         { name = "cell border matrix", fn = testCellBorderMatrix },
         { name = "daseeki cell vs edge", fn = testDaseekiCellVsQualityEdge },
         { name = "proficiency matrix", fn = testProficiency },
