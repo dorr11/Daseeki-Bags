@@ -221,20 +221,61 @@ local function bankRenderModel()
     return viewed, false, false, viewed            -- alt / summary -> already read-only
 end
 
--- The cross-character gold tooltip (D1 sacred). Uses the SAME 1.0-format renderer as the
--- inventory money bar (Frame.RenderMoneyTooltip) so the two windows read identically;
--- falls back to a plain total line if ui_frame is somehow absent.
-local function showMoneyTooltip(anchor)
-    local GT = _G.GameTooltip
+-- The cross-character gold tooltip (D1 sacred). Delegates WHOLLY to the one money model
+-- (Frame.RenderMoneyTooltip, defined in ui_owner.lua) so the bank and inventory windows
+-- read identically — this file contributes no lines of its own.
+--
+-- ── 1.x facts behind this function (verified on branch main) ──────────────────
+-- ANCHOR_TOP: 1.x's money widget family is the ONLY one that ignores the generic
+-- left/right-by-screen-side anchor — PlayerMoney:GetTipAnchor returns a fixed
+-- ANCHOR_TOP (core/classes/playerMoney.lua), so the money tip rises above the bar.
+-- The bank's money widget subclasses PlayerMoney and does NOT override GetTipAnchor,
+-- so BOTH surfaces anchor ANCHOR_TOP. This matches the inventory window's OnEnter.
+--
+-- NO Deposit/Withdraw hints: 1.x's bank-side warband widget (which is what carries the
+-- "Warband Money" + Deposit/Withdraw hint tooltip) hard-returns at file scope unless
+-- C_Bank.FetchDepositedMoney exists. This addon targets Classic Era (## Interface
+-- 11507-11509), which has no C_Bank at all — so on our client 1.x's bank money frame
+-- falls back to the plain PlayerMoney widget: the full cross-character tooltip, no
+-- warband line, and NO hint lines. Matching that is exactly "same as the inventory",
+-- which is why nothing bank-specific is added below.
+function Bank.ShowMoneyTooltip(GT, anchor)
     if not GT then return end
-    GT:SetOwner(anchor, "ANCHOR_LEFT")
-    if ns.Frame and ns.Frame.RenderMoneyTooltip then
-        ns.Frame.RenderMoneyTooltip(GT)
+    GT:SetOwner(anchor, "ANCHOR_TOP")
+    local render = ns.Frame and ns.Frame.RenderMoneyTooltip
+    if render then render(GT) end
+end
+
+-- Coin pickup on the BANK money bar (audit §4.5). 1.x fact: the coin-pickup click lives on
+-- the PlayerMoney widget itself (OpenCoinPickupFrame on the gold/silver/copper sub-buttons,
+-- suppressed only for a cached view) — and since our client resolves the bank's money frame
+-- to that very widget (see the C_Bank note above), 1.x DOES offer pickup on the bank's money
+-- bar. The bank window is the surface where pickup is legal, so it gets the same click the
+-- inventory bar has.
+--
+-- The DECISION is not re-implemented here: it comes from the one harness-locked pure model,
+-- Frame.MoneyClickAction (bank-only · self-only · combat-guarded). Only the pickup dialog's
+-- anchor differs — it hangs off the BANK window's money frame, not the inventory's, which is
+-- why this does not simply call Frame.OnMoneyClick.
+function Bank.OnMoneyClick()
+    local Frame = ns.Frame
+    if not (Frame and Frame.MoneyClickAction) then return end
+    local inCombat  = (_G.InCombatLockdown and _G.InCombatLockdown()) and true or false
+    local isSelf    = (Frame.ViewedOwnerKey and Frame.SelfKey
+                       and Frame.ViewedOwnerKey() == Frame.SelfKey()) and true or false
+    local atBank    = (_G.BankFrame and _G.BankFrame.IsShown and _G.BankFrame:IsShown()) and true or false
+    local hasPickup = (_G.OpenCoinPickupFrame ~= nil)
+    local action = Frame.MoneyClickAction({ inCombat = inCombat, isSelf = isSelf,
+                                            atBank = atBank, hasPickup = hasPickup })
+    if action == "combat" then
+        if ns.Print then ns:Print("Can't move money in combat.") end
         return
     end
-    GT:AddLine(_G.MONEY or "Money", UI.Color("text"))
-    GT:AddDoubleLine(_G.TOTAL or "Total", moneyString(Store.TotalMoney()), 1,1,1, 1,1,1)
-    GT:Show()
+    if action ~= "pickup" then return end   -- alt view / away from the bank / unsupported
+    local amount = (_G.GetMoney and _G.GetMoney()) or 0
+    local mf = Bank.window and Bank.window.money
+    if ns.SafeCall then ns:SafeCall(_G.OpenCoinPickupFrame, amount, mf, _G.UIParent)
+    else _G.OpenCoinPickupFrame(amount, mf, _G.UIParent) end
 end
 
 ----------------------------------------------------------------------
@@ -372,13 +413,23 @@ function Bank.Ensure()
     local money = _G.CreateFrame("Button", nil, win)
     money:SetSize(160, Bank.MONEY_H)
     money:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    -- Defensive mouse wiring, mirrored from the inventory money bar: explicitly enable mouse
+    -- and float the bar ABOVE the content grid's frame-level stack so a hover always lands on
+    -- it (the owner reported the inventory gold hover doing nothing before this was added; the
+    -- bank grid stacks the same way, so the same assertion belongs here).
+    money:EnableMouse(true)
+    money:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
     local moneyFS = money:CreateFontString(nil, "OVERLAY")
     moneyFS:SetFontObject(UI.fonts.numeral or UI.fonts.body)
     moneyFS:SetPoint("RIGHT", money, "RIGHT", 0, 0)
     moneyFS:SetJustifyH("RIGHT")
     UI.Skin(moneyFS, function(self) self:SetTextColor(UI.Color("text")) end)
-    money:SetScript("OnEnter", function(self) showMoneyTooltip(self) end)
+    money:SetScript("OnEnter", function(self) Bank.ShowMoneyTooltip(_G.GameTooltip, self) end)
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
+    -- Coin pickup: left-click to pick up coins — self-only, combat-guarded, and only while
+    -- actually at the bank (all decided by Frame.MoneyClickAction via Bank.OnMoneyClick).
+    money:RegisterForClicks("LeftButtonUp")
+    money:SetScript("OnClick", function() Bank.OnMoneyClick() end)
     win.money, win.moneyFS = money, moneyFS
 
     -- Free/total bank-slot counter, bottom-CENTER (sibling of the inventory SlotCount).
@@ -556,8 +607,11 @@ function Bank.Rebuild()
     local Frame = ns.Frame
     local renderOwner, live, isSelf, viewed = bankRenderModel()
 
-    -- owner selector face
-    if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector.Refresh() end
+    -- Owner selector face. MUST be a COLON call: ui_owner defines it as `function frame:Refresh()`
+    -- and the body dereferences self._name / self._pip, so a dot call passes self = nil and hard
+    -- errors. Bank.Open calls Bank.Rebuild UNPROTECTED, so that error aborted the repaint before
+    -- the title, money and grid were ever painted — the bank window came up blank.
+    if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
 
     -- Gold title "<Character>'s Bank" for the VIEWED owner (1.0 TitleBank).
     if win.title then
@@ -569,7 +623,14 @@ function Bank.Rebuild()
         win.title:SetText(Bank.WindowTitle(nm))
     end
 
-    -- money (viewed owner)
+    -- money (viewed owner). The "Show money bar" toggle (audit §9.4) is honored here exactly as
+    -- the inventory window honors it, off the SAME predicate — 1.x carries one per-frame `money`
+    -- profile flag that both its inventory and bank frames read, so one option must govern both
+    -- surfaces. The bottom band stays either way (it also holds the slot counter).
+    if win.money then
+        local shown = not (Frame and Frame.MoneyShown) or Frame.MoneyShown()
+        win.money:SetShown(shown and true or false)
+    end
     if win.moneyFS then win.moneyFS:SetText(moneyString(viewed and viewed.money or 0)) end
 
     -- free/total bank-slot counter, bottom-center (sibling of the inventory SlotCount)
@@ -813,9 +874,107 @@ local function testBankTitleAndCounts(fails)
     ck(select(2, Bank.SlotCounts(nil)) == 0, "nil owner -> 0 total")
 end
 
+-- MONEY TOOLTIP (1.x parity): the bank money hover must anchor ANCHOR_TOP (1.x's money widget
+-- family fixes that anchor and the bank widget inherits it), must delegate its whole content to
+-- the ONE money model, and must add NO lines of its own — on Classic Era 1.x's bank money frame
+-- resolves to the plain player-money widget, so there are no Deposit/Withdraw hints to match.
+local function testMoneyTooltip(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- Recording GameTooltip stub: captures the owner/anchor and every line the bank itself adds.
+    local function newGT()
+        local gt = { owner = nil, anchor = nil, lines = 0, shown = false }
+        function gt:SetOwner(o, a) self.owner, self.anchor = o, a end
+        function gt:ClearLines() self.lines = 0 end
+        function gt:AddLine() self.lines = self.lines + 1 end
+        function gt:AddDoubleLine() self.lines = self.lines + 1 end
+        function gt:Show() self.shown = true end
+        return gt
+    end
+
+    local Frame = ns.Frame
+    local saved = Frame and Frame.RenderMoneyTooltip
+    local rendered
+    if Frame then Frame.RenderMoneyTooltip = function(gt) rendered = gt end end
+
+    local anchorFrame = { tag = "bank money bar" }
+    local gt = newGT()
+    Bank.ShowMoneyTooltip(gt, anchorFrame)
+    ck(gt.anchor == "ANCHOR_TOP", "bank money tip anchors ANCHOR_TOP (1.x), got " .. tostring(gt.anchor))
+    ck(gt.owner == anchorFrame, "tip owned by the money bar it was hovered on")
+    ck(rendered == gt, "content delegated to the one money model (Frame.RenderMoneyTooltip)")
+    ck(gt.lines == 0, "bank adds NO lines of its own (no Deposit/Withdraw hint), got " .. gt.lines)
+
+    -- No money model installed -> no divergent local fallback tooltip is painted.
+    if Frame then Frame.RenderMoneyTooltip = nil end
+    local gt2 = newGT()
+    Bank.ShowMoneyTooltip(gt2, anchorFrame)
+    ck(gt2.anchor == "ANCHOR_TOP", "anchor still ANCHOR_TOP without the model")
+    ck(gt2.lines == 0 and gt2.shown == false,
+        "no money model -> bank paints nothing (no non-1.x fallback), got " .. gt2.lines .. " line(s)")
+
+    if Frame then Frame.RenderMoneyTooltip = saved end
+    Bank.ShowMoneyTooltip(nil, anchorFrame)   -- must not error
+end
+
+-- MONEY CLICK: the bank money bar offers the coin pickup (1.x fact: pickup lives on the same
+-- player-money widget our client resolves the bank's money frame to), gated by the ONE pure
+-- decision Frame.MoneyClickAction — self-only, at-bank-only, combat-guarded.
+local function testMoneyClick(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local Frame = ns.Frame
+    if not (Frame and Frame.MoneyClickAction) then
+        fails[#fails + 1] = "Frame.MoneyClickAction missing (the shared decision model)"
+        return
+    end
+
+    local sVOK, sSK = Frame.ViewedOwnerKey, Frame.SelfKey
+    local sBank, sPickup, sMoney, sCombat =
+        _G.BankFrame, _G.OpenCoinPickupFrame, _G.GetMoney, _G.InCombatLockdown
+
+    local picked
+    _G.OpenCoinPickupFrame = function(amount) picked = amount end
+    _G.GetMoney            = function() return 4321 end
+    _G.InCombatLockdown    = function() return false end
+    local atBank = true
+    _G.BankFrame = { IsShown = function() return atBank end }
+    Frame.ViewedOwnerKey = function() return "Tester-TestRealm" end
+    Frame.SelfKey        = function() return "Tester-TestRealm" end
+
+    picked = nil; Bank.OnMoneyClick()
+    ck(picked == 4321, "at bank + self + out of combat -> coin pickup opens, got " .. tostring(picked))
+
+    picked = nil; atBank = false; Bank.OnMoneyClick()
+    ck(picked == nil, "away from the bank -> no pickup")
+    atBank = true
+
+    picked = nil
+    Frame.ViewedOwnerKey = function() return "Alt-TestRealm" end
+    Bank.OnMoneyClick()
+    ck(picked == nil, "viewing an alt's cached money -> no pickup")
+    Frame.ViewedOwnerKey = function() return "Tester-TestRealm" end
+
+    picked = nil
+    _G.InCombatLockdown = function() return true end
+    Bank.OnMoneyClick()
+    ck(picked == nil, "in combat -> no pickup")
+    _G.InCombatLockdown = function() return false end
+
+    picked = nil
+    _G.OpenCoinPickupFrame = nil
+    Bank.OnMoneyClick()   -- client without the pickup surface: must be a silent no-op, not an error
+    ck(picked == nil, "no pickup surface -> silent no-op")
+
+    Frame.ViewedOwnerKey, Frame.SelfKey = sVOK, sSK
+    _G.BankFrame, _G.OpenCoinPickupFrame, _G.GetMoney, _G.InCombatLockdown =
+        sBank, sPickup, sMoney, sCombat
+end
+
 function Bank.RunSelfTests(verbose)
     local suites = {
         { name = "bank container order",   fn = testBankContainerOrder },
+        { name = "money tooltip (1.x)",    fn = testMoneyTooltip },
+        { name = "money click (pickup)",   fn = testMoneyClick },
         { name = "title + slot counts",    fn = testBankTitleAndCounts },
         { name = "purchase-state matrix",  fn = testPurchaseStateMatrix },
         { name = "cached-view proxy",      fn = testCachedViewProxy },
