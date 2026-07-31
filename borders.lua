@@ -26,7 +26,7 @@
 --
 -- Split into a PURE decision layer (ShouldShow / QualityRGB / TierPx / Desaturate /
 -- Enabled — headless-testable) and a thin FRAME layer (Attach / Apply / SetAlpha —
--- in-game only, guarded on _G.CreateFrame). Fresh code — no Bagnon lines.
+-- in-game only, guarded on _G.CreateFrame). Fresh code — no lines copied from 1.x.
 --
 -- Toggle: Store.db.qualityBorders (defaults ON when unset).
 
@@ -71,6 +71,14 @@ function Borders.UnusableRGB()
     local rc = _G.RED_FONT_COLOR
     if rc and rc.r then return rc.r, rc.g, rc.b end
     return 1, 0.1, 0.1
+end
+
+-- QUEST gold — the exact 1.x glowQuest color, a literal triple in 1.x's UpdateBorder
+-- (`r,g,b = 1, .82, .2`), applied to the icon border/overlay at full alpha. Kept as a
+-- literal here for the same reason: it is NOT NORMAL_FONT_COLOR (which is 1, .82, 0), so
+-- routing it through a Blizzard global would silently shift the blue channel.
+function Borders.QuestRGB()
+    return 1, 0.82, 0.2
 end
 
 ----------------------------------------------------------------------
@@ -265,15 +273,32 @@ function Borders.Attach(button)
     return b
 end
 
--- Color (or hide) a button's edge. `unusable` (1.x glowUnusable) draws a RED border that
--- WINS over the quality edge (1.x precedence: unusable > quality). Otherwise a FULL-
--- SATURATION quality edge is drawn when the quality clears the configurable floor. Honors
--- the store toggle live. Recolor/resize/show/hide of the edge textures only — safe on
--- every repaint, even in combat.
-function Borders.Apply(button, quality, unusable)
+-- Color (or hide) a button's edge. Precedence is 1.x's UpdateBorder chain, top down:
+--   quest (gold)  >  unusable (red)  >  quality (rarity)
+-- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the border half of
+-- 1.x's quest treatment, the bang glyph being reserved for quest STARTERS (ui_items draws
+-- that). `unusable` (1.x glowUnusable) draws a RED border. Otherwise a FULL-SATURATION
+-- quality edge is drawn when the quality clears the configurable floor. Honors the store
+-- toggle live. Recolor/resize/show/hide of the edge textures only — safe on every repaint,
+-- even in combat.
+function Borders.Apply(button, quality, unusable, quest)
     local b = Borders.Attach(button)
     if not b then return end
     local enabled = Borders.Enabled()
+
+    -- QUEST gold border — 1.x's FIRST branch, so it wins over both unusable and rarity.
+    if enabled and quest then
+        local qr, qg, qb = Borders.QuestRGB()
+        b._pxTier = 2
+        layoutEdges(b)
+        forEachEdge(b, function(t)
+            if t.SetVertexColor then t:SetVertexColor(qr, qg, qb, 1) end
+            t:Show()
+        end)
+        if b.SetAlpha then b:SetAlpha(1) end
+        b:Show()
+        return
+    end
 
     -- UNUSABLE red border — the "can't use" cue, overriding rarity on that cell. A prominent
     -- 2px so it reads at a glance. Gated by the same Item-borders toggle as the quality edge.

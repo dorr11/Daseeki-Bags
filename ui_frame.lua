@@ -297,87 +297,11 @@ function Frame.CursorIsBag(kind, equipLoc)
     return equipLoc == "INVTYPE_BAG"
 end
 
--- PURE: cross-account gold tooltip lines. Ordered { label, copper, isTotal }: the
--- "All characters" grand total first, then each account by copper desc then label asc.
--- Harness-locked so the money tooltip content is provable; the live OnEnter only
--- formats copper into coin strings.
-function Frame.BuildMoneyLines(total, byAccount)
-    local lines = { { label = "All characters", copper = total or 0, isTotal = true } }
-    local accts = {}
-    for acct, copper in pairs(byAccount or {}) do
-        accts[#accts + 1] = { label = (acct ~= "" and acct) or "Unlinked", copper = copper or 0 }
-    end
-    table.sort(accts, function(a, b)
-        if a.copper ~= b.copper then return a.copper > b.copper end
-        return tostring(a.label) < tostring(b.label)
-    end)
-    for _, a in ipairs(accts) do lines[#lines + 1] = a end
-    return lines
-end
-
--- PURE: the 1.0 Money-tooltip structure (playerMoney.lua parity). Builds an ordered row
--- list from per-character descriptors:
---   chars = { { name, class, account, faction, copper }, ... }
---   opts  = { selfAccount, minCopper (default 0, from moneyTooltipMinGold*10000),
---             maxPerGroup (default 5),
---             sameFactionOnly (bool), selfFaction (this char's faction, e.g. "Horde") }
--- Behavior matched from 1.x: characters split into THIS account ("mine") vs OTHER accounts;
--- within each group, money>0 AND >=minCopper, sorted by copper DESC then name; the first
--- `maxPerGroup` shown, the rest summed into one "Others" rollup line; the Other-Accounts
--- group is preceded by a spacer + an "Other Accounts" section header; a "Total" footer holds
--- the grand total. The same-faction filter (audit §4.4) is applied UP FRONT — a filtered-out
--- character contributes to neither the rows NOR the total (it's a same-faction view). A char
--- with an unknown (nil) faction is never filtered out (we can't prove it's the other faction).
--- Row kinds: "char" | "others" | "spacer" | "section" | "total". Harness-locked.
-function Frame.BuildMoneyReport(chars, opts)
-    opts = opts or {}
-    local selfAccount = opts.selfAccount
-    local minCopper   = opts.minCopper or 0
-    local maxPerGroup = opts.maxPerGroup or 5
-    local haveSelf    = (selfAccount ~= nil and selfAccount ~= "")
-    local factionGate = opts.sameFactionOnly and opts.selfFaction and opts.selfFaction ~= ""
-
-    local mine, others, total = {}, {}, 0
-    for _, c in ipairs(chars or {}) do
-        -- Same-faction filter: drop opposite-faction characters entirely (rows + total).
-        -- Unknown faction (nil) is kept — we never hide gold we can't prove is cross-faction.
-        if not (factionGate and c.faction ~= nil and c.faction ~= opts.selfFaction) then
-            local copper = c.copper or 0
-            total = total + copper
-            if copper > 0 and copper >= minCopper then
-                local acct = c.account or ""
-                local isMine = (not haveSelf) or (acct == selfAccount)
-                local row = { kind = "char", name = c.name or "?", class = c.class, account = acct, copper = copper }
-                if isMine then mine[#mine + 1] = row else others[#others + 1] = row end
-            end
-        end
-    end
-    local function sortGroup(g)
-        table.sort(g, function(a, b)
-            if a.copper ~= b.copper then return a.copper > b.copper end
-            return tostring(a.name):lower() < tostring(b.name):lower()
-        end)
-    end
-    sortGroup(mine); sortGroup(others)
-
-    local rows = {}
-    local function emitGroup(g)
-        local overflow = 0
-        for i, row in ipairs(g) do
-            if i <= maxPerGroup then rows[#rows + 1] = row
-            else overflow = overflow + row.copper end
-        end
-        if overflow > 0 then rows[#rows + 1] = { kind = "others", copper = overflow } end
-    end
-    emitGroup(mine)
-    if #others > 0 then
-        rows[#rows + 1] = { kind = "spacer" }
-        rows[#rows + 1] = { kind = "section", label = "Other Accounts" }
-        emitGroup(others)
-    end
-    rows[#rows + 1] = { kind = "total", copper = total }
-    return rows
-end
+-- NOTE (money model): ui_frame.lua no longer carries a money model. The FIRST CUT of it
+-- lived here (Frame.BuildMoneyLines / Frame.BuildMoneyReport / Frame.MoneyChars /
+-- Frame.RenderMoneyTooltip) and was superseded by the 1.x-parity model in ui_owner.lua
+-- (Owner.BuildMoneyReport / Owner.MoneyChars / Owner.RenderMoneyTooltip), which installs
+-- itself onto ns.Frame at load. The dead first cut is deleted — ONE money model only.
 
 ----------------------------------------------------------------------
 -- PURE: entry-list construction
@@ -685,66 +609,11 @@ local function moneyString(copper)
     return string.format("%dg %ds %dc", g, s, c)
 end
 
--- Class-color for a money row's character name (RAID_CLASS_COLORS; cream fallback).
-local function classColor(class)
-    local c = class and _G.RAID_CLASS_COLORS and _G.RAID_CLASS_COLORS[class]
-    if c then return c.r, c.g, c.b end
-    if UI and UI.Color then return UI.Color("text") end
-    return 0.9294, 0.9020, 0.8706
-end
-
--- Live per-character money descriptors from the store (for the Money tooltip).
-function Frame.MoneyChars()
-    local out = {}
-    if Store and Store.ForEachOwner then
-        Store.ForEachOwner(function(_, o)
-            out[#out + 1] = { name = o.name or "?", class = o.class, account = o.account or "",
-                              faction = o.faction, copper = o.money or 0 }
-        end)
-    end
-    return out
-end
-
--- Render the 1.0-format cross-character Money tooltip into GT: "Money" header, class-colored
--- per-character rows with right-aligned coin-icon amounts, an "Others" rollup, an "Other
--- Accounts" section, and a grey "Total" footer. Shared by the inventory + bank money bars so
--- the two read identically. Content comes from the pure Frame.BuildMoneyReport.
-function Frame.RenderMoneyTooltip(GT)
-    if not GT then return end
-    local function tok(name) if UI and UI.Color then return UI.Color(name) end return 1, 1, 1 end
-    GT:ClearLines()
-    GT:AddLine(_G.MONEY or "Money", tok("text"))
-    local selfAccount = Store and Store.data and Store.data.selfAccount
-    local db          = Store and Store.db
-    local minGold     = (db and db.moneyTooltipMinGold) or 0
-    -- Same-faction filter (audit §4.4). Default OFF (additive; unchanged 2.0 behavior — see
-    -- the deliverable note: the exact 1.x default is unverifiable under clean-room, so we take
-    -- the no-regression choice). selfFaction from the live UnitFactionGroup.
-    local sameFaction = db and db.moneyTooltipFaction == true
-    local selfFaction = _G.UnitFactionGroup and _G.UnitFactionGroup("player") or nil
-    local rows = Frame.BuildMoneyReport(Frame.MoneyChars(), {
-        selfAccount = selfAccount, minCopper = (minGold or 0) * 10000, maxPerGroup = 5,
-        sameFactionOnly = sameFaction, selfFaction = selfFaction,
-    })
-    for _, row in ipairs(rows) do
-        if row.kind == "char" then
-            local r, g, b = classColor(row.class)
-            GT:AddDoubleLine(row.name, moneyString(row.copper), r, g, b, r, g, b)
-        elseif row.kind == "others" then
-            local mr, mg, mb = tok("muted")
-            GT:AddDoubleLine("Others", moneyString(row.copper), mr, mg, mb, mr, mg, mb)
-        elseif row.kind == "spacer" then
-            GT:AddLine(" ")
-        elseif row.kind == "section" then
-            local fr, fg, fb = tok("faint")
-            GT:AddLine(row.label, fr, fg, fb)
-        elseif row.kind == "total" then
-            local mr, mg, mb = tok("muted")
-            GT:AddDoubleLine(_G.TOTAL or "Total", moneyString(row.copper), mr, mg, mb, mr, mg, mb)
-        end
-    end
-    GT:Show()
-end
+-- Frame.MoneyChars / Frame.RenderMoneyTooltip are DEFINED IN ui_owner.lua (it installs them
+-- onto ns.Frame — the same table as this file's `Frame` — at load, after this file). They are
+-- intentionally absent here: the first cut that lived in this file is deleted (see the money
+-- model note above), so the tooltip has exactly one implementation. Call sites guard on
+-- presence rather than assume the install ran.
 
 -- PURE: decide what a click on the money display should do (audit §4.5, "click coins to
 -- pick up/deposit at the bank the way the default UI does").
@@ -1062,15 +931,16 @@ function Frame.Ensure()
     UI.Skin(moneyFS, function(self) self:SetTextColor(UI.Color("text")) end)
     -- 1.0-format cross-character Money tooltip (D1 sacred): "Money" header · class-colored
     -- per-character coin rows · Others rollup · Other Accounts section · Total footer.
+    -- ANCHOR_TOP is the 1.x fact: PlayerMoney overrides the generic Tipped anchor
+    -- (ANCHOR_LEFT/RIGHT by screen side) with a fixed ANCHOR_TOP for the money tip
+    -- (core/classes/playerMoney.lua GetTipAnchor), so the money tooltip rises above the
+    -- bar instead of flying off to the side. No click hint: 1.x's player-money tooltip
+    -- carries NO coin-pickup hint line at all (only the BANK's warband money shows the
+    -- Deposit/Withdraw hints, which is ui_bank's surface). The pickup click itself is
+    -- unchanged — it stays undocumented in the tip, exactly as in 1.x.
     money:SetScript("OnEnter", function(self)
-        _G.GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-        Frame.RenderMoneyTooltip(_G.GameTooltip)
-        -- Hint the bank-only coin pickup so the click is discoverable.
-        if _G.OpenCoinPickupFrame and _G.GameTooltip.AddLine then
-            _G.GameTooltip:AddLine(" ")
-            _G.GameTooltip:AddLine("Click at the bank to pick up coins.", UI.Color("muted"))
-            _G.GameTooltip:Show()
-        end
+        _G.GameTooltip:SetOwner(self, "ANCHOR_TOP")
+        if Frame.RenderMoneyTooltip then Frame.RenderMoneyTooltip(_G.GameTooltip) end
     end)
     money:SetScript("OnLeave", function() _G.GameTooltip:Hide() end)
     -- Coin pickup (audit §4.5): left-click the money display to pick up coins — bank-only,
@@ -1488,8 +1358,20 @@ function Frame.DebugMoney()
         tostring(m:IsShown()), tostring(m.IsMouseEnabled and m:IsMouseEnabled()),
         (m:GetLeft() or -1), (m:GetRight() or -1), (m:GetBottom() or -1), (m:GetTop() or -1),
         tostring(m:GetFrameLevel()), tostring(m:GetScript("OnEnter") ~= nil)))
-    for _, ln in ipairs(Frame.BuildMoneyLines(Store.TotalMoney(), Store.MoneyByAccount())) do
-        P(string.format("  %s = %s", ln.label, moneyString(ln.copper)))
+    -- Dump the ONE live money model (ui_owner.lua owns it; ns.Frame.MoneyChars is re-pointed
+    -- there at load), so the debug print can never drift from what the tooltip paints.
+    local report = ns.Owner and ns.Owner.BuildMoneyReport
+    if not (report and Frame.MoneyChars) then P("  money model unavailable (ui_owner not loaded)"); return end
+    for _, row in ipairs(report(Frame.MoneyChars(), {})) do
+        if row.kind == "char" then
+            P(string.format("  %s = %s", tostring(row.name), moneyString(row.copper)))
+        elseif row.kind == "others" then
+            P(string.format("  Others = %s", moneyString(row.copper)))
+        elseif row.kind == "section" then
+            P("  -- " .. tostring(row.label))
+        elseif row.kind == "total" then
+            P(string.format("  Total = %s", moneyString(row.copper)))
+        end
     end
 end
 
@@ -2201,96 +2083,17 @@ local function testCursorIsBag(fails)
     ck(Frame.CursorIsBag(nil, nil) == false, "empty cursor -> not a bag")
 end
 
--- MONEY LINES (Task 4): the cross-account gold tooltip builder — grand total first,
--- accounts by copper desc, empty account => "Unlinked", nil-safe.
-local function testMoneyLines(fails)
-    local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    local lines = Frame.BuildMoneyLines(1000, { ["acctA"] = 700, ["acctB"] = 300, [""] = 0 })
-    ck(lines[1].isTotal and lines[1].label == "All characters" and lines[1].copper == 1000, "grand total line first")
-    ck(lines[2].label == "acctA" and lines[2].copper == 700, "richest account second")
-    ck(lines[3].label == "acctB" and lines[3].copper == 300, "next account by copper desc")
-    ck(lines[4].label == "Unlinked" and lines[4].copper == 0, "empty account label -> Unlinked")
-    local solo = Frame.BuildMoneyLines(50, {})
-    ck(#solo == 1 and solo[1].copper == 50 and solo[1].isTotal, "no accounts -> just the total line")
-    ck(#Frame.BuildMoneyLines(nil, nil) == 1, "nil args -> one zero total line")
-    ck(Frame.BuildMoneyLines(nil, nil)[1].copper == 0, "nil total -> 0 copper")
-end
+-- MONEY: no money suite lives here any more. The model moved wholly to ui_owner.lua and
+-- its behavior (partition, 1.x anatomy, row cap + favorites, totals math incl. the
+-- same-faction gate, row formatting) is locked by the five "money: …" suites in that
+-- file's harness registration. The suites below stayed with ui_frame's own surfaces.
 
--- 1.0-PARITY money tooltip (item 2): per-character rows, Others rollup at >5, Other Accounts
--- section, grand-total footer, and the moneyTooltipMinGold display filter.
-local function testMoneyReport(fails)
-    local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    local G = 10000
-    local chars = {
-        { name = "Zed", class = "MAGE",    account = "A", copper = 100 * G },
-        { name = "Bob", class = "WARRIOR", account = "A", copper = 50 * G },
-        { name = "Amy", class = "PRIEST",  account = "A", copper = 10 * G },
-        { name = "Ann", class = "ROGUE",   account = "A", copper = 4 * G },
-        { name = "Abe", class = "DRUID",   account = "A", copper = 3 * G },
-        { name = "Ada", class = "SHAMAN",  account = "A", copper = 2 * G },   -- 6th in A -> overflow
-        { name = "Cid", class = "ROGUE",   account = "B", copper = 200 * G },
-        { name = "Rex", class = "HUNTER",  account = "B", copper = 5 * G },
-        { name = "Zip", class = "MAGE",    account = "A", copper = 0 },        -- money 0 -> excluded
-    }
-    local expTotal = (100 + 50 + 10 + 4 + 3 + 2 + 200 + 5 + 0) * G
-    local rows = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 5 })
-    -- self (A) group, copper desc: Zed, Bob, Amy, Ann, Abe (5 shown), then Others = Ada (2g).
-    ck(rows[1].kind == "char" and rows[1].name == "Zed", "richest self char first")
-    ck(rows[5].name == "Abe", "5th self char shown (cap)")
-    ck(rows[6].kind == "others" and rows[6].copper == 2 * G, "6th self char rolled into Others (2g)")
-    ck(rows[7].kind == "spacer" and rows[8].kind == "section" and rows[8].label == "Other Accounts",
-        "spacer + Other Accounts header before the other-account group")
-    ck(rows[9].kind == "char" and rows[9].name == "Cid" and rows[9].copper == 200 * G, "other-account richest first")
-    ck(rows[10].name == "Rex", "other-account second char")
-    ck(rows[#rows].kind == "total" and rows[#rows].copper == expTotal,
-        "Total footer = grand total of everyone, got " .. rows[#rows].copper)
-
-    -- moneyTooltipMinGold = 20g: only >=20g chars DISPLAYED (A: Zed,Bob; B: Cid); Total unchanged.
-    local rows2 = Frame.BuildMoneyReport(chars, { selfAccount = "A", minCopper = 20 * G, maxPerGroup = 5 })
-    ck(rows2[1].name == "Zed" and rows2[2].name == "Bob", "minGold: only >=20g self chars shown")
-    ck(rows2[3].kind == "spacer" and rows2[4].kind == "section", "minGold: no self Others (under cap)")
-    ck(rows2[5].kind == "char" and rows2[5].name == "Cid", "minGold: other-account Cid shown, Rex filtered")
-    ck(rows2[#rows2].kind == "total" and rows2[#rows2].copper == expTotal, "minGold: Total still counts everyone")
-
-    -- No self account known -> a single group, NO Other Accounts section, still a Total footer.
-    local rows3 = Frame.BuildMoneyReport(chars, { selfAccount = "", maxPerGroup = 99 })
-    for _, r in ipairs(rows3) do ck(r.kind ~= "section", "no self account -> no Other Accounts section") end
-    ck(rows3[#rows3].kind == "total", "single-group still has a Total footer")
-
-    -- Empty -> just a Total(0).
-    local empty = Frame.BuildMoneyReport({}, {})
-    ck(#empty == 1 and empty[1].kind == "total" and empty[1].copper == 0, "no chars -> Total 0 only")
-end
-
--- Parity-triage additions: same-faction money filter (§4.4), coin-click decision (§4.5),
--- money-bar toggle (§9.4), frame-lock drag gate (§9.8). All pure/headless.
+-- Parity-triage additions: coin-click decision (§4.5), money-bar toggle (§9.4),
+-- frame-lock drag gate (§9.8). All pure/headless. (The same-faction money filter, §4.4,
+-- is now locked by ui_owner's "money: totals math" suite alongside the model it belongs
+-- to — it was asserted twice while ui_frame still carried a money model of its own.)
 local function testTriageBits(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    local G = 10000
-
-    -- ── Same-faction money filter ──────────────────────────────────────────────
-    local chars = {
-        { name = "Horde1", account = "A", faction = "Horde",    copper = 100 * G },
-        { name = "Horde2", account = "A", faction = "Horde",    copper = 50 * G },
-        { name = "Ally1",  account = "A", faction = "Alliance", copper = 40 * G },
-        { name = "Unknown", account = "A", faction = nil,       copper = 7 * G },   -- unknown faction
-    }
-    -- filter OFF (default): everyone counts; total = 197g
-    local off = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9 })
-    ck(off[#off].kind == "total" and off[#off].copper == 197 * G, "faction filter off -> total counts all (197g)")
-    -- filter ON, self Horde: Alliance dropped from rows AND total; unknown faction KEPT
-    local on = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9,
-        sameFactionOnly = true, selfFaction = "Horde" })
-    local names = {}
-    for _, r in ipairs(on) do if r.kind == "char" then names[r.name] = true end end
-    ck(names.Horde1 and names.Horde2, "same-faction: own-faction chars shown")
-    ck(names.Ally1 == nil, "same-faction: opposite-faction char hidden")
-    ck(names.Unknown == true, "same-faction: unknown-faction char kept (never hide unprovable gold)")
-    ck(on[#on].kind == "total" and on[#on].copper == 157 * G, "same-faction: total EXCLUDES opposite faction (157g)")
-    -- filter ON but no selfFaction known -> behaves as OFF (can't filter safely)
-    local unk = Frame.BuildMoneyReport(chars, { selfAccount = "A", maxPerGroup = 9,
-        sameFactionOnly = true, selfFaction = nil })
-    ck(unk[#unk].copper == 197 * G, "same-faction with unknown self faction -> no filtering")
 
     -- ── Coin-click decision (MoneyClickAction) ─────────────────────────────────
     ck(Frame.MoneyClickAction({ inCombat = true, isSelf = true, atBank = true, hasPickup = true }) == "combat",
@@ -2374,8 +2177,6 @@ function Frame.RunSelfTests(verbose)
         { name = "1.0 anatomy",         fn = testParityAnatomy },
         { name = "container order",     fn = testContainerOrder },
         { name = "cursor is bag",       fn = testCursorIsBag },
-        { name = "money lines",         fn = testMoneyLines },
-        { name = "money report (1.0)",  fn = testMoneyReport },
         { name = "combined entries",    fn = testCombinedEntries },
         { name = "split groups",        fn = testSplitGroups },
         { name = "grid + window size",  fn = testGridAndWindowSize },
@@ -2388,7 +2189,7 @@ function Frame.RunSelfTests(verbose)
         { name = "effective mode",       fn = testEffectiveMode },
         { name = "strip slots",          fn = testStripSlots },
         { name = "strip button state",   fn = testStripButtonState },
-        { name = "triage bits (§4.4/§4.5/§9.4/§9.8)", fn = testTriageBits },
+        { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

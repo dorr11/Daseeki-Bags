@@ -74,9 +74,9 @@ Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 --     FrameXML constant TEXTURE_ITEM_QUEST_BANG. We reference the SAME constant from our
 --     own region (with the literal Era path as a guard so a nil constant can never leave
 --     an untextured object), anchored over the whole cell like the native region — so the
---     glyph lands exactly where 1.x puts it. (WHEN it shows is unchanged by this fix:
---     slotIsQuest's isQuestItem-or-questID trigger still marks every quest item, where
---     1.x reserves the bang for quest STARTERS and tints the border for the rest.)
+--     glyph lands exactly where 1.x puts it. WHEN it shows is now 1.x-exact too: the bang
+--     is reserved for quest STARTERS only, and an ordinary quest item gets the gold border
+--     tint instead (see Items.QuestFlags).
 --   NEW / SET — token-tinted pips, but round: a WHITE8X8 fill clipped by our shipped
 --     circular stencil (art/dot-mask.tga). Same size and same tokens as before; only the
 --     SHAPE changes (hard square -> anti-aliased dot). Masking degrades to the old square
@@ -92,6 +92,31 @@ Items.TEX_QUEST_BANG = "Interface\\ContainerFrame\\UI-Icon-QuestBang"
 
 function Items.QuestBangTexture()
     return _G.TEXTURE_ITEM_QUEST_BANG or Items.TEX_QUEST_BANG
+end
+
+-- PURE: split C_Container.GetContainerItemQuestInfo's answer into the two 1.x facts.
+-- Returns `isQuest, isStarter`.
+--
+-- 1.x rule, read as fact from its Item:GetQuestInfo (frames/inventory/item.lua):
+--     return info.isQuestItem, (info.questID and not info.isActive)
+-- ...consumed by UpdateBorder as `quest, bang`. So the DISTINGUISHING FIELD PAIR is
+-- questID + isActive, NOT isQuestItem:
+--   * isStarter (the bang) == the item carries a questID that is NOT yet active — i.e.
+--     right-clicking it STARTS that quest. `isActive` true means the quest is already in
+--     the log, so the item is just an objective and the bang is withheld.
+--   * isQuest (the gold border) == isQuestItem — every quest item, starter or not.
+-- 1.x paints the bang ONLY for a starter (`QuestBang:SetShown(bang)`) and tints the border
+-- for `(glowQuest and quest) or bang`, so a starter gets BOTH glyph and tint. glowQuest
+-- defaults ON in 1.x and 2.0 has no equivalent per-cue toggle, so it is treated as on —
+-- no new setting, no SavedVariables change.
+--
+-- A starter is reported as a quest item too, so a starter whose isQuestItem is somehow
+-- false still returns isQuest = true: the tint can never go missing under the glyph.
+function Items.QuestFlags(info)
+    if type(info) ~= "table" then return false, false end
+    local isStarter = (info.questID and not info.isActive) and true or false
+    local isQuest   = (info.isQuestItem or isStarter) and true or false
+    return isQuest, isStarter
 end
 
 -- PURE: the art contract for one per-slot marker.  kind = "quest" | "new" | "set".
@@ -384,10 +409,15 @@ end
 -- FULL-COLOR and drew a RED BORDER instead (RED_FONT_COLOR). So unusable now yields
 -- redBorder=true (drawn by borders.Apply, winning over the quality edge on that cell) while
 -- the icon stays normal. `unusableTint` is retired (kept false for back-compat readers).
---   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>, isUnusable=<bool>,
---           isSet=<bool> }
--- returns { icon, iconDesat, redBorder, unusableTint, showNewDot, showQuestTab, showSetMark,
---           dressAlpha }.
+-- 1.x QUEST SPLIT: `isQuest` (any quest item) and `isQuestStarter` (a quest STARTER) drive
+-- two different cues, exactly as 1.x does — the bang glyph is reserved for starters
+-- (showQuestTab), while every quest item takes the gold border tint (questBorder). The
+-- tint is 1.x's FIRST border branch, so it wins over the unusable red and the quality
+-- edge; redBorder is therefore suppressed on a quest cell so the two never fight.
+--   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>,
+--           isQuestStarter=<bool>, isUnusable=<bool>, isSet=<bool> }
+-- returns { icon, iconDesat, redBorder, questBorder, unusableTint, showNewDot,
+--           showQuestTab, showSetMark, dressAlpha }.
 -- The equipment-set tick (audit §2.8, Daseeki-Armory) is an INDEPENDENT corner marker — a
 -- subtle bronze corner tick, NOT a border, so the quality edge and the unusable red border
 -- keep full precedence on the cell edge. Like the other markers it recedes fully when dimmed.
@@ -395,17 +425,25 @@ function Items.ResolveState(ctx)
     ctx = ctx or {}
     local dimmed = ctx.dimmed and true or false
     local unusable = ctx.isUnusable and true or false
+    -- A starter is always a quest item, even if the caller only set the starter flag.
+    local starter = ctx.isQuestStarter and true or false
+    local quest   = (ctx.isQuest or starter) and true or false
     local icon
     if dimmed then icon = "dimmed"
     elseif ctx.quality == 0 then icon = "junk"
     else icon = "normal" end
+    local questBorder = (quest and not dimmed)
     return {
         icon         = icon,
         iconDesat    = (icon ~= "normal"),      -- junk/dimmed desaturate; unusable does NOT
-        redBorder    = (unusable and not dimmed),-- 1.0 glowUnusable: red border, icon full-color
+        -- 1.0 glowQuest: gold border, 1.x's first branch — it wins over the unusable red.
+        questBorder  = questBorder,
+        -- 1.0 glowUnusable: red border, icon full-color. Yields to the quest gold.
+        redBorder    = (unusable and not dimmed and not questBorder),
         unusableTint = false,                    -- retired (1.x kept the icon full-color)
         showNewDot   = (ctx.isNew and not dimmed) and true or false,
-        showQuestTab = (ctx.isQuest and not dimmed) and true or false,
+        -- 1.x reserves the bang glyph for quest STARTERS; ordinary quest items get the tint.
+        showQuestTab = (starter and not dimmed) and true or false,
         showSetMark  = (ctx.isSet and not dimmed) and true or false,
         dressAlpha   = Items.DressAlpha(dimmed),
     }
@@ -638,13 +676,13 @@ local function slotIsNew(button)
     return CN.IsNewItem(button._cid, button._slot) and true or false
 end
 
--- QUEST: container quest info (isQuestItem / active questID) — same source as the old
--- native bang, now surfaced as a warn-token tab instead of the yellow "!" art.
-local function slotIsQuest(button)
+-- QUEST: container quest info, split into the two 1.x cues. Returns `isQuest, isStarter`
+-- (see Items.QuestFlags for the exact 1.x rule): every quest item takes the gold border,
+-- and only a quest STARTER also takes the bang glyph.
+local function slotQuestFlags(button)
     local CC = _G.C_Container
-    if not (CC and CC.GetContainerItemQuestInfo and button._cid and button._slot) then return false end
-    local info = CC.GetContainerItemQuestInfo(button._cid, button._slot)
-    return (info and (info.isQuestItem or info.questID)) and true or false
+    if not (CC and CC.GetContainerItemQuestInfo and button._cid and button._slot) then return false, false end
+    return Items.QuestFlags(CC.GetContainerItemQuestInfo(button._cid, button._slot))
 end
 
 -- UNUSABLE: 1.x glowUnusable parity via CLASS PROFICIENCY (Items.ClassCannotEquip),
@@ -761,22 +799,24 @@ end
 local function applyDressState(button)
     local live = button._live and true or false
     local hasItem = button._data and button._data.id ~= nil
-    local isNew, isQuest, isUnusable, isSet = false, false, false, false
+    local isNew, isQuest, isStarter, isUnusable, isSet = false, false, false, false, false
     if hasItem and live then
         isNew      = slotIsNew(button)
-        isQuest    = slotIsQuest(button)
         isSet      = slotIsSet(button)
-        -- reuse the unusable verdict paintButton already computed (avoids a second
-        -- proficiency/level scan); recompute only if this path ran standalone.
+        -- reuse the verdicts paintButton already computed (avoids a second proficiency/level
+        -- scan and a second quest query); recompute only if this path ran standalone.
+        if button._questItem ~= nil then isQuest, isStarter = button._questItem, button._questStarter
+        else isQuest, isStarter = slotQuestFlags(button) end
         if button._unusable ~= nil then isUnusable = button._unusable else isUnusable = slotIsUnusable(button) end
     end
     local spec = Items.ResolveState({
-        quality    = button._quality,
-        dimmed     = button._dimmed,
-        isNew      = isNew,
-        isQuest    = isQuest,
-        isUnusable = isUnusable,
-        isSet      = isSet,
+        quality        = button._quality,
+        dimmed         = button._dimmed,
+        isNew          = isNew,
+        isQuest        = isQuest,
+        isQuestStarter = isStarter,
+        isUnusable     = isUnusable,
+        isSet          = isSet,
     })
     Items._applyDress(button, spec)
 end
@@ -797,7 +837,7 @@ local function updateCooldown(button)
 end
 
 -- Style the stack-count numeral once, at creation: ARIALN + OUTLINE (UI.fonts.numeral),
--- cream `text` token (NOT bright white — a Bagnon tell that glares on the dark well),
+-- cream `text` token (NOT bright white — 1.x's numeral glares on the dark well),
 -- bottom-right, −2px so the outline doesn't fatten the cell edge. SetItemButtonCount
 -- sets only the TEXT, so font/color/anchor persist across repaints from this one call.
 local function styleCount(button)
@@ -1015,11 +1055,14 @@ local function setWellState(button, filled)
 end
 
 -- PURE: the CELL border-presence matrix (1.0 parity — NO universal neutral ring). 1.x shows
--- no border on common/poor items or empties; a cell gets a ring ONLY for the unusable red
--- (which WINS) or a qualifying quality edge (uncommon+, per minQuality). Mirrors
--- borders.Apply so the two never disagree. Returns "unusable" | "quality" | "none".
-function Items.CellBorderKind(quality, unusable, enabled, minQuality)
+-- no border on common/poor items or empties; a cell gets a ring ONLY for the quest gold
+-- (which wins outright), the unusable red, or a qualifying quality edge (uncommon+, per
+-- minQuality). The order is 1.x's UpdateBorder branch chain — quest > unusable > quality.
+-- Mirrors borders.Apply so the two never disagree.
+-- Returns "quest" | "unusable" | "quality" | "none".
+function Items.CellBorderKind(quality, unusable, enabled, minQuality, quest)
     if not enabled then return "none" end            -- borders off / gate closed
+    if quest then return "quest" end                 -- gold tint: 1.x's first branch
     if unusable then return "unusable" end           -- red border wins over rarity
     if ns.Borders and ns.Borders.ShouldShow(quality, enabled, minQuality) then return "quality" end
     return "none"                                     -- common / poor / empty -> clean cell
@@ -1132,6 +1175,9 @@ local function paintButton(button)
         if button._live then updateCooldown(button) end
         button._pendingId = nil
         button._quality = nil
+        -- Clear the cached quest verdicts with the slot, so a recycled button can never
+        -- carry a stale bang/gold tint from the item that used to sit here.
+        button._questItem, button._questStarter = false, false
         applyDressState(button)   -- resets icon, hides markers, cascades alpha; well stays
         return
     end
@@ -1143,12 +1189,17 @@ local function paintButton(button)
     if _G.SetItemButtonCount then _G.SetItemButtonCount(button, (visual and visual.count) or 1) end
 
     local quality = visual and visual.quality
-    -- 1.0-PARITY: an UNUSABLE (class-can't-equip / below-level) item draws a RED border that
-    -- WINS over the quality edge (borders.Apply precedence). Computed once here (live only)
-    -- and cached on the button so applyDressState reuses it without a second scan.
+    -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > quality edge.
+    -- A quest item (starter or objective) draws the gold tint — 1.x's first branch. An
+    -- UNUSABLE (class-can't-equip / below-level) item draws the red. Both are computed once
+    -- here (live only) and cached on the button so applyDressState reuses them without a
+    -- second scan; the bang glyph is decided from _questStarter over in ResolveState.
+    local isQuest, isStarter = false, false
+    if button._live then isQuest, isStarter = slotQuestFlags(button) end
+    button._questItem, button._questStarter = isQuest, isStarter
     local unusable = (button._live and slotIsUnusable(button)) or false
     button._unusable = unusable
-    if ns.Borders then ns.Borders.Apply(button, quality, unusable) end
+    if ns.Borders then ns.Borders.Apply(button, quality, unusable, isQuest) end
     button._quality = quality
 
     -- FILLED -> raised card backing (no neutral ring — 1.0 clean cell). The ONLY border a
@@ -1603,27 +1654,81 @@ local function testStatePrecedence(fails)
     local uj = Items.ResolveState({ quality = 0, isUnusable = true })
     ck(uj.icon == "junk" and uj.redBorder == true, "unusable junk -> junk icon + red border")
 
-    -- markers are independent of icon treatment (a new, quest, set, unusable item shows all)
-    local m = Items.ResolveState({ quality = 3, isNew = true, isQuest = true, isSet = true, isUnusable = true })
+    -- markers are independent of icon treatment (a new, quest-STARTER, set, unusable item
+    -- shows all). Note the quest gold border takes the cell from the unusable red here.
+    local m = Items.ResolveState({ quality = 3, isNew = true, isQuestStarter = true, isSet = true, isUnusable = true })
     ck(m.showNewDot == true and m.showQuestTab == true and m.showSetMark == true,
-        "new+quest+set markers show alongside unusable")
-    -- the set tick is NOT a border — it never affects redBorder precedence
-    ck(m.redBorder == true, "set marker does not disturb the unusable red border")
+        "new+quest-starter+set markers show alongside unusable")
+    -- the set tick is NOT a border — it never affects border precedence
+    ck(m.questBorder == true and m.redBorder == false,
+        "quest gold wins the cell from the unusable red (1.x branch order)")
+    -- an unusable NON-quest item still gets the red
+    local mu = Items.ResolveState({ quality = 3, isSet = true, isUnusable = true })
+    ck(mu.redBorder == true and mu.questBorder == false, "unusable non-quest -> red border")
 
-    -- DIMMED outranks everything: icon=dimmed, ALL markers + red border suppressed, alpha 0.25
-    local d = Items.ResolveState({ quality = 0, isNew = true, isQuest = true, isSet = true, isUnusable = true, dimmed = true })
+    -- DIMMED outranks everything: icon=dimmed, ALL markers + both borders suppressed, alpha 0.25
+    local d = Items.ResolveState({ quality = 0, isNew = true, isQuestStarter = true, isSet = true, isUnusable = true, dimmed = true })
     ck(d.icon == "dimmed" and d.iconDesat == true, "dimmed outranks junk")
-    ck(d.redBorder == false, "dimmed suppresses the unusable red border")
+    ck(d.redBorder == false and d.questBorder == false, "dimmed suppresses both borders")
     ck(d.showNewDot == false and d.showQuestTab == false and d.showSetMark == false, "dimmed suppresses all markers")
     ck(d.dressAlpha == 0.25, "dimmed -> 0.25 dress alpha")
 
-    -- new-only, quest-only, set-only
+    -- 1.x QUEST SPLIT: an ORDINARY quest item (an objective already in the log) gets the
+    -- gold border and NO bang; a quest STARTER gets both.
+    local qo = Items.ResolveState({ quality = 1, isQuest = true })
+    ck(qo.questBorder == true, "ordinary quest item -> gold border")
+    ck(qo.showQuestTab == false, "ordinary quest item -> NO bang glyph (1.x reserves it for starters)")
+    local qs = Items.ResolveState({ quality = 1, isQuest = true, isQuestStarter = true })
+    ck(qs.showQuestTab == true and qs.questBorder == true, "quest starter -> bang glyph AND gold border")
+    -- a starter flagged alone still implies a quest item (the tint can't go missing)
+    local qs2 = Items.ResolveState({ quality = 1, isQuestStarter = true })
+    ck(qs2.questBorder == true and qs2.showQuestTab == true, "starter alone implies quest item")
+    -- a non-quest item takes neither cue
+    local nq = Items.ResolveState({ quality = 1 })
+    ck(nq.questBorder == false and nq.showQuestTab == false, "non-quest item -> no gold, no bang")
+
+    -- new-only, quest-starter-only, set-only
     local n = Items.ResolveState({ quality = 2, isNew = true })
     ck(n.showNewDot == true and n.showQuestTab == false and n.showSetMark == false and n.icon == "normal", "new-only marker")
-    local q = Items.ResolveState({ quality = 2, isQuest = true })
-    ck(q.showQuestTab == true and q.showNewDot == false and q.showSetMark == false, "quest-only marker")
+    local q = Items.ResolveState({ quality = 2, isQuestStarter = true })
+    ck(q.showQuestTab == true and q.showNewDot == false and q.showSetMark == false, "quest-starter-only marker")
     local st = Items.ResolveState({ quality = 2, isSet = true })
     ck(st.showSetMark == true and st.showNewDot == false and st.showQuestTab == false and st.icon == "normal", "set-only marker")
+end
+
+-- 1.x QUEST RULE (Items.QuestFlags): the exact field mechanism that separates a quest
+-- STARTER (bang glyph) from an ordinary quest item (gold border tint only). 1.x fact:
+--   Item:GetQuestInfo -> info.isQuestItem, (info.questID and not info.isActive)
+-- so the starter test is questID-present AND not-active — NOT isQuestItem.
+local function testQuestFlags(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function flags(info) local q, s = Items.QuestFlags(info); return q, s end
+
+    -- Ordinary quest OBJECTIVE: flagged a quest item, no questID at all.
+    local q, s = flags({ isQuestItem = true })
+    ck(q == true and s == false, "quest objective (no questID) -> quest, NOT a starter")
+
+    -- Quest STARTER: carries a questID that is not yet active (right-click starts it).
+    q, s = flags({ isQuestItem = true, questID = 1234, isActive = false })
+    ck(q == true and s == true, "questID + not active -> STARTER (bang)")
+
+    -- Same item once the quest is ACCEPTED: isActive true -> the bang is withheld, and it
+    -- stays an ordinary quest item (gold border only). This is the whole point of the rule.
+    q, s = flags({ isQuestItem = true, questID = 1234, isActive = true })
+    ck(q == true and s == false, "questID but ALREADY ACTIVE -> quest, no bang")
+
+    -- A starter whose isQuestItem is somehow false still counts as a quest item, so the
+    -- tint can never go missing underneath the glyph.
+    q, s = flags({ questID = 77, isActive = false })
+    ck(q == true and s == true, "starter without isQuestItem still reads as a quest item")
+
+    -- Not a quest item at all / no info (offline owner, API absent).
+    q, s = flags({ isQuestItem = false })
+    ck(q == false and s == false, "non-quest item -> neither cue")
+    q, s = flags(nil)
+    ck(q == false and s == false, "nil info -> neither cue (nil-safe)")
+    q, s = flags({})
+    ck(q == false and s == false, "empty info -> neither cue")
 end
 
 -- DIM CASCADE covering ALL dress layers: a dimmed slot recedes icon + quality edge +
@@ -1967,10 +2072,12 @@ local function testDaseekiCellVsQualityEdge(fails)
         "border only at uncommon+ (common/poor draw no ring — 1.0 clean cell)")
 end
 
--- 1.0-PARITY grey-border removal: the CELL border-presence matrix. Common/poor/empty draw
--- NO ring (the universal neutral hairline is gone); uncommon+ get the quality edge; unusable
--- gets red (winning over quality); borders-off draws nothing. This is the styling the KEYRING
--- keys inherit too — keys are common quality, so they render as clean dark cells like 1.x.
+-- 1.0-PARITY grey-border removal + the 1.x quest tint: the CELL border-presence matrix.
+-- Common/poor/empty draw NO ring (the universal neutral hairline is gone); uncommon+ get the
+-- quality edge; unusable gets red (winning over quality); a QUEST item gets the gold tint,
+-- which is 1.x's first branch and wins over both; borders-off draws nothing. This is the
+-- styling the KEYRING keys inherit too — keys are common quality, so they render as clean
+-- dark cells like 1.x.
 local function testCellBorderMatrix(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local K = Items.CellBorderKind
@@ -1984,12 +2091,27 @@ local function testCellBorderMatrix(fails)
     -- unusable red WINS over quality (and over common)
     ck(K(4, true, true, 2)    == "unusable", "unusable epic -> red (wins over quality)")
     ck(K(1, true, true, 2)    == "unusable", "unusable common -> red")
+    -- QUEST gold wins over EVERYTHING (1.x UpdateBorder branch order)
+    ck(K(1, false, true, 2, true) == "quest", "quest common -> gold tint (no quality edge to beat)")
+    ck(K(4, false, true, 2, true) == "quest", "quest epic -> gold tint wins over the quality edge")
+    ck(K(4, true, true, 2, true)  == "quest", "quest + unusable -> gold tint wins over the red")
+    ck(K(nil, false, true, 2, false) == "none", "explicit non-quest is inert")
     -- configurable floor raises where the quality ring starts
     ck(K(2, false, true, 3)   == "none",    "min=Rare -> uncommon has no ring")
     ck(K(3, false, true, 3)   == "quality", "min=Rare -> rare gets the quality edge")
-    -- borders OFF -> nothing at all, even unusable
+    -- borders OFF -> nothing at all, even unusable or quest
     ck(K(4, true, false, 2)   == "none", "borders off -> no ring at all (even unusable)")
     ck(K(2, false, false, 2)  == "none", "borders off -> uncommon draws no ring")
+    ck(K(4, false, false, 2, true) == "none", "borders off -> quest draws no ring either")
+
+    -- The 1.x quest gold itself: (1, .82, .2), read as fact from 1.x's UpdateBorder. It is
+    -- deliberately NOT NORMAL_FONT_COLOR (1, .82, 0) — the blue channel is .2.
+    local r, g, b = ns.Borders.QuestRGB()
+    ck(r == 1 and g == 0.82 and b == 0.2, "quest gold is exactly 1, .82, .2 (1.x fact)")
+    -- ...and it stays distinguishable from the unusable red on the same cell edge.
+    local ur = select(1, ns.Borders.UnusableRGB())
+    local _, ug = ns.Borders.UnusableRGB()
+    ck(g > ug and ur >= r - 1e-9, "quest gold separates from the unusable red by the green channel")
 end
 
 -- RUN SPLIT (1.0 keyring row-break). The defect: the keyring began at flat index
@@ -2130,6 +2252,7 @@ function Items.RunSelfTests(verbose)
         { name = "dim + cached age",   fn = testDimAndAge },
         { name = "cell clamp",         fn = testCellClamp },
         { name = "state precedence",   fn = testStatePrecedence },
+        { name = "quest flags (1.x)",  fn = testQuestFlags },
         { name = "dim cascade",        fn = testDimCascade },
         { name = "slot-art neutralized", fn = testSlotArtNeutralized },
         { name = "kill-list resurrection", fn = testKillListResurrection },
