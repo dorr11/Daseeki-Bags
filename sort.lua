@@ -11,24 +11,31 @@
 --     Sort.PartitionWaves(moves)            — ordered moves -> waves of slot-disjoint moves
 --
 --   EXECUTOR (in-game only; guarded on _G):
---     Sort.Run(cids, opts)                  — snapshot cids, plan, partition into waves,
---     issue a whole wave of slot-disjoint moves per tick and wait on ITEM_LOCK_CHANGED /
---     GetContainerItemInfo(isLocked) for the touched slots to settle before the next
---     wave (report §3(b): ~1-3s full-bag sort, vs the old one-move-per-BAG_UPDATE tick).
---     Abort-clean on combat / window close / bank close. Accepts an explicit container-id
---     SET so W3 reuses it for the bank. No native sort exists on 1.15.9 (see below).
+--     Sort.Run(cids, opts)                  — OPTIMISTIC, flat-tick, re-planning. Every
+--     Sort.TICK (0.05s) it re-snapshots the containers, overlays its own predicted-lock /
+--     predicted-content table for moves still in flight, re-plans, and issues WAVE 1 of
+--     the dependency partition — then returns. It NEVER waits on a server round-trip.
+--     Converged when a plan taken on fully-observed state yields zero moves; bounded by a
+--     move budget + idle-tick + hard tick caps. Abort-clean on combat / window close /
+--     bank close. Accepts an explicit container-id SET so W3 reuses it for the bank.
+--     No native sort exists on 1.15.9 (see below). See the EXECUTOR banner for the full
+--     rationale and the defect-analysis §4 cost model this replaced.
 --
 -- ── Why the planner cannot infinite-loop ──────────────────────────────────────
 -- Sorting runs in two bounded phases over a fixed set of free (unlocked) cells:
---   Phase I (merge)  pours partial stacks of each item into its canonical shape.
---                    Each pour strictly lowers Σ(stacks − canonicalStacks) ≥ 0 by one,
---                    so it halts in ≤ (freeStacks − canonicalStacks) merges. After it,
---                    the multiset of (itemID, count) equals the target multiset.
+--   Phase I (merge)  pours partial stacks of each item into its canonical shape, in
+--                    PAIRWISE rounds. Each pour retires at least one open (partial) cell,
+--                    so a round of ⌊k/2⌋ pours retires ≥⌊k/2⌋ cells and the phase halts in
+--                    ⌈log2 k⌉ rounds and ≤ (freeStacks − canonicalStacks) merges. After
+--                    it, the multiset of (itemID, count) equals the target multiset.
 --   Phase II (swap)  is selection-sort over a permutation: cell i is filled with its
 --                    target stack by one swap with a later cell and never touched again,
 --                    so it halts in ≤ (freeCells − 1) swaps.
--- The move list is therefore FINITE and precomputed; the executor plays it back with a
--- strictly increasing index and aborts (never replans) on any drift — so nothing loops.
+-- Each plan is therefore FINITE. The executor re-plans every tick rather than replaying a
+-- frozen list, so drift is ABSORBED instead of fatal; termination comes from the planner
+-- being a fixed point (a sorted bag plans to zero moves) plus the explicit budget/tick
+-- caps above, and is proved empirically by the "executor convergence" suite below
+-- (randomized bags × simulated latency × dropped moves × mid-sort bag changes).
 --
 -- Catalog-verified (wow-api-catalog/1.15.9.68808): C_Container.GetContainerNumSlots,
 -- GetContainerItemInfo (isLocked field), PickupContainerItem, SplitContainerItem,
@@ -208,27 +215,52 @@ function Sort.Plan(state)
 
     ---------------------------------------------------------------
     -- PHASE I — merge each id's partial stacks into the canonical shape
+    --
+    -- PAIRWISE (tournament) merge, not a single accumulator. The old shape poured
+    -- every partial through ONE open accumulator cell, so k partials produced k-1
+    -- CONSECUTIVE moves that all claimed the same destination — each conflicting with
+    -- its predecessor, i.e. one wave apiece (defect analysis §4: Phase I alone was
+    -- 12.3 of the typical bag's 18.6 waves, ~1.9 moves/wave).
+    --
+    -- Instead, each ROUND pairs the still-open (non-full, id-bearing) cells in free
+    -- order — (o1<-o2), (o3<-o4), … — pouring the LATER into the EARLIER. Every move
+    -- in a round is slot-disjoint from the others in that round, so the whole round
+    -- batches into ONE wave. Each pour either fills its destination to max or empties
+    -- its source, so it retires at least one open cell: a round of ⌊k/2⌋ pours retires
+    -- ≥⌊k/2⌋ cells and the loop halts in ⌈log2 k⌉ rounds with ≤ k-1 total moves (never
+    -- MORE moves than the accumulator form, and log-depth instead of linear).
+    --
+    -- Invariants preserved: the earliest open cell is always a DESTINATION, never a
+    -- source, so "fill the earliest partial first" still holds (the descending fixed
+    -- point at :249-257 depends on it); the final multiset is the canonical shape
+    -- (loop exits only when ≤1 open cell remains for the id); and an already-canonical
+    -- bag has ≤1 open cell per id => zero merges => Plan stays idempotent.
     ---------------------------------------------------------------
     for _, id in ipairs(idOrder) do
         local max = maxStackOf(id)
         if max > 1 then   -- non-stackables (max 1) can never merge
-            local acc = nil   -- the current open (non-full, id-bearing) accumulator cell
-            for _, i in ipairs(free) do
-                if sim[i].id == id and sim[i].count > 0 then
-                    if acc == nil then
-                        acc = i
-                    else
-                        local ns2, nd2 = Sort.MergePour(sim[i].count, sim[acc].count, max)
-                        if nd2 > sim[acc].count then
-                            moves[#moves + 1] = { op = "merge", from = ref(i), to = ref(acc) }
-                            sim[i].count, sim[acc].count = ns2, nd2
-                            if ns2 == 0 then sim[i].id = nil end
-                        end
-                        if sim[acc].count >= max then
-                            acc = (sim[i].count > 0) and i or nil
-                        end
-                    end
+            while true do
+                -- open = cells still holding a PARTIAL stack of this id, in free order
+                local open = {}
+                for _, i in ipairs(free) do
+                    local s = sim[i]
+                    if s.id == id and s.count > 0 and s.count < max then open[#open + 1] = i end
                 end
+                if #open < 2 then break end
+                local progressed = false
+                local k = 1
+                while k + 1 <= #open do
+                    local dst, src = open[k], open[k + 1]   -- pour later -> earlier
+                    local ns2, nd2 = Sort.MergePour(sim[src].count, sim[dst].count, max)
+                    if nd2 > sim[dst].count then
+                        moves[#moves + 1] = { op = "merge", from = ref(src), to = ref(dst) }
+                        sim[src].count, sim[dst].count = ns2, nd2
+                        if ns2 == 0 then sim[src].id = nil end
+                        progressed = true
+                    end
+                    k = k + 2
+                end
+                if not progressed then break end   -- belt-and-suspenders: never spin
             end
         end
     end
@@ -325,15 +357,35 @@ end
 -- merges, then a selection-sort in Phase II). Playing it back one-move-per-tick with a
 -- BAG_UPDATE wait is correct but slow (~0.15s × 100 moves = 15-30s). PartitionWaves
 -- groups the SAME ordered list into WAVES of mutually slot-disjoint moves so a whole
--- wave can be issued in one tick without waiting between its moves:
---   * Greedy sequential: walk the moves in order; a move joins the current wave iff
---     none of its slots (source + dest) is already claimed by a move in that wave,
---     else it opens a new wave.
---   * This preserves the planner's order ACROSS waves — a move that conflicts with an
---     earlier one always lands in a LATER wave, so it still runs after it.
---   * Every move WITHIN a wave touches a disjoint slot set, so the moves commute and
---     issuing them together (no inter-move wait) yields the same result as in order.
--- Flattening the waves back therefore reproduces the original move sequence exactly.
+-- wave can be issued in one tick without waiting between its moves.
+--
+-- DEPENDENCY-GRAPH partition (was: a sequential RUN partition). Two moves are dependent
+-- exactly when they share a container slot; the move list is therefore a DAG whose edges
+-- run forward in plan order, and the wave index of a move is its longest-path depth:
+--
+--     wave(m) = 1 + max{ wave(m') : m' earlier in the plan and sharing a slot with m }
+--
+-- computed in O(n) with a per-slot "last wave that touched this slot" map. The OLD form
+-- closed the current wave on the FIRST conflict and never revisited it, so one conflicting
+-- move stranded every later move behind it even when dozens of slots were still free
+-- (defect analysis §4: 2.5-3.5× more waves than the dependency graph requires — typical
+-- bag 18.6 waves vs 7.0 optimal).
+--
+-- The three properties the executor and the tests rely on are unchanged:
+--   * SLOT-DISJOINT within a wave — a move only joins wave w when no move already in w
+--     touches either of its slots (its own predecessors all sit in waves < w, and any
+--     move in w is by construction slot-independent of it).
+--   * ORDER-PRESERVING across dependencies — a move that shares a slot with an earlier
+--     move lands in a STRICTLY later wave, so it still runs after it.
+--   * FLATTENING IS EQUIVALENT — flattening wave-by-wave can now move an independent
+--     move EARLIER than a plan-order predecessor, but only past moves it is slot-disjoint
+--     from (otherwise it would sit in a later wave). Slot-disjoint moves commute, so the
+--     flattened order has exactly the same effect as the planner's order.
+--
+-- Wave 1 has a further property the optimistic executor depends on: every wave-1 move
+-- depends on NO earlier move, so each one is valid against the OBSERVED bag state, not
+-- against a hypothetical post-plan state. That is what makes "issue wave 1, re-plan next
+-- tick" sound.
 ----------------------------------------------------------------------
 
 -- The container slots a single move touches (source + destination).
@@ -345,26 +397,23 @@ end
 
 function Sort.PartitionWaves(moves)
     local waves = {}
-    local cur, claimed
+    local lastWave = {}   -- [slotKey] = index of the last wave that touched this slot
     local function key(ref) return ref.cid .. ":" .. ref.slot end
-    local function newWave()
-        cur = { moves = {}, slots = {} }
-        claimed = {}
-        waves[#waves + 1] = cur
-    end
     for _, m in ipairs(moves or {}) do
         local slots = Sort.MoveSlots(m)
-        local conflict = false
-        if cur then
-            for _, ref in ipairs(slots) do
-                if claimed[key(ref)] then conflict = true; break end
-            end
-        end
-        if not cur or conflict then newWave() end
-        cur.moves[#cur.moves + 1] = m
+        -- earliest legal wave = one past the deepest wave any of our slots is already in
+        local w = 1
         for _, ref in ipairs(slots) do
-            claimed[key(ref)] = true
-            cur.slots[#cur.slots + 1] = ref
+            local lw = lastWave[key(ref)]
+            if lw and lw + 1 > w then w = lw + 1 end
+        end
+        -- w can never skip: it is at most (max lastWave) + 1 <= #waves + 1, so no holes.
+        local wave = waves[w]
+        if not wave then wave = { moves = {}, slots = {} }; waves[w] = wave end
+        wave.moves[#wave.moves + 1] = m
+        for _, ref in ipairs(slots) do
+            lastWave[key(ref)] = w
+            wave.slots[#wave.slots + 1] = ref
         end
     end
     return waves
@@ -384,22 +433,67 @@ function Sort.CarriedBagIDs()
 end
 
 -- =====================================================================
--- EXECUTOR (in-game only) — WAVE-BATCHED, lock-verified, abort-clean.
+-- EXECUTOR (in-game only) — OPTIMISTIC, flat-tick, re-planning, abort-clean.
 --
 -- Catalog verdict (wow-api-catalog/1.15.9.68808): Classic Era 1.15.9 has NO native
 -- container sort — there is no C_Container.SortBags / SortBags / SortBankBags (grep of
--- functions.txt finds only auction/calendar sorts). So the client-side planner remains
--- the sort, and this executor is the perf path (report §3(b)): issue a whole wave of
--- slot-disjoint moves per tick (Sort.PartitionWaves), then wait on ITEM_LOCK_CHANGED /
--- GetContainerItemInfo(isLocked) for the touched slots to settle before the next wave —
--- instead of one move per BAG_UPDATE tick. Target: a full-bag sort in ~1-3s.
+-- functions.txt finds only auction/calendar sorts). So the client-side planner IS the
+-- sort and this executor is the perf path.
 --
--- Not headless-tested (no WoW API under the harness); exercised by Drew's live pass.
--- The planner AND the wave partition it plays back ARE exhaustively tested above.
+-- ── Why this was rewritten (defect analysis §4) ──────────────────────────────
+-- The previous executor froze ONE plan, then per wave: issue the wave, poll every
+-- touched slot's live isLocked until the SERVER confirmed the swap, then wait another
+-- WAVE_THROTTLE before the next wave. Cost `N_waves × (RTT + 0.05 + frame quantization)`
+-- — at 200 ms latency the synchronous round-trip alone was ~80% of a 4.6 s sort. The
+-- owner's 1.x fork never waits on the server at all: it re-scans, re-plans and fires
+-- every currently-legal move on a flat 0.05 s cadence, which is why it feels instant.
+--
+-- ── What this executor does instead ──────────────────────────────────────────
+-- A flat `Sort.TICK` ticker. Every tick:
+--   1. Re-SNAPSHOT the live containers (so bag changes mid-sort are absorbed, not fatal).
+--   2. Overlay our own PREDICTED-LOCK table onto that snapshot: for every slot we have
+--      an outstanding move on, force `locked = true` and substitute the content we
+--      predicted the move would produce. The planner already treats locked cells as
+--      FIXED POINTS (never a source, never a destination, excluded from the target map),
+--      so in-flight slots are planned AROUND rather than planned against — and because
+--      the predicted content is what the move is about to deliver, the remaining cells
+--      get the same placement the full plan would have given them. That is what stops
+--      optimistic re-planning from oscillating (a re-plan against merely OBSERVED, i.e.
+--      pre-move, content would keep rearranging cells the in-flight moves already fixed).
+--      Predictions are dropped the moment reality can be observed (slot seen unlocked, or
+--      ITEM_LOCK_CHANGED reports it clear), and expire on `Sort.LOCK_TTL` regardless — so
+--      a FAILED or dropped move self-corrects on the very next tick.
+--   3. Re-PLAN from scratch (the planner is a documented fixed point, so this converges).
+--   4. Issue WAVE 1 ONLY of the dependency partition. Wave-1 moves depend on no earlier
+--      move, so each is valid against the state we just observed — never against a
+--      hypothetical post-plan state. Later waves are simply left for a later tick, by
+--      which time their dependencies have settled and they have become wave 1.
+--   5. Return immediately. NEVER wait for the server.
+-- Termination: converged when a plan with NO outstanding predictions yields zero moves.
+-- Bounded by a move budget (`MAX_MOVE_FACTOR`), an idle-tick cap and a hard tick cap;
+-- every one of those aborts cleanly through the same path as combat / bank / window.
+--
+-- Cost model: `Σ over dependency rounds of max(TICK, RTT)` with per-move granularity
+-- (independent chains progress in parallel and a move becomes issuable the instant ITS
+-- own dependency clears — there is no whole-wave barrier), against the old
+-- `N_waves × (RTT + 0.05 + quantization)` where N_waves was itself 2.5-3.5× the true
+-- dependency depth. Both multipliers are gone.
+--
+-- Correctness guard-rails, all preserved and covered by the convergence suite below:
+-- locked slots stay fixed points; family / canHold constraints are enforced by the
+-- planner on every re-plan; combat / bank-closed / window-closed abort immediately and
+-- clear the cursor. Items are only ever swapped or poured between two legal cells, so no
+-- reachable interleaving can drop or duplicate one.
 -- =====================================================================
 
-Sort.WAVE_THROTTLE    = 0.05   -- seconds between waves (~one frame; perf + taint-quiet)
-Sort.MAX_SETTLE_POLLS = 40     -- safety valve: force-advance a wave after 40×throttle (~2s)
+Sort.TICK               = 0.05   -- flat cadence; never waits on a server round-trip
+Sort.MAX_MOVES_PER_TICK = 24     -- cap the burst so the client never drops requests
+Sort.MAX_TICKS          = 200    -- hard wall (~10s) — safety valve, never hit normally
+Sort.MAX_IDLE_TICKS     = 40     -- ~2s with nothing issuable (slots stuck locked) => abort
+Sort.MAX_MOVE_FACTOR    = 4      -- issued-move budget = factor × initial plan + MOVE_SLACK
+Sort.MOVE_SLACK         = 32
+Sort.LOCK_TTL           = 3.00   -- backstop only: a slot locked THIS long is pathological
+Sort.QUIET_REFRESH      = 0.20   -- 5 Hz grid heartbeat while the refresh storm is muted
 
 local function inCombat()
     return _G.InCombatLockdown and _G.InCombatLockdown()
@@ -453,6 +547,11 @@ end
 
 -- Family-aware canHold: general bags (family 0) hold anything; a specialized bag
 -- holds an item only when their family bits overlap. Missing APIs => permissive.
+--
+-- BOTH lookups are memoized for the life of a run. Plan now runs ~20×/s (the optimistic
+-- executor re-plans every tick) and Plan's fit loop calls canHold O(stacks × cells)
+-- times, so an un-memoized C_Item.GetItemFamily here was thousands of API calls per
+-- second (defect analysis §4 "memoize GetItemFamily per run").
 local function makeCanHoldFn(cache)
     return function(cid, id)
         if cid == Store.BACKPACK_CONTAINER or cid == Store.BANK_CONTAINER then return true end
@@ -467,7 +566,12 @@ local function makeCanHoldFn(cache)
             cache["_bag" .. cid] = bagFamily
         end
         if bagFamily == 0 then return true end
-        local itemFamily = CI.GetItemFamily(id) or 0
+        local fkey = "_fam" .. tostring(id)
+        local itemFamily = cache[fkey]
+        if itemFamily == nil then
+            itemFamily = CI.GetItemFamily(id) or 0
+            cache[fkey] = itemFamily
+        end
         return band(bagFamily, itemFamily) ~= 0
     end
 end
@@ -502,13 +606,31 @@ local function snapshot(cids)
     return cells
 end
 
+-- Does a container slot currently hold anything? (PickupContainerItem is a NO-OP on an
+-- empty slot, so the executor has to know which end of a swap can start it.)
+local function slotHasItem(ref)
+    local CC = _G.C_Container
+    if not (CC and CC.GetContainerItemInfo) then return true end
+    local info = CC.GetContainerItemInfo(ref.cid, ref.slot)
+    return (info and info.itemID) and true or false
+end
+
 -- Perform one planned move via the container pickup/split primitives.
 local function performMove(m)
     local CC = _G.C_Container
     if not CC then return end
     if m.op == "swap" then
-        CC.PickupContainerItem(m.a.cid, m.a.slot)
-        CC.PickupContainerItem(m.b.cid, m.b.slot)
+        -- A "swap" is often really a MOVE into an empty cell, and PickupContainerItem
+        -- does nothing on an empty slot — issuing it in plan order would pick up the
+        -- OTHER end instead and the belt-and-suspenders ClearCursor would put it right
+        -- back, so the move silently never happened. (The old frozen-plan executor had
+        -- no way to notice: it never re-planned, so it just advanced and still printed
+        -- "sort complete" over a partly unsorted bag.) Exchanging two cells is symmetric,
+        -- so always START from the end that actually holds an item.
+        local first, second = m.a, m.b
+        if not slotHasItem(m.a) then first, second = m.b, m.a end
+        CC.PickupContainerItem(first.cid, first.slot)
+        CC.PickupContainerItem(second.cid, second.slot)
     elseif m.op == "merge" then
         CC.PickupContainerItem(m.from.cid, m.from.slot)
         CC.PickupContainerItem(m.to.cid, m.to.slot)
@@ -524,18 +646,110 @@ local function performMove(m)
     if _G.ClearCursor then _G.ClearCursor() end   -- belt-and-suspenders: never leave a held item
 end
 
+-- Monotonic seconds. GetTime() in-game; os.clock() headless (harness / simulator).
+local function nowSeconds()
+    if _G.GetTime then return _G.GetTime() end
+    return os.clock()
+end
+
+local function slotKey(cid, slot) return cid .. ":" .. slot end
+local function refKey(r) return r.cid .. ":" .. r.slot end
+
+----------------------------------------------------------------------
+-- Refresh-storm suppression (defect analysis §4 fix #2)
+--
+-- ui_frame registers ITEM_LOCK_CHANGED -> Frame.RequestRefresh() unconditionally, and
+-- capture re-scans EVERY container on BAG_UPDATE. A sort fires dozens of lock events per
+-- wave, so the OLD sort cost ~60-95 full grid rebuilds + full captures — each of which
+-- re-parses every category query from scratch. That FPS drag stretched every C_Timer.After
+-- in the executor's own loop, i.e. it made the sort measurably slower as well as janky.
+--
+-- sort.lua owns none of those files, so it mutes them for the duration of a run by
+-- swapping the two coalescing entry points for dirty-flag stubs, and restores them on
+-- EVERY exit path (completion and every abort). Identity-guarded in both directions: we
+-- only install over the function we captured, and only restore if OUR stub is still the
+-- one installed — so a reload or another consumer replacing them mid-sort is never
+-- clobbered. A `Sort.QUIET_REFRESH` heartbeat still repaints the grid at ~5 Hz so the
+-- sort stays visible, and the restore does one full capture + rebuild unconditionally.
+----------------------------------------------------------------------
+local function beginQuiet()
+    if Sort._quiet then return end
+    local q = { refreshes = 0 }
+    local F, C = ns.Frame, ns.Capture
+    if F and type(F.RequestRefresh) == "function" then
+        q.frameFn = F.RequestRefresh
+        q.frameStub = function() q.dirty = true end
+        F.RequestRefresh = q.frameStub
+    end
+    if C and type(C.RequestCapture) == "function" then
+        q.captureFn = C.RequestCapture
+        q.captureStub = function() q.dirty = true end
+        C.RequestCapture = q.captureStub
+    end
+    Sort._quiet = q
+end
+
+-- ~5 Hz repaint through the ORIGINAL refresh fn so the user watches the sort happen.
+local function quietHeartbeat(now)
+    local q = Sort._quiet
+    if not (q and q.frameFn) then return end
+    if now - (Sort._lastRefresh or 0) < Sort.QUIET_REFRESH then return end
+    Sort._lastRefresh = now
+    q.refreshes = q.refreshes + 1
+    if ns.SafeCall then ns:SafeCall(q.frameFn) else q.frameFn() end
+end
+
+local function endQuiet()
+    local q = Sort._quiet
+    if not q then return end
+    Sort._quiet = nil
+    local F, C = ns.Frame, ns.Capture
+    if F and q.frameFn and F.RequestRefresh == q.frameStub then F.RequestRefresh = q.frameFn end
+    if C and q.captureFn and C.RequestCapture == q.captureStub then C.RequestCapture = q.captureFn end
+    -- One full recapture + rebuild at the end, always (the sort definitely changed bags).
+    if C and C.RequestCapture then
+        if ns.SafeCall then ns:SafeCall(C.RequestCapture) else C.RequestCapture() end
+    end
+    if F and F.RequestRefresh then
+        if ns.SafeCall then ns:SafeCall(F.RequestRefresh) else F.RequestRefresh() end
+    end
+end
+
+----------------------------------------------------------------------
+-- Run lifecycle
+----------------------------------------------------------------------
+
 local function stopDriver()
     Sort._running = false
-    Sort._waiting = false
-    Sort._waves, Sort._w, Sort._gen, Sort._settlePolls, Sort._moveCount = nil, nil, nil, nil, nil
+    Sort._cids, Sort._pred, Sort._meta, Sort._canHold, Sort._cache = nil, nil, nil, nil, nil
+    Sort._ticks, Sort._idle, Sort._budget, Sort._lastIssued = nil, nil, nil, nil
+    Sort._tickGen = (Sort._tickGen or 0) + 1   -- invalidate any queued tick
     if Sort._driver then Sort._driver:UnregisterAllEvents() end
     if _G.ClearCursor then _G.ClearCursor() end
+    endQuiet()
+end
+
+-- Human-readable tail shared by the completion and abort prints. `_rounds` counts the
+-- ticks that actually issued moves — the direct analogue of the old wave counter, and
+-- the number the defect analysis asks the owner to read off a live sort.
+local function runStats()
+    local elapsed = nowSeconds() - (Sort._start or nowSeconds())
+    return string.format("%d moves in %d waves, %.2fs",
+        Sort._moveCount or 0, Sort._rounds or 0, elapsed)
 end
 
 local function abort(reason)
     if not Sort._running then return end
-    if ns.Print then ns:Print("sort stopped: " .. tostring(reason)) end
+    local stats = runStats()
     stopDriver()
+    if ns.Print then ns:Print("sort stopped: " .. tostring(reason) .. " (" .. stats .. ").") end
+end
+
+local function finish()
+    if not Sort._running then return end
+    local stats = runStats()
+    stopDriver()
+    if ns.Print then ns:Print("sort complete (" .. stats .. ").") end
 end
 
 -- Is a specific container slot still locked (mid-move, server not yet confirmed)?
@@ -548,74 +762,211 @@ local function slotLocked(cid, slot)
     return false
 end
 
--- Has every slot a wave touched settled (unlocked)? A no-op wave settles immediately.
-local function waveSettled(wave)
-    if not wave then return true end
-    for _, ref in ipairs(wave.slots) do
-        if slotLocked(ref.cid, ref.slot) then return false end
-    end
-    return true
+----------------------------------------------------------------------
+-- The predicted-lock / predicted-content table
+--
+-- _pred[slotKey] = { cid, slot, id, count, at }  — "we issued a move on this slot at
+-- `at`; when it lands the slot will hold {id,count}". Until then the slot is treated as
+-- LOCKED (a planner fixed point) holding its PREDICTED content.
+----------------------------------------------------------------------
+
+local function setPred(ref, id, count, now)
+    Sort._pred[refKey(ref)] = { cid = ref.cid, slot = ref.slot, id = id, count = count or 0, at = now }
 end
 
--- Advance to the next wave (or finish). Bumps the generation so any in-flight settle
--- poll for the wave just finished no-ops, and clears the waiting flag so a stray
--- ITEM_LOCK_CHANGED can't double-advance.
-local function advanceWave()
-    if not Sort._running or not Sort._waiting then return end
-    Sort._waiting = false
-    Sort._gen = (Sort._gen or 0) + 1
-    Sort._w = Sort._w + 1
-    if Sort._w > #Sort._waves then
-        if ns.Print then ns:Print("sort complete (" .. (Sort._moveCount or 0) .. " moves in " .. #Sort._waves .. " waves).") end
-        stopDriver()
-        if ns.Frame and ns.Frame.RequestRefresh then ns.Frame.RequestRefresh() end
-        return
+local function predOutstanding()
+    return next(Sort._pred) ~= nil
+end
+
+-- Drop a prediction once reality is observable for that slot. Called from the tick's
+-- overlay and (same-frame fast path) from ITEM_LOCK_CHANGED.
+--
+-- The lock state is the authority, NOT the clock: as long as the client still reports the
+-- slot locked the move is genuinely in flight, however slow the server is, and the
+-- prediction must stand — expiring it on a timer would hand the planner the stale
+-- pre-move contents and restart the churn the overlay exists to prevent. The TTL is only
+-- a backstop for a slot that stays locked pathologically long; a slot that is NOT locked
+-- is settled (or the move never happened), and reality wins immediately either way —
+-- which is exactly how a rejected or dropped move self-corrects.
+local function releasePred(key, now)
+    local p = Sort._pred[key]
+    if not p then return end
+    if not slotLocked(p.cid, p.slot) then
+        Sort._pred[key] = nil
+    elseif now - p.at >= Sort.LOCK_TTL then
+        Sort._pred[key] = nil
+    end
+end
+
+-- Fold the prediction table into a fresh snapshot: an in-flight slot shows the content
+-- its move is about to deliver, and — crucially — is NOT marked locked.
+--
+-- The live client reports isLocked on a slot we just moved and keeps showing its OLD
+-- contents until the server answers. Handing that to the planner as a LOCKED cell would
+-- make it a fixed point, so the target map would be re-derived over a shrinking free set
+-- every tick and keep reassigning cells the in-flight moves had already claimed —
+-- measured at ~2x the necessary moves. Instead we clear the lock and substitute the
+-- predicted content: our moves conserve the item multiset, so `totals` and the sorted
+-- target stack list are IDENTICAL on every tick, the target assignment is a stable fixed
+-- point, and each re-plan is simply the shrinking residual. The slot being unusable
+-- RIGHT NOW is a scheduling fact, and it is enforced where it belongs — at issue time.
+--
+-- A slot locked by something that is NOT ours (the user dragging an item) has no
+-- prediction, so it keeps locked = true and stays a true planner fixed point.
+local function overlayPredictions(cells, now)
+    if not predOutstanding() then return end
+    for key in pairs(Sort._pred) do releasePred(key, now) end
+    if not predOutstanding() then return end
+    for _, c in ipairs(cells) do
+        local p = Sort._pred[slotKey(c.cid, c.slot)]
+        if p then
+            c.id, c.count, c.locked = p.id, p.count, false
+        end
+    end
+end
+
+-- Record what a move we are about to issue will produce, and mirror the same effect onto
+-- the local cell model so several moves issued in one tick predict consistently. The
+-- arithmetic is exactly the planner's (MergePour / exchange) — see applyMoves in the
+-- tests, which is the same model.
+local function predictMove(m, byKey, maxStackOf, now)
+    if m.op == "swap" then
+        local a, b = byKey[refKey(m.a)], byKey[refKey(m.b)]
+        if not (a and b) then return end
+        local aid, acnt, bid, bcnt = a.id, a.count, b.id, b.count
+        a.id, a.count, b.id, b.count = bid, bcnt, aid, acnt
+        setPred(m.a, a.id, a.count, now)
+        setPred(m.b, b.id, b.count, now)
+    elseif m.op == "merge" then
+        local f, t = byKey[refKey(m.from)], byKey[refKey(m.to)]
+        if not (f and t) then return end
+        local id = t.id or f.id
+        local rs, rd = Sort.MergePour(f.count, t.count, maxStackOf(id))
+        t.id, t.count = id, rd
+        f.count = rs
+        if rs == 0 then f.id = nil end
+        setPred(m.from, f.id, f.count, now)
+        setPred(m.to, t.id, t.count, now)
+    end
+end
+
+-- Issue wave 1 of the dependency partition. Returns how many moves went out.
+local function issueWave1(plan, cells, now)
+    local wave = Sort.PartitionWaves(plan.moves)[1]
+    if not wave then return 0 end
+    local byKey = {}
+    for _, c in ipairs(cells) do byKey[slotKey(c.cid, c.slot)] = c end
+    local maxStackOf = function(id)
+        local m = id and Sort._meta(id)
+        return (m and m.maxStack) or 1
+    end
+    local issued = 0
+    for _, m in ipairs(wave.moves) do
+        if issued >= Sort.MAX_MOVES_PER_TICK then break end
+        if (Sort._moveCount or 0) >= (Sort._budget or 0) then break end
+        local slots = Sort.MoveSlots(m)
+        -- Defensive re-check against LIVE locks: the planner already excludes locked
+        -- cells, this only catches a lock that appeared between snapshot and issue.
+        local blocked = false
+        for _, r in ipairs(slots) do
+            if Sort._pred[refKey(r)] or slotLocked(r.cid, r.slot) then blocked = true; break end
+        end
+        if not blocked then
+            if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
+            predictMove(m, byKey, maxStackOf, now)
+            issued = issued + 1
+            Sort._moveCount = (Sort._moveCount or 0) + 1
+        end
+        -- A blocked wave-1 move is simply deferred; every other move in wave 1 is
+        -- slot-disjoint from it, so skipping it cannot invalidate any of them.
+    end
+    return issued
+end
+
+-- Schedule the next round. Generation-guarded so an ITEM_LOCK_CHANGED "kick" can pull the
+-- next round forward without ever running two rounds for one slot: bumping _tickGen
+-- makes every already-queued callback a no-op.
+local function scheduleTick(delay)
+    Sort._tickGen = (Sort._tickGen or 0) + 1
+    local gen = Sort._tickGen
+    local fn = function()
+        if Sort._running and gen == Sort._tickGen then Sort._tick() end
     end
     local after = _G.C_Timer and _G.C_Timer.After
-    if after then after(Sort.WAVE_THROTTLE, Sort._stepWave) else Sort._stepWave() end
+    if after then after(delay or Sort.TICK, fn) else fn() end
 end
 
--- Wait for the current wave's slots to unlock, then advance. Driven by a bounded
--- poll (the safety valve) AND fast-pathed by ITEM_LOCK_CHANGED in the driver.
-local function pollSettle(gen)
-    if not Sort._running or not Sort._waiting or gen ~= Sort._gen then return end
-    if waveSettled(Sort._waves[Sort._w]) then return advanceWave() end
-    Sort._settlePolls = (Sort._settlePolls or 0) + 1
-    if Sort._settlePolls > Sort.MAX_SETTLE_POLLS then return advanceWave() end   -- don't hang
-    local after = _G.C_Timer and _G.C_Timer.After
-    if after then after(Sort.WAVE_THROTTLE, function() pollSettle(gen) end) else advanceWave() end
-end
-
--- Issue one whole wave of slot-disjoint moves, then wait for it to settle.
-function Sort._stepWave()
+-- One optimistic round: snapshot -> overlay predictions -> re-plan -> issue wave 1.
+function Sort._tick()
     if not Sort._running then return end
+
+    -- Abort guards first, exactly as before (polled AND event-driven).
     if inCombat() then return abort("entered combat") end
     if Sort._needsBank and not bankIsOpen() then return abort("bank closed") end
     if ns.Frame and ns.Frame.IsShown and not ns.Frame.IsShown() and not Sort._needsBank then
         return abort("window closed")
     end
-    local wave = Sort._waves[Sort._w]
-    for _, m in ipairs(wave.moves) do
-        if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
+
+    Sort._ticks = (Sort._ticks or 0) + 1
+    if Sort._ticks > Sort.MAX_TICKS then return abort("time budget exceeded") end
+
+    local now = nowSeconds()
+    local cells = snapshot(Sort._cids)
+    if not cells then return abort("containers unavailable") end
+    overlayPredictions(cells, now)
+
+    local plan = Sort.Plan({
+        cells = cells, meta = Sort._meta, canHold = Sort._canHold, descending = Sort._desc,
+    })
+
+    local issued = 0
+    if #plan.moves == 0 then
+        -- Converged only when the plan is clean AND nothing of ours is still in flight,
+        -- i.e. the zero-move verdict was reached on fully OBSERVED state.
+        if not predOutstanding() then return finish() end
+    else
+        if (Sort._moveCount or 0) >= (Sort._budget or 0) then
+            return abort("not converging (move budget spent)")
+        end
+        issued = issueWave1(plan, cells, now)
+        if issued > 0 then Sort._rounds = (Sort._rounds or 0) + 1 end
     end
-    Sort._gen = (Sort._gen or 0) + 1
-    Sort._settlePolls = 0
-    Sort._waiting = true
-    pollSettle(Sort._gen)
+
+    Sort._lastIssued = issued
+    if issued > 0 then
+        Sort._idle = 0
+    else
+        Sort._idle = (Sort._idle or 0) + 1
+        if Sort._idle > Sort.MAX_IDLE_TICKS then
+            return abort("stalled (slots stayed locked)")
+        end
+    end
+
+    quietHeartbeat(now)
+    scheduleTick()
 end
 
 local function ensureDriver()
     if Sort._driver or not _G.CreateFrame then return end
     local f = _G.CreateFrame("Frame")
-    f:SetScript("OnEvent", function(_, event)
+    f:SetScript("OnEvent", function(_, event, a, b)
         if event == "PLAYER_REGEN_DISABLED" then abort("entered combat"); return end
         if event == "BANKFRAME_CLOSED" and Sort._needsBank then abort("bank closed"); return end
         if event == "ITEM_LOCK_CHANGED" then
-            -- Fast path: the moment the current wave's slots are all unlocked, advance
-            -- (the poll remains as the bounded fallback). advanceWave() clears _waiting
-            -- so a burst of lock events can't skip a wave.
-            if Sort._running and Sort._waiting and Sort._waves and waveSettled(Sort._waves[Sort._w]) then
-                advanceWave()
+            -- Use the (bag, slot) payload the event already carries to release exactly
+            -- that prediction the moment the server confirms — no full re-scan, and the
+            -- dependent moves become issuable on the very next tick.
+            if not (Sort._running and Sort._pred) then return end
+            if a == nil or b == nil then return end
+            local k = slotKey(a, b)
+            if not Sort._pred[k] then return end
+            releasePred(k, nowSeconds())
+            -- If the last round had nothing issuable, this confirmation may have just
+            -- unblocked something — pull the next round forward instead of burning the
+            -- remainder of the 0.05s tick. This is what keeps the total at the raw
+            -- dependency-depth x round-trip floor with no tick quantization on top.
+            if Sort._pred[k] == nil and (Sort._lastIssued or 0) == 0 then
+                scheduleTick(0)
             end
         end
     end)
@@ -643,6 +994,7 @@ function Sort.Run(cids, opts)
     local cells = snapshot(cids)
     if not cells then return false end
 
+    -- One meta/family cache for the WHOLE run: Plan now runs every tick.
     local cache = {}
     -- Sort direction: opts.descending overrides; else the persisted db.sortDescending
     -- (absent/false => ascending, the canonical order).
@@ -651,29 +1003,41 @@ function Sort.Run(cids, opts)
         local db = Store and Store.db
         descending = (db and db.sortDescending) and true or false
     end
-    local plan = Sort.Plan({
-        cells = cells,
-        meta = makeMetaFn(cache),
-        canHold = makeCanHoldFn(cache),
-        descending = descending,
-    })
+    local meta, canHold = makeMetaFn(cache), makeCanHoldFn(cache)
+    local plan = Sort.Plan({ cells = cells, meta = meta, canHold = canHold, descending = descending })
     if #plan.moves == 0 then
         if ns.Print then ns:Print("bags already sorted.") end
         return true
     end
 
     ensureDriver()
-    Sort._running    = true
-    Sort._waves      = Sort.PartitionWaves(plan.moves)
-    Sort._w          = 1
-    Sort._gen        = 0
-    Sort._waiting    = false
-    Sort._moveCount  = #plan.moves
-    Sort._needsBank  = needsBank
+    local ids = {}
+    for _, cid in ipairs(cids) do ids[#ids + 1] = cid end
+
+    Sort._running   = true
+    Sort._cids      = ids
+    Sort._cache     = cache
+    Sort._meta      = meta
+    Sort._canHold   = canHold
+    Sort._desc      = descending
+    Sort._pred      = {}
+    Sort._needsBank = needsBank
+    Sort._ticks     = 0
+    Sort._rounds    = 0
+    Sort._idle      = 0
+    Sort._moveCount = 0
+    -- Convergence budget: a healthy run issues ~#plan.moves; anything wildly past that
+    -- means we are thrashing, so abort rather than churn the owner's bags.
+    Sort._budget    = #plan.moves * Sort.MAX_MOVE_FACTOR + Sort.MOVE_SLACK
+    Sort._start     = nowSeconds()
+    Sort._lastRefresh = Sort._start
+
     Sort._driver:RegisterEvent("ITEM_LOCK_CHANGED")
     Sort._driver:RegisterEvent("PLAYER_REGEN_DISABLED")
     if needsBank then Sort._driver:RegisterEvent("BANKFRAME_CLOSED") end
-    Sort._stepWave()
+
+    beginQuiet()
+    Sort._tick()
     return true
 end
 
@@ -1052,6 +1416,872 @@ local function testPlanDirection(fails)
     ck(#rp.moves == 0, "re-planning a desc-sorted bag descending -> no moves (fixed point)")
 end
 
+----------------------------------------------------------------------
+-- =====================================================================
+-- EXECUTOR CONVERGENCE SUITE — a simulated Classic-Era container API
+--
+-- The old executor was explicitly untested headless ("no WoW API under the harness").
+-- The optimistic executor removes the blocking settle, so the timing path is now load-
+-- bearing for CORRECTNESS, not just speed — it needs a gate. This simulator stands in
+-- for the whole client/server surface the executor touches:
+--
+--   * C_Container.GetContainerNumSlots / GetContainerItemInfo / GetContainerNumFreeSlots
+--     / PickupContainerItem, with the REAL semantics that matter here: a drop mutates
+--     nothing immediately — both touched slots read isLocked = true and keep their OLD
+--     contents until the simulated server confirms `latency` seconds later, exactly as
+--     the live client behaves.
+--   * ClearCursor / CursorHasItem, including the merge-overflow case (a pour that fills
+--     the destination leaves the residual on the cursor, which performMove drops back).
+--   * C_Timer.After + GetTime driven by a virtual clock, so a 0.3 s round-trip costs no
+--     wall time and the whole latency sweep runs in milliseconds.
+--   * CreateFrame / RegisterEvent + ITEM_LOCK_CHANGED (with its (bag, slot) payload),
+--     PLAYER_REGEN_DISABLED, InCombatLockdown.
+--   * C_Item.GetItemInfo / GetItemInfoInstant / GetItemFamily + bit.band, so the REAL
+--     makeMetaFn / makeCanHoldFn / snapshot paths run — not test doubles.
+--
+-- Fault injection: `latency` (server round-trip), `dropRate` (server rejects a move
+-- outright — the slots flap locked and nothing changes), `jitter` (per-move latency
+-- spread), and scheduled mid-sort bag mutations.
+--
+-- Exposed as Sort._Simulator so CI / timing models can drive it without duplicating it.
+-- =====================================================================
+
+-- Deterministic LCG so every run of the suite is reproducible.
+local function newRng(seed)
+    local s = seed % 2147483647
+    if s <= 0 then s = s + 2147483646 end
+    return function()
+        s = (s * 16807) % 2147483647
+        return s / 2147483647
+    end
+end
+
+local function bandOf(a, b)
+    local r, bitv = 0, 1
+    a, b = math.floor(a or 0), math.floor(b or 0)
+    while a > 0 and b > 0 do
+        if (a % 2 == 1) and (b % 2 == 1) then r = r + bitv end
+        a, b, bitv = math.floor(a / 2), math.floor(b / 2), bitv * 2
+    end
+    return r
+end
+
+-- Item catalog the simulated C_Item serves. `family` drives the bag-family constraint.
+local SIMCAT = {}
+do
+    local function add(id, classID, subClassID, equip, quality, level, maxStack, family)
+        SIMCAT[id] = { id = id, classID = classID, subClassID = subClassID, equip = equip,
+                       quality = quality, level = level, maxStack = maxStack,
+                       icon = 90000 + id, family = family or 0, name = "item" .. id }
+    end
+    -- gear / goods (band 2)
+    for k = 1, 12 do add(600 + k, ({2,4,4,7,9,12,2,4,7,15,13,4})[k], k % 6,
+                         (k % 3 == 0) and "INVTYPE_CHEST" or "", (k % 5), 20 + k * 3, 1, 0) end
+    -- stackables (band 2, tradegoods) — one is herb-family (bit 4)
+    for k = 1, 8 do add(700 + k, 7, k % 4, "", 1, 0, ({5,10,20,20,10,20,5,20})[k],
+                        (k == 3) and 4 or 0) end
+    -- consumables (band 0)
+    for k = 1, 6 do add(800 + k, 0, k % 2, "", 1, 0, ({5,20,20,10,20,5})[k], 0) end
+end
+local SIMIDS = {}
+for id in pairs(SIMCAT) do SIMIDS[#SIMIDS + 1] = id end
+table.sort(SIMIDS)
+
+-- The simulator. opts: { bags = { {cid, size, family}, ... }, latency, jitter,
+--                        dropRate, seed }
+local function makeSimulator(opts)
+    opts = opts or {}
+    local S = {
+        clock    = 0,
+        latency  = opts.latency or 0,
+        jitter   = opts.jitter or 0,
+        dropRate = opts.dropRate or 0,
+        rng      = newRng(opts.seed or 12345),
+        timers   = {}, seq = 0,
+        frames   = {},
+        -- Two views, exactly as the live client has: `truth` is server state (mutated the
+        -- instant a drop is issued) and `slots` is what GetContainerItemInfo shows — it
+        -- only catches up when the round-trip lands. Everything the ADDON can observe
+        -- goes through `slots`; every rule the SERVER applies is computed on `truth`.
+        bags     = {},          -- [cid] = { n, family, slots = {...}, truth = {...} }
+        locked   = {},          -- [key] = true while a move is in flight
+        held     = nil,         -- cursor { id, count }
+        holdKey  = nil,         -- origin slot key of the held item
+        combat   = false,
+        stats    = { pickups = 0, drops = 0, rejected = 0, applied = 0 },
+        saved    = {},
+    }
+    for _, b in ipairs(opts.bags or {}) do
+        S.bags[b.cid] = { n = b.size, family = b.family or 0, slots = {}, truth = {} }
+    end
+
+    local function key(cid, slot) return cid .. ":" .. slot end
+    local function unkey(k)
+        local cid, slot = k:match("^(-?%d+):(%d+)$")
+        return tonumber(cid), tonumber(slot)
+    end
+
+    ------------------------------------------------------------------
+    -- virtual clock
+    ------------------------------------------------------------------
+    function S.after(delay, fn)
+        S.seq = S.seq + 1
+        S.timers[#S.timers + 1] = { at = S.clock + (delay or 0), seq = S.seq, fn = fn }
+    end
+
+    -- Run the clock forward until the queue drains or `limit` virtual seconds pass.
+    function S:pump(limit)
+        limit = limit or 30
+        local guard = 0
+        while true do
+            guard = guard + 1
+            if guard > 100000 then error("simulator: timer storm (possible infinite loop)") end
+            local best
+            for i, t in ipairs(S.timers) do
+                if not best or t.at < S.timers[best].at
+                   or (t.at == S.timers[best].at and t.seq < S.timers[best].seq) then best = i end
+            end
+            if not best then return end
+            local t = S.timers[best]
+            if t.at > limit then return end
+            table.remove(S.timers, best)
+            if t.at > S.clock then S.clock = t.at end
+            t.fn()
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- events
+    ------------------------------------------------------------------
+    function S.fire(event, a, b)
+        for _, f in ipairs(S.frames) do
+            if f._events[event] and f._script then f._script(f, event, a, b) end
+        end
+    end
+
+    ------------------------------------------------------------------
+    -- server-side application of a queued mutation
+    ------------------------------------------------------------------
+    local function settleDelay()
+        local j = (S.jitter > 0) and (S.rng() * S.jitter) or 0
+        return S.latency + j
+    end
+
+    -- The round-trip landing: publish server truth into the visible view for the slots
+    -- this move touched, unlock them, and fire ITEM_LOCK_CHANGED with its (bag, slot).
+    local function commit(touched)
+        S.after(settleDelay(), function()
+            for _, k in ipairs(touched) do
+                local cid, slot = unkey(k)
+                local bag = S.bags[cid]
+                if bag then
+                    local t = bag.truth[slot]
+                    bag.slots[slot] = t and { id = t.id, count = t.count } or nil
+                end
+            end
+            S.stats.applied = S.stats.applied + 1
+            for _, k in ipairs(touched) do S.locked[k] = nil end
+            for _, k in ipairs(touched) do
+                local cid, slot = unkey(k)
+                S.fire("ITEM_LOCK_CHANGED", cid, slot)
+            end
+        end)
+    end
+
+    ------------------------------------------------------------------
+    -- the container API
+    ------------------------------------------------------------------
+    local function canHoldSim(cid, id)
+        local bag = S.bags[cid]
+        if not bag or bag.family == 0 then return true end
+        return bandOf(bag.family, (SIMCAT[id] and SIMCAT[id].family) or 0) ~= 0
+    end
+    S.canHoldSim = canHoldSim
+
+    local function isLocked(cid, slot)
+        local k = key(cid, slot)
+        return (S.locked[k] or (S.holdKey == k)) and true or false
+    end
+
+    local C_Container = {}
+    function C_Container.GetContainerNumSlots(cid)
+        local bag = S.bags[cid]; return bag and bag.n or 0
+    end
+    function C_Container.GetContainerItemInfo(cid, slot)
+        local bag = S.bags[cid]
+        if not bag or slot < 1 or slot > bag.n then return nil end
+        local it = bag.slots[slot]
+        if not it then
+            -- an empty slot still reports its lock state (mid-move source)
+            if isLocked(cid, slot) then return { itemID = nil, isLocked = true } end
+            return nil
+        end
+        return { itemID = it.id, stackCount = it.count,
+                 quality = (SIMCAT[it.id] and SIMCAT[it.id].quality) or 1,
+                 isLocked = isLocked(cid, slot) }
+    end
+    function C_Container.GetContainerNumFreeSlots(cid)
+        local bag = S.bags[cid]
+        if not bag then return 0, 0 end
+        local free = 0
+        for slot = 1, bag.n do if not bag.slots[slot] then free = free + 1 end end
+        return free, bag.family
+    end
+
+    function C_Container.PickupContainerItem(cid, slot)
+        local bag = S.bags[cid]
+        if not bag or slot < 1 or slot > bag.n then return end
+        local k = key(cid, slot)
+        if S.held == nil then
+            ----------------------------------------------------- pick up
+            -- Client-side only: no server state changes until the DROP.
+            if S.locked[k] then S.stats.rejected = S.stats.rejected + 1; return end
+            local it = bag.truth[slot]
+            if not it then return end
+            S.held, S.holdKey = { id = it.id, count = it.count }, k
+            -- Nothing has left the slot yet: server truth still holds this item, so a
+            -- ClearCursor from here is a pure no-op.
+            S.heldDetached = false
+            S.stats.pickups = S.stats.pickups + 1
+            return
+        end
+        ----------------------------------------------------------- drop
+        S.stats.drops = S.stats.drops + 1
+        -- A locked destination is refused by the client (unless it is where the held
+        -- item came from — that is the "put the merge residual back" case).
+        if S.locked[k] and k ~= S.holdKey then S.stats.rejected = S.stats.rejected + 1; return end
+        if not canHoldSim(cid, S.held.id) then S.stats.rejected = S.stats.rejected + 1; return end
+
+        local srcKey = S.holdKey
+        local scid, sslot = unkey(srcKey)
+        local sbag = S.bags[scid]
+        local held = S.held
+        local touched = { srcKey, k }
+
+        -- Dropping an item back onto the slot it came from, when nothing has actually
+        -- left that slot, is a no-op — the client simply puts it down again. (This is
+        -- the path performMove takes when a merge was REFUSED: CursorHasItem() is still
+        -- true, so it re-drops onto `from`. Treating that as a pour would merge a stack
+        -- into itself and invent items out of nothing.)
+        if k == srcKey and not S.heldDetached then
+            S.held, S.holdKey = nil, nil
+            return
+        end
+
+        if S.dropRate > 0 and S.rng() < S.dropRate then
+            -- The move is refused: server truth is untouched and the item stays on the
+            -- cursor, so the caller's ClearCursor() puts it back where it came from.
+            -- (Never silently discard the cursor — that would model item destruction the
+            -- real client cannot do, and would hide a genuine executor leak.)
+            S.stats.rejected = S.stats.rejected + 1
+            return
+        end
+
+        -- All arithmetic is done on server TRUTH, never on the stale visible view.
+        local dst  = bag.truth[slot]
+        local maxS = (SIMCAT[held.id] and SIMCAT[held.id].maxStack) or 1
+        S.locked[srcKey], S.locked[k] = true, true
+
+        if dst == nil then
+            bag.truth[slot]    = { id = held.id, count = held.count }
+            if srcKey ~= k then sbag.truth[sslot] = nil end
+            S.held, S.holdKey = nil, nil
+        elseif dst.id == held.id and maxS > 1 and dst.count < maxS then
+            -- Same item WITH room: pour. (Same item with NO room falls through to the
+            -- swap branch below — that is what the live client does; two full stacks
+            -- dropped on each other exchange places rather than no-op.)
+            local rs, rd = Sort.MergePour(held.count, dst.count, maxS)
+            bag.truth[slot] = { id = dst.id, count = rd }
+            if srcKey ~= k then sbag.truth[sslot] = nil end
+            if rs > 0 then
+                -- Overflow stays on the cursor and its source slot is now empty in
+                -- server truth — the only state in which ClearCursor must put it back.
+                S.held, S.heldDetached = { id = held.id, count = rs }, true
+            else
+                S.held, S.holdKey = nil, nil
+            end
+        else
+            bag.truth[slot]    = { id = held.id, count = held.count }
+            sbag.truth[sslot]  = { id = dst.id, count = dst.count }
+            S.held, S.holdKey = nil, nil
+        end
+        commit(touched)
+    end
+
+    ------------------------------------------------------------------
+    -- install / restore the global surface
+    ------------------------------------------------------------------
+    local GLOBALS = { "C_Container", "C_Timer", "C_Item", "bit", "ClearCursor",
+                      "CursorHasItem", "InCombatLockdown", "GetTime", "CreateFrame",
+                      "BankFrame", "Enum" }
+
+    function S:install()
+        for _, g in ipairs(GLOBALS) do S.saved[g] = _G[g] end
+        _G.C_Container = C_Container
+        _G.C_Timer = { After = function(d, fn) S.after(d, fn) end }
+        _G.GetTime = function() return S.clock end
+        _G.InCombatLockdown = function() return S.combat end
+        _G.CursorHasItem = function() return S.held ~= nil end
+        -- Dropping the cursor returns the held item to the slot it came from (the live
+        -- client's behaviour for a container item), so nothing can ever be destroyed by
+        -- the executor's belt-and-suspenders ClearCursor().
+        _G.ClearCursor = function()
+            if not S.held then S.holdKey = nil; return end
+            local k, held, detached = S.holdKey, S.held, S.heldDetached
+            S.held, S.holdKey, S.heldDetached = nil, nil, false
+            -- Picked up but never dropped (or the drop was refused): server truth never
+            -- lost the item, so putting the cursor down changes nothing.
+            if not detached then return end
+            if not k then return end
+            local cid, slot = unkey(k)
+            local bag = S.bags[cid]
+            if not bag then return end
+            local cur = bag.truth[slot]
+            if cur and cur.id == held.id then
+                cur.count = cur.count + held.count      -- residual rejoins its own stack
+            elseif cur == nil then
+                bag.truth[slot] = { id = held.id, count = held.count }
+            else
+                -- slot taken by something else: park it in the first free slot we own
+                for c2, b2 in pairs(S.bags) do
+                    for s2 = 1, b2.n do
+                        if not b2.truth[s2] and canHoldSim(c2, held.id) then
+                            b2.truth[s2] = { id = held.id, count = held.count }
+                            S.locked[key(c2, s2)] = true
+                            commit({ key(c2, s2) })
+                            return
+                        end
+                    end
+                end
+            end
+            S.locked[k] = true
+            commit({ k })
+        end
+        _G.bit = { band = bandOf }
+        _G.BankFrame = nil
+        _G.Enum = _G.Enum or { ItemClass = { Weapon = 2 } }
+        _G.C_Item = {
+            GetItemInfoInstant = function(id)
+                local c = SIMCAT[id]; if not c then return nil end
+                return c.name, nil, nil, c.equip, c.icon, c.classID, c.subClassID
+            end,
+            GetItemInfo = function(id)
+                local c = SIMCAT[id]; if not c then return nil end
+                return c.name, nil, c.quality, c.level, nil, nil, nil, c.maxStack
+            end,
+            GetItemFamily = function(id)
+                local c = SIMCAT[id]; return c and c.family or 0
+            end,
+        }
+        _G.CreateFrame = function()
+            local f = { _events = {} }
+            function f:RegisterEvent(e) self._events[e] = true end
+            function f:UnregisterAllEvents() self._events = {} end
+            function f:SetScript(_, fn) self._script = fn end
+            S.frames[#S.frames + 1] = f
+            return f
+        end
+    end
+
+    function S:restore()
+        for _, g in ipairs(GLOBALS) do _G[g] = S.saved[g] end
+    end
+
+    ------------------------------------------------------------------
+    -- bag helpers used by the tests
+    ------------------------------------------------------------------
+    -- Write BOTH views at once — for test setup and for injected mid-sort bag changes,
+    -- where the change is instantaneous in the client as well as on the server.
+    function S:set(cid, slot, id, count)
+        local bag = S.bags[cid]; if not bag then return end
+        local it = id and { id = id, count = count or 1 } or nil
+        bag.truth[slot] = it
+        bag.slots[slot] = it and { id = it.id, count = it.count } or nil
+    end
+    function S:put(cid, slot, id, count) S:set(cid, slot, id, count) end
+    function S:totals()   -- server truth (+ anything stranded on the cursor)
+        local t = {}
+        for _, bag in pairs(S.bags) do
+            for slot = 1, bag.n do
+                local it = bag.truth[slot]
+                if it then t[it.id] = (t[it.id] or 0) + it.count end
+            end
+        end
+        if S.held then t[S.held.id] = (t[S.held.id] or 0) + S.held.count end
+        return t
+    end
+    function S:cells()
+        local out, cids = {}, {}
+        for cid in pairs(S.bags) do cids[#cids + 1] = cid end
+        table.sort(cids)
+        for _, cid in ipairs(cids) do
+            local bag = S.bags[cid]
+            for slot = 1, bag.n do
+                local it = bag.truth[slot]
+                out[#out + 1] = { cid = cid, slot = slot, id = it and it.id or nil,
+                                  count = it and it.count or 0 }
+            end
+        end
+        return out
+    end
+    function S:at(cid, slot)   -- server truth for one slot
+        local bag = S.bags[cid]
+        return bag and bag.truth[slot] or nil
+    end
+    function S:firstFree(unlockedOnly)
+        for cid, bag in pairs(S.bags) do
+            for slot = 1, bag.n do
+                if not bag.truth[slot] and not (unlockedOnly and S.locked[key(cid, slot)]) then
+                    return cid, slot
+                end
+            end
+        end
+    end
+    function S:firstUsed(unlockedOnly)
+        for cid, bag in pairs(S.bags) do
+            for slot = 1, bag.n do
+                if bag.truth[slot] and not (unlockedOnly and S.locked[key(cid, slot)]) then
+                    return cid, slot
+                end
+            end
+        end
+    end
+    function S:anyLocked()
+        for _ in pairs(S.locked) do return true end
+        return false
+    end
+
+    return S
+end
+Sort._Simulator = makeSimulator   -- test hook: CI / timing models drive the same sim
+
+local function simMetaFn(id)
+    local c = SIMCAT[id]
+    if not c then return nil end
+    return { set = (c.classID < 2) and 0 or 2, classID = c.classID, subClassID = c.subClassID,
+             equip = c.equip, quality = c.quality, iconFileID = c.icon, level = c.level,
+             name = c.name, maxStack = c.maxStack }
+end
+
+-- Fill a simulator's bags with a randomized, deliberately messy layout.
+local function seedRandomBags(S, rng, nGear, nStackTypes)
+    local entries = {}
+    for _ = 1, nGear do
+        local id = SIMIDS[1 + math.floor(rng() * #SIMIDS)]
+        while (SIMCAT[id].maxStack or 1) > 1 do id = SIMIDS[1 + math.floor(rng() * #SIMIDS)] end
+        entries[#entries + 1] = { id = id, count = 1 }
+    end
+    for _ = 1, nStackTypes do
+        local id = SIMIDS[1 + math.floor(rng() * #SIMIDS)]
+        local guard = 0
+        while (SIMCAT[id].maxStack or 1) <= 1 and guard < 60 do
+            id = SIMIDS[1 + math.floor(rng() * #SIMIDS)]; guard = guard + 1
+        end
+        local maxS = SIMCAT[id].maxStack
+        if maxS > 1 then
+            for _ = 1, 2 + math.floor(rng() * 3) do
+                entries[#entries + 1] = { id = id, count = 1 + math.floor(rng() * (maxS - 1)) }
+            end
+        end
+    end
+    local slots = {}
+    for cid, bag in pairs(S.bags) do
+        for slot = 1, bag.n do slots[#slots + 1] = { cid = cid, slot = slot } end
+    end
+    for _, e in ipairs(entries) do
+        for _ = 1, 400 do
+            local p = slots[1 + math.floor(rng() * #slots)]
+            if not S:at(p.cid, p.slot) and S.canHoldSim(p.cid, e.id) then
+                S:set(p.cid, p.slot, e.id, e.count)
+                break
+            end
+        end
+    end
+end
+
+-- Swap in inert ns.Frame / ns.Capture doubles so the quiet-mode monkey-patch is what is
+-- under test, and count how often each is actually called.
+local function withFakeUI(fn)
+    local oldFrame, oldCapture, oldPrint = ns.Frame, ns.Capture, ns.Print
+    local tally = { refresh = 0, capture = 0, prints = {} }
+    ns.Frame = { IsShown = function() return true end,
+                 RequestRefresh = function() tally.refresh = tally.refresh + 1 end }
+    ns.Capture = { RequestCapture = function() tally.capture = tally.capture + 1 end }
+    ns.Print = function(_, ...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        tally.prints[#tally.prints + 1] = table.concat(parts, "")
+    end
+    local ok, err = pcall(fn, tally)
+    ns.Frame, ns.Capture, ns.Print = oldFrame, oldCapture, oldPrint
+    if not ok then error(err, 0) end
+    return tally
+end
+
+-- Drive one full sort against a simulator and return a verdict record.
+local function runSortInSim(S, cids, opts)
+    S:install()
+    local tally
+    local ok, err = pcall(function()
+        tally = withFakeUI(function()
+            Sort.Run(cids, opts)
+            S:pump(opts and opts.limit or 30)
+        end)
+    end)
+    -- Always tear the run down, even if an assertion below never runs.
+    if Sort._running then Sort._running = false end
+    S:restore()
+    if not ok then error(err, 0) end
+    return tally
+end
+
+local function sameTotals(a, b)
+    for id, n in pairs(a) do if (b[id] or 0) ~= n then return false, id end end
+    for id, n in pairs(b) do if (a[id] or 0) ~= n then return false, id end end
+    return true
+end
+
+----------------------------------------------------------------------
+-- Convergence property of the PLANNER itself (defect analysis §4 fix #5 ask):
+-- "plan -> apply a random PREFIX of the moves -> re-plan -> the new move count is
+-- strictly smaller". This is the algebraic reason the optimistic executor terminates:
+-- every partially-applied plan is strictly closer to the fixed point.
+----------------------------------------------------------------------
+local function testPlanPrefixConvergence(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(4242)
+    local worst, checked = 0, 0
+    for trial = 1, 120 do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 },
+                                           { cid = 2, size = 16 }, { cid = 3, size = 16 } },
+                                  seed = 900 + trial })
+        seedRandomBags(S, rng, 4 + math.floor(rng() * 12), 2 + math.floor(rng() * 12))
+        local cells = S:cells()
+        local plan = Sort.Plan({ cells = cells, meta = simMetaFn })
+        if #plan.moves >= 2 then
+            local k = 1 + math.floor(rng() * (#plan.moves - 1))
+            local prefix = {}
+            for i = 1, k do prefix[i] = plan.moves[i] end
+            applyMoves(cells, prefix, function(id)
+                return (SIMCAT[id] and SIMCAT[id].maxStack) or 1
+            end)
+            local re = Sort.Plan({ cells = cells, meta = simMetaFn })
+            checked = checked + 1
+            if #re.moves >= #plan.moves then
+                worst = worst + 1
+                ck(false, string.format(
+                    "prefix of %d/%d moves did not strictly reduce the residual (%d -> %d)",
+                    k, #plan.moves, #plan.moves, #re.moves))
+            end
+        end
+    end
+    ck(checked > 60, "prefix-convergence exercised enough randomized bags (" .. checked .. ")")
+    ck(worst == 0, "every partially-applied plan re-plans to a strictly smaller move count")
+end
+
+----------------------------------------------------------------------
+-- The headline gate: the executor converges under simulated latency.
+----------------------------------------------------------------------
+local function testExecutorLatency(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(777)
+    for _, latency in ipairs({ 0, 0.05, 0.10, 0.20, 0.30, 0.50 }) do
+        for trial = 1, 4 do
+            local S = makeSimulator({
+                bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 },
+                         { cid = 2, size = 16 }, { cid = 3, size = 16 } },
+                latency = latency, jitter = latency * 0.4, seed = 5000 + trial })
+            seedRandomBags(S, rng, 8, 10)
+            local before = S:totals()
+            -- The dependency DEPTH of the plan is the floor this executor should run at:
+            -- each round of the graph costs one server round-trip and nothing more.
+            local plan0 = Sort.Plan({ cells = S:cells(), meta = simMetaFn })
+            local depth = #Sort.PartitionWaves(plan0.moves)
+            local tally = runSortInSim(S, { 0, 1, 2, 3 })
+            local tag = string.format("latency %.2fs trial %d", latency, trial)
+
+            ck(Sort._running == false, tag .. ": executor stopped")
+            local same, badId = sameTotals(before, S:totals())
+            ck(same, tag .. ": every item conserved (id " .. tostring(badId) .. ")")
+            ck(S.held == nil, tag .. ": cursor left empty")
+            ck(not S:anyLocked(), tag .. ": no slot left locked")
+
+            -- Converged to the planner's fixed point: re-planning finds nothing to do.
+            local re = Sort.Plan({ cells = S:cells(), meta = simMetaFn })
+            ck(#re.moves == 0, tag .. ": final layout is the sorted fixed point ("
+                .. #re.moves .. " residual moves)")
+
+            local completed = false
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort complete", 1, true) then completed = true end
+            end
+            ck(completed, tag .. ": printed 'sort complete', not an abort")
+
+            -- No wasted work: an ideal run issues exactly the planned move count. Allow a
+            -- little slack for merges that re-split across rounds, but nothing like the
+            -- 2x churn a target re-derived per tick produces.
+            ck(Sort._pred == nil and Sort._cids == nil, tag .. ": run state torn down")
+            local issued = 0
+            for _, line in ipairs(tally.prints) do
+                local n = line:match("sort complete %((%d+) moves")
+                if n then issued = tonumber(n) end
+            end
+            -- A target re-derived per tick produced ~2x the planned moves; the stable
+            -- target keeps it within a few percent (merges can re-split across rounds).
+            ck(issued <= #plan0.moves * 1.3 + 4, tag .. string.format(
+                ": issued %d moves for a %d-move plan (no churn)", issued, #plan0.moves))
+
+            -- The cost model: one server round-trip per DEPENDENCY ROUND, with no
+            -- settle-poll and no throttle stacked on top. The old executor paid
+            -- waves x (latency + 0.05 + quantization) with waves ~2.5-3.5x this depth.
+            local bound = (depth + 5) * (latency + latency * 0.4 + Sort.TICK)
+            ck(S.clock <= bound, tag .. string.format(
+                ": %.2fs simulated vs %.2fs bound (%d dependency rounds)", S.clock, bound, depth))
+            if latency <= 0.10 then
+                ck(S.clock < 1.5, tag .. string.format(
+                    ": feels instant at realistic latency (%.2fs)", S.clock))
+            end
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Fault injection: the server rejects a share of moves outright.
+----------------------------------------------------------------------
+local function testExecutorLockFailures(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(31337)
+    for _, drop in ipairs({ 0.15, 0.35 }) do
+        for trial = 1, 4 do
+            local S = makeSimulator({
+                bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 }, { cid = 2, size = 16 } },
+                latency = 0.15, jitter = 0.05, dropRate = drop, seed = 8000 + trial })
+            seedRandomBags(S, rng, 6, 8)
+            local before = S:totals()
+            local tally = runSortInSim(S, { 0, 1, 2 })
+            local tag = string.format("dropRate %.2f trial %d", drop, trial)
+
+            ck(Sort._running == false, tag .. ": executor stopped (never loops)")
+            local same, badId = sameTotals(before, S:totals())
+            ck(same, tag .. ": every item conserved despite rejected moves (id " .. tostring(badId) .. ")")
+            ck(S.held == nil, tag .. ": cursor left empty")
+            -- It must either converge or abort CLEANLY — never spin, never strand items.
+            local ended = false
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort complete", 1, true) or line:find("sort stopped", 1, true) then
+                    ended = true
+                end
+            end
+            ck(ended, tag .. ": reported a definite outcome (complete or clean abort)")
+            ck(S.clock < 12, tag .. string.format(": bounded runtime (%.2fs simulated)", S.clock))
+        end
+    end
+end
+
+----------------------------------------------------------------------
+-- Mid-sort bag changes: loot lands / an item leaves while the sort is running.
+----------------------------------------------------------------------
+local function testExecutorMidSortChange(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(606)
+    for trial = 1, 6 do
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 }, { cid = 2, size = 16 } },
+            latency = 0.12, jitter = 0.05, seed = 3300 + trial })
+        seedRandomBags(S, rng, 7, 7)
+        S:install()
+        local tally
+        local ok, err = pcall(function()
+            tally = withFakeUI(function()
+                Sort.Run({ 0, 1, 2 })
+                -- Inject a change part-way through: loot lands in a free, unlocked slot.
+                S.after(0.18, function()
+                    local cid, slot = S:firstFree(true)
+                    if cid then S:set(cid, slot, 803, 3) end
+                end)
+                -- ...and something leaves a little later (an item consumed mid-sort).
+                S.after(0.40, function()
+                    local cid, slot = S:firstUsed(true)
+                    if cid then S:set(cid, slot, nil) end
+                end)
+                S:pump(30)
+            end)
+        end)
+        if Sort._running then Sort._running = false end
+        S:restore()
+        if not ok then error(err, 0) end
+
+        local tag = "mid-sort change trial " .. trial
+        ck(Sort._running == false, tag .. ": executor stopped")
+        ck(S.held == nil, tag .. ": cursor left empty")
+        ck(not S:anyLocked(), tag .. ": no slot left locked")
+        local ended = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort complete", 1, true) or line:find("sort stopped", 1, true) then ended = true end
+        end
+        ck(ended, tag .. ": reported a definite outcome")
+        ck(S.clock < 12, tag .. string.format(": bounded runtime (%.2fs simulated)", S.clock))
+    end
+end
+
+----------------------------------------------------------------------
+-- Guard-rails: locked-slot fixed points, family constraints, abort-on-user-action.
+----------------------------------------------------------------------
+local function testExecutorGuardRails(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(20260731)
+
+    ---------------------------------------------------------------- locked fixed point
+    for trial = 1, 4 do
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+            latency = 0.15, seed = 100 + trial })
+        seedRandomBags(S, rng, 6, 5)
+        -- Pin one occupied slot as permanently locked (the user is dragging it).
+        local pinKey, pinItem
+        for slot = 1, 16 do
+            local it = S:at(0, slot)
+            if it then pinKey, pinItem = "0:" .. slot, { id = it.id, count = it.count,
+                                                          slot = slot }; break end
+        end
+        ck(pinKey ~= nil, "found a slot to pin")
+        S.locked[pinKey] = true
+        local tally = runSortInSim(S, { 0, 1 })
+        local now = S:at(0, pinItem.slot)
+        ck(now ~= nil and now.id == pinItem.id and now.count == pinItem.count,
+           "locked slot " .. tostring(pinKey) .. " is an untouched fixed point")
+        local ended = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort complete", 1, true) or line:find("sort stopped", 1, true) then ended = true end
+        end
+        ck(ended, "pinned-slot run reported a definite outcome")
+        ck(Sort._running == false, "pinned-slot run stopped")
+    end
+
+    ---------------------------------------------------------------- family constraint
+    for trial = 1, 4 do
+        -- cid 3 is an herb bag (family bit 4); only item 703 carries that family.
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 }, { cid = 1, size = 12 },
+                     { cid = 3, size = 8, family = 4 } },
+            latency = 0.12, seed = 400 + trial })
+        seedRandomBags(S, rng, 6, 8)
+        -- seed the specialised bag too
+        S:put(3, 1, 703, 4); S:put(3, 3, 703, 7)
+        local before = S:totals()
+        runSortInSim(S, { 0, 1, 3 })
+        for slot = 1, S.bags[3].n do
+            local it = S:at(3, slot)
+            if it then ck(it.id == 703, "herb bag holds only family-4 items (found " .. it.id .. ")") end
+        end
+        local same = sameTotals(before, S:totals())
+        ck(same, "family run conserved every item")
+        ck(Sort._running == false, "family run stopped")
+    end
+
+    ---------------------------------------------------------------- abort on combat
+    do
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 }, { cid = 2, size = 16 } },
+            latency = 0.15, seed = 55 })
+        seedRandomBags(S, rng, 10, 10)
+        local before = S:totals()
+        S:install()
+        local tally
+        local ok, err = pcall(function()
+            tally = withFakeUI(function()
+                Sort.Run({ 0, 1, 2 })
+                S.after(0.16, function() S.combat = true; S.fire("PLAYER_REGEN_DISABLED") end)
+                S:pump(30)
+            end)
+        end)
+        if Sort._running then Sort._running = false end
+        S:restore()
+        if not ok then error(err, 0) end
+        ck(Sort._running == false, "combat aborted the sort")
+        ck(S.held == nil, "abort left the cursor empty")
+        local stopped = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort stopped: entered combat", 1, true) then stopped = true end
+        end
+        ck(stopped, "abort printed 'sort stopped: entered combat'")
+        local same = sameTotals(before, S:totals())
+        ck(same, "aborting mid-sort conserved every item")
+    end
+
+    ---------------------------------------------------------------- abort on window close
+    do
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+            latency = 0.15, seed = 66 })
+        seedRandomBags(S, rng, 8, 8)
+        local before = S:totals()
+        S:install()
+        local shown = true
+        local oldFrame, oldCapture, oldPrint = ns.Frame, ns.Capture, ns.Print
+        local lines = {}
+        ns.Frame = { IsShown = function() return shown end, RequestRefresh = function() end }
+        ns.Capture = { RequestCapture = function() end }
+        ns.Print = function(_, ...) lines[#lines + 1] = tostring((...)) end
+        local ok, err = pcall(function()
+            Sort.Run({ 0, 1 })
+            S.after(0.14, function() shown = false end)
+            S:pump(30)
+        end)
+        if Sort._running then Sort._running = false end
+        ns.Frame, ns.Capture, ns.Print = oldFrame, oldCapture, oldPrint
+        S:restore()
+        if not ok then error(err, 0) end
+        local closed = false
+        for _, line in ipairs(lines) do
+            if line:find("sort stopped: window closed", 1, true) then closed = true end
+        end
+        ck(closed, "closing the window aborted the sort")
+        ck(sameTotals(before, S:totals()), "window-close abort conserved every item")
+    end
+end
+
+----------------------------------------------------------------------
+-- The completion print + the refresh-storm suppression contract.
+----------------------------------------------------------------------
+local function testExecutorReporting(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(9090)
+    local S = makeSimulator({
+        bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 },
+                 { cid = 2, size = 16 }, { cid = 3, size = 16 } },
+        latency = 0.20, jitter = 0.05, seed = 4321 })
+    seedRandomBags(S, rng, 8, 14)
+
+    -- Record what quiet mode saw: how many rebuilds and captures actually escaped.
+    local tally = runSortInSim(S, { 0, 1, 2, 3 })
+
+    local line
+    for _, l in ipairs(tally.prints) do if l:find("sort complete", 1, true) then line = l end end
+    ck(line ~= nil, "printed a completion line")
+    if line then
+        local moves, waves, secs = line:match("^sort complete %((%d+) moves in (%d+) waves, (%d+%.%d%d)s%)%.$")
+        ck(moves ~= nil, "completion line matches 'sort complete (N moves in M waves, T.TTs).' -- got: " .. line)
+        if moves then
+            ck(tonumber(moves) > 0, "reported a positive move count")
+            ck(tonumber(waves) > 0, "reported a positive wave count")
+            ck(tonumber(secs) >= 0, "reported elapsed seconds")
+        end
+    end
+
+    -- Refresh storm: the OLD path did one full rebuild per lock burst (60-95 per sort).
+    -- Quiet mode caps the mid-sort rebuilds at the ~5 Hz heartbeat plus the final one.
+    local budget = math.ceil(S.clock / Sort.QUIET_REFRESH) + 2
+    ck(tally.refresh <= budget, string.format(
+        "grid rebuilds held to the 5 Hz heartbeat (%d <= %d over %.2fs)",
+        tally.refresh, budget, S.clock))
+    ck(tally.refresh >= 1, "at least one rebuild happened (the final one)")
+    ck(tally.capture == 1, "exactly one full recapture, at the end (got " .. tally.capture .. ")")
+
+    -- And the patched entry points were handed back untouched.
+    ck(Sort._quiet == nil, "quiet mode torn down")
+end
+
 function Sort.RunSelfTests(verbose)
     local suites = {
         { name = "merge pour (exhaustive)", fn = testMergePour },
@@ -1062,6 +2292,12 @@ function Sort.RunSelfTests(verbose)
         { name = "plan: family + multi-bag", fn = testPlanFamilyAndMultiBag },
         { name = "plan: direction inversion", fn = testPlanDirection },
         { name = "wave partition",          fn = testPartitionWaves },
+        { name = "converge: plan prefix",    fn = testPlanPrefixConvergence },
+        { name = "converge: executor latency", fn = testExecutorLatency },
+        { name = "converge: lock failures",  fn = testExecutorLockFailures },
+        { name = "converge: mid-sort change", fn = testExecutorMidSortChange },
+        { name = "converge: guard-rails",    fn = testExecutorGuardRails },
+        { name = "converge: report + quiet",  fn = testExecutorReporting },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
