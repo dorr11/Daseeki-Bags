@@ -200,9 +200,14 @@ if _G.SlashCmdList then
 end
 
 ----------------------------------------------------------------------
--- Keybindings (audit §10.2). Bindings.xml (loaded last on the v2 tocs) calls these
--- in-game handler globals; the BINDING_HEADER_/BINDING_NAME_ strings label them in the
--- KeyBindings UI (enUS inline — suite convention, no localization files on this tree).
+-- Keybindings (audit §10.2). Bindings.xml calls these in-game handler globals; the
+-- BINDING_HEADER_/BINDING_CATEGORY_/BINDING_NAME_ strings label them in the KeyBindings
+-- UI (enUS inline — suite convention, no localization files on this tree).
+--
+-- Bindings.xml is auto-discovered by the client from the addon root and is NOT listed in
+-- any .toc (listing it there ALSO double-loads it through the generic UI-XML parser, which
+-- warns on every <Binding>). It may therefore be parsed before this file runs — every
+-- binding body is guarded on its handler global, so that ordering is harmless.
 --
 -- Action names are DASEEKIBAGS2_* so they NEVER collide with the live 1.x DASEEKIBAGS_*
 -- bindings (DASEEKIBAGS_TOGGLE / DASEEKIBAGS_BANK_TOGGLE) while both addons are installed;
@@ -219,6 +224,7 @@ if _G.SlashCmdList then
     end
 
     _G.BINDING_HEADER_DASEEKIBAGS2           = "Daseeki Bags"
+    _G.BINDING_CATEGORY_DASEEKIBAGS2         = "Daseeki Bags"
     _G.BINDING_NAME_DASEEKIBAGS2_TOGGLE      = "Toggle Bags"
     _G.BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE = "Toggle Bank"
     _G.BINDING_NAME_DASEEKIBAGS2_FIND        = "Find Item Across Characters"

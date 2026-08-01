@@ -43,5 +43,11 @@ sort.lua
 ui_find.lua
 options.lua
 features.lua
-# Bindings.xml: Toggle Bags / Toggle Bank / Find keybindings (DASEEKIBAGS2_* action names).
-Bindings.xml
+#
+# Bindings.xml is deliberately NOT listed here. The client auto-discovers
+# Bindings.xml at the addon root and hands it to the KEYBINDINGS parser. Listing
+# it as a .toc file entry ALSO feeds it to the generic UI-XML parser, which does
+# not know the <Binding> element -- that is what produced the LUA_WARNINGs the
+# owner saw on every load ("Unrecognized XML: Binding", "Unrecognized XML
+# attribute: header/category"). No shipping Era addon lists Bindings.xml in its
+# .toc, and 1.x never did either. Do not re-add it.
