@@ -22,9 +22,33 @@
 		here: renaming would silently drop every key the owner has already bound.
 		The harness bindings gate reports the collision when it can see the install.
 
-		Action names are DASEEKIBAGS2_* so they never collide with the live 1.x
-		DASEEKIBAGS_* bindings while both addons are installed, and so any key the
-		owner has already bound survives untouched.
+		ACTION NAMES: BOTH generations are declared, on purpose.
+
+		DASEEKIBAGS2_* were chosen for the side-by-side beta so 2.0 could be installed
+		next to the live 1.x addon without either one stealing the other's keys. That is
+		still right for the beta, and WRONG on its own at cutover: a key binding is stored
+		against an ACTION NAME, so when the 1.x folder goes away its action names go with
+		it and every key the owner bound through 1.x is orphaned (ROLLOUT_CONTINUITY_AUDIT
+		AT-RISK-4). Renaming the 2.0 actions instead would orphan the beta's keys.
+
+		So the LEGACY names DASEEKIBAGS_TOGGLE and DASEEKIBAGS_BANK_TOGGLE are declared
+		here as additional bindings whose bodies call the SAME 2.0 handlers. Whichever
+		generation the owner bound, the key keeps working across the cutover, with no
+		re-binding and no lost key. Two action names pointing at one handler is ordinary:
+		each Binding element is its own action and its body is arbitrary Lua, so nothing
+		is shared except the function call. The client's uniqueness rule is per NAME.
+
+		1.x never had a Find window, so DASEEKIBAGS2_FIND has no legacy twin.
+
+		Consequence while side by side: the installed 1.x folder also declares the two
+		legacy names, so the client registers whichever folder loads first and logs
+		"attempted to be loaded more than once" for the other. That is EXPECTED during
+		the overlap and resolves the moment 1.x is uninstalled at cutover. The harness
+		bindings gate knows about this pair and reports it as expected continuity rather
+		than a collision; a name shared with any OTHER folder is still flagged.
+
+		Labels for the legacy pair say "legacy binding" so the Key Bindings list does not
+		show two identically-named rows.
 
 		Labels come from the BINDING_HEADER_DASEEKIBAGS2 / BINDING_CATEGORY_DASEEKIBAGS2
 		/ BINDING_NAME_DASEEKIBAGS2_* globals set in core.lua. header= sits on the
@@ -42,5 +66,11 @@
 	</Binding>
 	<Binding name="DASEEKIBAGS2_FIND" category="DASEEKIBAGS2">
 		if DaseekiBags2_ToggleFind then DaseekiBags2_ToggleFind() end
+	</Binding>
+	<Binding name="DASEEKIBAGS_TOGGLE" category="DASEEKIBAGS2">
+		if DaseekiBags2_ToggleBags then DaseekiBags2_ToggleBags() end
+	</Binding>
+	<Binding name="DASEEKIBAGS_BANK_TOGGLE" category="DASEEKIBAGS2">
+		if DaseekiBags2_ToggleBank then DaseekiBags2_ToggleBank() end
 	</Binding>
 </Bindings>

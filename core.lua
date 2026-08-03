@@ -209,10 +209,13 @@ end
 -- warns on every <Binding>). It may therefore be parsed before this file runs — every
 -- binding body is guarded on its handler global, so that ordering is harmless.
 --
--- Action names are DASEEKIBAGS2_* so they NEVER collide with the live 1.x DASEEKIBAGS_*
--- bindings (DASEEKIBAGS_TOGGLE / DASEEKIBAGS_BANK_TOGGLE) while both addons are installed;
--- a cutover rename follows when v2 replaces 1.x. Guarded on _G.SlashCmdList so the headless
--- harness (which has neither SlashCmdList nor a bindings UI) never sees these globals.
+-- Action names: the DASEEKIBAGS2_* set is 2.0's own, and the two LEGACY 1.x names
+-- (DASEEKIBAGS_TOGGLE / DASEEKIBAGS_BANK_TOGGLE) are declared alongside them so a key the
+-- owner bound under 1.x still fires after the cutover removes the 1.x addon — a binding is
+-- stored against an action NAME, so a name that disappears orphans the key
+-- (ROLLOUT_CONTINUITY_AUDIT AT-RISK-4). Both names call the same handler below; only the
+-- labels differ, so the Key Bindings list does not show two identical rows. Guarded on
+-- _G.SlashCmdList so the headless harness (no SlashCmdList, no bindings UI) never sees these.
 ----------------------------------------------------------------------
 
 if _G.SlashCmdList then
@@ -228,6 +231,10 @@ if _G.SlashCmdList then
     _G.BINDING_NAME_DASEEKIBAGS2_TOGGLE      = "Toggle Bags"
     _G.BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE = "Toggle Bank"
     _G.BINDING_NAME_DASEEKIBAGS2_FIND        = "Find Item Across Characters"
+
+    -- Legacy 1.x action names kept alive for keybinding continuity at cutover.
+    _G.BINDING_NAME_DASEEKIBAGS_TOGGLE       = "Toggle Bags (legacy binding)"
+    _G.BINDING_NAME_DASEEKIBAGS_BANK_TOGGLE  = "Toggle Bank (legacy binding)"
 end
 
 ----------------------------------------------------------------------
