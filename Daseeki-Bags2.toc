@@ -51,3 +51,10 @@ features.lua
 # owner saw on every load ("Unrecognized XML: Binding", "Unrecognized XML
 # attribute: header/category"). No shipping Era addon lists Bindings.xml in its
 # .toc, and 1.x never did either. Do not re-add it.
+#
+# Corollary: because discovery is per FOLDER and by file name, this .toc cannot
+# suppress Bindings.xml either. If any second installed folder also ships a
+# Bindings.xml with the DASEEKIBAGS2_* names, the client logs "Binding
+# DASEEKIBAGS2_TOGGLE was attempted to be loaded more than once" against the
+# second folder. That is an install-topology defect (e.g. the repo checkout
+# junctioned in as the live 1.x addon while on a v2 branch), not a .toc defect.

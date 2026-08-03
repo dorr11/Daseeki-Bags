@@ -8,6 +8,20 @@
 		UI-XML parser, which has no Binding element and emits a LUA_WARNING per
 		binding on every load. See the matching note in the .toc files.
 
+		FOLDER CONTRACT (the second, separate failure mode): auto-discovery is per
+		installed addon FOLDER and is driven by the file name alone, so no .toc can
+		suppress it. Exactly ONE installed folder may ship a Bindings.xml declaring
+		the DASEEKIBAGS2_* names. If a second folder also carries this file, the
+		client registers the first folder's names and then logs
+		"Binding DASEEKIBAGS2_TOGGLE was attempted to be loaded more than once",
+		naming the SECOND folder as Source. That is what happens when the
+		Daseeki-Bags repo checkout is junctioned into Interface/AddOns as the live
+		1.x addon while parked on a v2 branch: 1.x loads through Daseeki-Bags.toc
+		and never mentions this file, but the file is in the folder, so it loads
+		anyway. Fix it in the install (one folder), never by renaming the actions
+		here: renaming would silently drop every key the owner has already bound.
+		The harness bindings gate reports the collision when it can see the install.
+
 		Action names are DASEEKIBAGS2_* so they never collide with the live 1.x
 		DASEEKIBAGS_* bindings while both addons are installed, and so any key the
 		owner has already bound survives untouched.

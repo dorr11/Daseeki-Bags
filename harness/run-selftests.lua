@@ -91,6 +91,174 @@ realprint("=== toc parse gate: PASS ===")
 realprint("")
 
 ----------------------------------------------------------------------
+-- 0b) BINDINGS GATE  (added 2026-08-02 after the SECOND Bindings.xml warning)
+--
+-- Keybindings reach the client by a path no .toc controls: the client
+-- auto-discovers <AddOnFolder>/Bindings.xml for every ENABLED addon and feeds
+-- it to the keybindings parser. Two distinct failure modes have now shipped:
+--
+--   1) "Unrecognized XML: Binding" (fixed in a0a8ae5) -- the file was ALSO
+--      listed as a .toc file entry, so the generic UI-XML parser, which has no
+--      <Binding> element, saw it a second time. Guarded below: no .toc in this
+--      addon may list Bindings.xml.
+--
+--   2) "Binding DASEEKIBAGS2_TOGGLE was attempted to be loaded more than once"
+--      -- the SAME action name registered from two sources. Within one file
+--      that means duplicate <Binding name=> elements (guarded below). Across
+--      the install it means a second installed addon FOLDER ships a
+--      Bindings.xml declaring our names -- which is what actually happened:
+--      the Daseeki-Bags repo checkout is junctioned into Interface/AddOns as
+--      the live 1.x addon while parked on a v2 branch, so the v2 root
+--      Bindings.xml rides along in a folder whose .toc never mentions it. The
+--      .toc cannot suppress it; only the folder contents can. The live probe
+--      at the end of this gate reports that collision (WARN, not FAIL: it is
+--      a property of the machine's install, not of this repo).
+----------------------------------------------------------------------
+local BINDINGS_FILE = "Bindings.xml"
+-- Every .toc this addon ships. A .toc that is absent is skipped (branches
+-- differ); a .toc that exists MUST NOT list Bindings.xml.
+local TOC_CANDIDATES = { "Daseeki-Bags2.toc", "v2.toc", "Daseeki-Bags.toc" }
+
+local function readFile(path)
+    local fh = io.open(path, "r")
+    if not fh then return nil end
+    local s = fh:read("*a")
+    fh:close()
+    return s
+end
+
+realprint("=== bindings gate :: " .. BINDINGS_FILE .. " name uniqueness + toc silence ===")
+local bindFails = 0
+local bindSrc = readFile(P(BINDINGS_FILE))
+local OUR_BINDINGS, ourBindingOrder = {}, {}
+if not bindSrc then
+    bindFails = bindFails + 1
+    realprint("  [FAIL] cannot open " .. P(BINDINGS_FILE) ..
+              " -- the addon ships no keybindings at all")
+else
+    -- Well-formedness trap this file has now hit twice: XML forbids the two-dash
+    -- sequence INSIDE a comment. The client's parser rejects the whole file, so
+    -- every binding silently disappears. Checked here because the comment block
+    -- is long and prose-like, which is exactly where the sequence sneaks in.
+    for body in bindSrc:gmatch("<!%-%-(.-)%-%->") do
+        if body:find("%-%-") then
+            bindFails = bindFails + 1
+            realprint("  [FAIL] " .. BINDINGS_FILE .. " has an XML comment containing a")
+            realprint("         double-dash sequence, which is illegal and makes the whole")
+            realprint("         file unparseable (every binding lost). Rewrite that prose.")
+        end
+    end
+
+    -- Duplicate-name check: the exact shape that produces "attempted to be
+    -- loaded more than once" from a single file.
+    for name in bindSrc:gmatch('<Binding%s[^>]-name%s*=%s*"([^"]+)"') do
+        if OUR_BINDINGS[name] then
+            bindFails = bindFails + 1
+            realprint('  [FAIL] duplicate <Binding name="' .. name .. '"> in ' .. BINDINGS_FILE)
+        else
+            OUR_BINDINGS[name] = true
+            ourBindingOrder[#ourBindingOrder + 1] = name
+        end
+    end
+    if #ourBindingOrder == 0 then
+        bindFails = bindFails + 1
+        realprint("  [FAIL] " .. BINDINGS_FILE .. " declares no <Binding name=...> at all")
+    else
+        realprint(string.format("  [ok] %d binding name(s), all unique: %s",
+            #ourBindingOrder, table.concat(ourBindingOrder, ", ")))
+    end
+end
+
+-- No .toc may list Bindings.xml (regression guard for failure mode 1).
+for _, toc in ipairs(TOC_CANDIDATES) do
+    local src = readFile(P(toc))
+    if src then
+        for line in src:gmatch("[^\r\n]+") do
+            local t = line:gsub("^%s+", ""):gsub("%s+$", "")
+            if t ~= "" and t:sub(1, 1) ~= "#" and t:lower():find("bindings%.xml") then
+                bindFails = bindFails + 1
+                realprint("  [FAIL] " .. toc .. " lists " .. BINDINGS_FILE ..
+                          " as a file entry -- the client already auto-loads it")
+            end
+        end
+    end
+end
+if bindFails == 0 then
+    realprint("  [ok] no .toc lists " .. BINDINGS_FILE)
+end
+
+-- Live-install probe (WARN only; skipped when no Era install is visible).
+-- Enumerates sibling addon FOLDERS and flags any other one declaring our names.
+do
+    local addonsDir = os.getenv("DASEEKI_ERA_ADDONS")
+    if not addonsDir then
+        local guesses = {
+            "C:/Program Files (x86)/World of Warcraft/_classic_era_/Interface/AddOns",
+            "C:/Program Files/World of Warcraft/_classic_era_/Interface/AddOns",
+        }
+        for _, g in ipairs(guesses) do
+            local probe = io.open(g .. "/../../WTF/Config.wtf", "r")
+                       or io.open(g .. "/Blizzard_Console/Blizzard_Console.toc", "r")
+            if probe then probe:close(); addonsDir = g; break end
+            -- Directory existence without a known child: try the dir listing.
+            local okp, ph = pcall(io.popen, 'dir /b /ad "' .. g:gsub("/", "\\") .. '" 2>nul')
+            if okp and ph then
+                local first = ph:read("*l"); ph:close()
+                if first and first ~= "" then addonsDir = g; break end
+            end
+        end
+    end
+    local siblings = {}
+    if addonsDir and next(OUR_BINDINGS) then
+        local okp, ph = pcall(io.popen, 'dir /b /ad "' .. addonsDir:gsub("/", "\\") .. '" 2>nul')
+        if okp and ph then
+            for folder in ph:lines() do
+                folder = folder:gsub("%s+$", "")
+                if folder ~= "" then siblings[#siblings + 1] = folder end
+            end
+            ph:close()
+        end
+    end
+    local hits = {}
+    for _, folder in ipairs(siblings) do
+        local src = readFile(addonsDir .. "/" .. folder .. "/" .. BINDINGS_FILE)
+        if src then
+            local shared = {}
+            for name in src:gmatch('<Binding%s[^>]-name%s*=%s*"([^"]+)"') do
+                if OUR_BINDINGS[name] then shared[#shared + 1] = name end
+            end
+            if #shared > 0 then
+                hits[#hits + 1] = { folder = folder, names = shared }
+            end
+        end
+    end
+    if #hits > 1 then
+        realprint("  [WARN] LIVE BINDING-NAME COLLISION in " .. addonsDir)
+        for _, h in ipairs(hits) do
+            realprint("         " .. h.folder .. "/" .. BINDINGS_FILE ..
+                      "  ->  " .. table.concat(h.names, ", "))
+        end
+        realprint("         The client registers the first folder's names, then warns")
+        realprint('         "Binding <NAME> was attempted to be loaded more than once"')
+        realprint("         naming the SECOND folder as Source. Only one installed folder")
+        realprint("         may ship these names -- this is install topology, not repo content.")
+    elseif #hits == 1 then
+        realprint("  [ok] live install: " .. hits[1].folder .. " is the only folder declaring our names")
+    elseif addonsDir then
+        realprint("  [ok] live install scanned, no folder declares our names (addon not installed)")
+    else
+        realprint("  [skip] no Era install visible (set DASEEKI_ERA_ADDONS to enable the probe)")
+    end
+end
+
+if bindFails > 0 then
+    realprint(string.format("=== bindings gate: FAIL (%d problem(s)) ===", bindFails))
+    os.exit(1)
+end
+realprint("=== bindings gate: PASS ===")
+realprint("")
+
+----------------------------------------------------------------------
 -- WoW global aliases for stdlib helpers the addon uses as bare globals
 ----------------------------------------------------------------------
 _G.strmatch = string.match

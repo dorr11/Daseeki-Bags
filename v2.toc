@@ -56,5 +56,11 @@ features.lua
 # attribute: header/category"). No shipping Era addon lists Bindings.xml in its
 # .toc, and 1.x never did either. Do not re-add it.
 #
+# Corollary: because discovery is per FOLDER and by file name, this .toc cannot
+# suppress Bindings.xml either. If any second installed folder also ships a
+# Bindings.xml with the DASEEKIBAGS2_* names, the client logs "Binding
+# DASEEKIBAGS2_TOGGLE was attempted to be loaded more than once" against the
+# second folder: an install-topology defect, not a .toc defect.
+#
 # Load order is irrelevant for the auto-loaded file: each <Binding> body runs
 # only on keypress, and every body is guarded on its handler global existing.
