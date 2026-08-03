@@ -65,6 +65,31 @@ end
 Options._refresh = refreshAll
 
 ----------------------------------------------------------------------
+-- WINDOW-SCALE WRITE PATH (marker discipline)
+--
+-- Named and db-injected rather than inlined in the slider's set closure, because the
+-- headless harness cannot build a DaseekiUI panel and this is the ONE thing about the
+-- slider that has to be gated: a deliberate scale must claim db.scaleUserChose, or the
+-- next default bump's match-by-value heal (Frame.MigrateScale) cannot tell a shipped
+-- default apart from an owner setting that happens to equal it. Same discipline the
+-- Columns / Cell-gap sliders use for db.densityUserChose.
+--
+-- Frame.WriteScale owns the clamp + marker; the fallback branch exists only for the
+-- can't-happen case of options.lua loaded without ui_frame, and records the same intent.
+-- PURE: no frames, no live-apply — the caller does the RefreshScale.
+----------------------------------------------------------------------
+
+function Options.WriteWindowScale(db, v)
+    if ns.Frame and ns.Frame.WriteScale then return ns.Frame.WriteScale(db, v) end
+    local s = tonumber(v) or 0.92
+    if type(db) == "table" then
+        db.scale = s
+        db.scaleUserChose = true
+    end
+    return s
+end
+
+----------------------------------------------------------------------
 -- Page builder (called once when the section is first shown)
 ----------------------------------------------------------------------
 
@@ -156,9 +181,13 @@ function Options.Build(flow)
     -- Window scale. Separate from Button size on purpose: Button size changes the GRID
     -- (more or less of the screen for the same number of slots), while this shrinks the
     -- whole window — chrome, title, bag strip and all — the way 1.x's frame scale did.
-    -- Default 0.89 is the 1.0-size-parity value (see Frame.DEFAULT_SCALE). Applies to the
-    -- bank window too; RefreshScale re-scales both and repaints so the pixel-snapped
-    -- quality borders re-derive at the new effective scale.
+    -- Default 0.92 is the owner's bumped value (2026-08-03, "bring the default scale of
+    -- bags 2 up just a bit"), deliberately above the 1.0-size-parity 0.89 — see
+    -- Frame.DEFAULT_SCALE. Applies to the bank window too; RefreshScale re-scales both and
+    -- repaints so the pixel-snapped quality borders re-derive at the new effective scale.
+    -- The write goes through Frame.WriteScale, which clamps AND claims db.scaleUserChose,
+    -- so a future default bump can never heal away a scale the owner deliberately set
+    -- (the same marker discipline the Columns / Cell-gap sliders use for density).
     register(grid:Slider({
         label = "Window scale",
         min   = (ns.Frame and ns.Frame.MIN_SCALE) or 0.5,
@@ -168,13 +197,10 @@ function Options.Build(flow)
         get = function()
             local db = DB()
             if ns.Frame and ns.Frame.ClampScale then return ns.Frame.ClampScale(db and db.scale) end
-            return (db and db.scale) or 0.89
+            return (db and db.scale) or 0.92
         end,
         set = function(v)
-            local db = DB()
-            if db then
-                db.scale = (ns.Frame and ns.Frame.ClampScale and ns.Frame.ClampScale(v)) or tonumber(v) or 0.89
-            end
+            Options.WriteWindowScale(DB(), v)
             if ns.Frame and ns.Frame.RefreshScale then
                 if ns.SafeCall then ns:SafeCall(ns.Frame.RefreshScale) else ns.Frame.RefreshScale() end
             end
@@ -600,9 +626,43 @@ local function testDefaultsAdditive(fails)
     ck(true, "nil db is a safe no-op")
 end
 
+-- WINDOW-SCALE SLIDER WRITE. The gate on the marker discipline: every deliberate scale
+-- write must claim db.scaleUserChose, so the one-time 0.89 -> 0.92 heal (owner directive
+-- 2026-08-03) can never take back a scale the owner actually chose.
+local function testScaleSliderWrite(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local db = {}
+    ck(Options.WriteWindowScale(db, 1.10) == 1.10, "the slider write returns the stored value")
+    ck(db.scale == 1.10, "the slider write persists the value")
+    ck(db.scaleUserChose == true, "the slider write CLAIMS the user-chose marker")
+
+    -- Clamped through Frame.WriteScale, not stored raw.
+    local hi = {}
+    Options.WriteWindowScale(hi, 9)
+    ck(hi.scale == (ns.Frame and ns.Frame.MAX_SCALE or 1.5), "the slider write clamps out-of-band values")
+    ck(hi.scaleUserChose == true, "…and still marks the choice")
+
+    -- THE ROW THAT MATTERS: setting the slider to exactly the superseded default is a real
+    -- choice, and the marker is what makes it survive the next login's heal.
+    local at89 = {}
+    Options.WriteWindowScale(at89, 0.89)
+    ck(at89.scale == 0.89, "the slider can still be set to the old default")
+    if ns.Frame and ns.Frame.MigrateScale then
+        ck(ns.Frame.MigrateScale(at89) == false, "…and the heal leaves that deliberate 0.89 alone")
+        ck(at89.scale == 0.89, "…so it is still 0.89 after login")
+    else
+        ck(false, "ns.Frame.MigrateScale missing — the heal is not wired")
+    end
+
+    -- nil db is a safe no-op that still reports a value (headless / pre-login).
+    ck(Options.WriteWindowScale(nil, 0.75) == 0.75, "a write with no db still returns the clamped value")
+end
+
 function Options.RunSelfTests(verbose)
     local suites = {
         { name = "defaults additive", fn = testDefaultsAdditive },
+        { name = "window scale slider write", fn = testScaleSliderWrite },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

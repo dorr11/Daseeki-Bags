@@ -78,9 +78,24 @@ Frame.DEFAULT_GAP        = 2
 --
 -- Matching the window scale ALONE (0.98) would have left the grid ~10% oversized, which
 -- is exactly the difference the owner reported; itemScale is the knob that was missing.
-Frame.DEFAULT_SCALE = 0.89
+--
+-- ── THE OWNER'S DELIBERATE DIVERGENCE (2026-08-03) ────────────────────────────────
+-- Having lived with the strict-parity window, the owner asked to "bring the default
+-- scale of bags 2 up just a bit." So the SHIPPED default is no longer the 1.x composite:
+--     0.89 (strict 1.x parity, 0.8918)  ->  0.92   (+3.2%)
+-- That is a knowing, owner-directed departure from 1.x size parity — the ONLY one in the
+-- geometry model — and parity.lua records it as such: the cell-parity suite still proves
+-- the 2.0 model reproduces 1.x EXACTLY when handed the strict-parity scale, and asserts
+-- separately that the shipped default sits deliberately (and boundedly) above it.
+-- Everything else (cell/pitch ratio, halo-to-cell ratio, icon fill) is scale-invariant,
+-- so the bump changes the window's SIZE and nothing about its SHAPE.
+Frame.DEFAULT_SCALE = 0.92
 Frame.MIN_SCALE     = 0.50
 Frame.MAX_SCALE     = 1.50
+
+-- The superseded default, kept as a NAMED constant because the heal below matches on it.
+-- 1.x strict parity, and what every DB seeded by a pre-2026-08-03 build is sitting at.
+Frame.OLD_DEFAULT_SCALE = 0.89
 
 -- Window chrome bands (px). Kept in one place so the pure size math and the in-game
 -- arrange agree exactly. 1.0 anatomy: a compact TITLE row (gold character name
@@ -322,6 +337,24 @@ function Frame.ClampScale(v)
 end
 -- The live window scale (both windows share it, so inventory and bank stay one size).
 function Frame.Scale() local db = Store and Store.db; return Frame.ClampScale(db and db.scale) end
+
+-- PURE: the ONE write path for the window scale. Every deliberate change (today that is
+-- the options Window-scale slider) goes through here so the value is clamped AND the
+-- "the owner chose this" marker is claimed in the same breath. Without the marker a
+-- future default bump cannot tell a shipped default apart from a deliberate setting that
+-- happens to equal it — which is exactly the hole the 0.89 -> 0.92 heal had to reason
+-- around for DBs written before this marker existed. Mirrors densityUserChose.
+-- Returns the clamped value actually stored.
+Frame.SCALE_USER_CHOSE = "scaleUserChose"
+
+function Frame.WriteScale(db, v)
+    local s = Frame.ClampScale(v)
+    if type(db) == "table" then
+        db.scale = s
+        db[Frame.SCALE_USER_CHOSE] = true
+    end
+    return s
+end
 function Frame.ShowKeyring() local db = Store and Store.db; if db and db.showKeyring ~= nil then return db.showKeyring end return true end
 -- Money bar visibility (audit §9.4 dead-control fix): absent/true => shown, explicit false hides.
 function Frame.MoneyShown()  local db = Store and Store.db; return not (db and db.showMoney == false) end
@@ -360,7 +393,9 @@ function Frame.ApplyDefaults(db)
     if db.showKeyring == nil then db.showKeyring = true                     end
     -- SEEDS ONLY WHEN ABSENT (SV rule: additive, never clobber). A user who already
     -- moved the scale slider keeps their number; a DB from before the scale option
-    -- existed has no key at all, so it picks up the 1.0-parity default on next login.
+    -- existed has no key at all, so it picks up the shipped default on next login.
+    -- NOTE: this seed has ALREADY run for every live DB, which is why bumping the
+    -- default is not enough on its own — see Frame.MigrateScale below.
     if db.scale       == nil then db.scale       = Frame.DEFAULT_SCALE      end
     if type(db.hiddenBags) ~= "table" then db.hiddenBags = {} end  -- [cid]=true
     -- geometry keys are left nil until first save (RestoreGeometry falls back)
@@ -398,6 +433,57 @@ function Frame.MigrateDensity(db)
     end
     db[Frame.DENSITY_MARKER] = true
     return migrated
+end
+
+----------------------------------------------------------------------
+-- One-time WINDOW-SCALE default heal (same house pattern as MigrateDensity).
+--
+-- OWNER DIRECTIVE 2026-08-03: "bring the default scale of bags 2 up just a bit."
+-- 0.89 -> 0.92.
+--
+-- Why a migration and not just a new constant. Unlike the density round, the scale key
+-- is NOT absent from live DBs: ApplyDefaults has been seeding db.scale = 0.89 on every
+-- login since the scale option shipped, so every DB that has logged in once already has
+-- the OLD default written into it. Bumping DEFAULT_SCALE alone would therefore change
+-- nothing the owner can see — ApplyDefaults is additive and would never touch the
+-- already-present 0.89.
+--
+-- So this is the suite's match-by-value + user-chose pattern (Nexus match-by-value heals,
+-- Bags densityUserChose):
+--   * stored value EXACTLY the old default (0.89) and no evidence of a deliberate
+--     choice  ->  heal to the new default. That is a shipped default, not intent.
+--   * db.scaleUserChose set (the slider wrote it — see Frame.WriteScale)  ->  never
+--     touched, even at exactly 0.89.
+--   * ANY other value  ->  a deliberate setting. Never touched.
+--   * key absent  ->  nothing to heal; ApplyDefaults already seeded the new default.
+-- Guarded by a one-time marker so a later deliberate 0.89 can never be re-clobbered on
+-- a subsequent login. Idempotent.
+--
+-- The match uses a tolerance rather than ==: the stored number came off a 0.01-grid
+-- slider or a literal, and 1e-6 is far finer than that grid, so 0.88 / 0.90 can never
+-- be caught by it while a float-noisy 0.89 still is.
+----------------------------------------------------------------------
+
+Frame.SCALE_MARKER      = "scaleMigrated"
+Frame.SCALE_MATCH_EPS   = 1e-6
+
+-- PURE: is this stored value the superseded default (and therefore not a real choice)?
+function Frame.ScaleIsOldDefault(v)
+    v = tonumber(v)
+    if not v then return false end
+    return math.abs(v - Frame.OLD_DEFAULT_SCALE) < Frame.SCALE_MATCH_EPS
+end
+
+function Frame.MigrateScale(db)
+    if type(db) ~= "table" then return false end
+    if db[Frame.SCALE_MARKER] then return false end   -- already healed (one-time)
+    local healed = false
+    if not db[Frame.SCALE_USER_CHOSE] and Frame.ScaleIsOldDefault(db.scale) then
+        db.scale = Frame.DEFAULT_SCALE
+        healed = true
+    end
+    db[Frame.SCALE_MARKER] = true
+    return healed
 end
 
 ----------------------------------------------------------------------
@@ -1872,7 +1958,13 @@ function Frame.DebugToolbar()
     end
     P("  raid-prep available=" .. tostring(Frame.RaidPrepLoaded())
         .. " DaseekiPrep=" .. tostring(_G.DaseekiPrep ~= nil))
-    P(string.format("  window scale=%.2f (default %.2f)", Frame.Scale(), Frame.DEFAULT_SCALE))
+    do
+        local db = Store and Store.db
+        P(string.format("  window scale=%.2f (default %.2f, prev default %.2f) userChose=%s healed=%s",
+            Frame.Scale(), Frame.DEFAULT_SCALE, Frame.OLD_DEFAULT_SCALE,
+            tostring(db and db[Frame.SCALE_USER_CHOSE] or false),
+            tostring(db and db[Frame.SCALE_MARKER] or false)))
+    end
     P("  ns.Find present=" .. tostring(ns.Find ~= nil) .. " ns.Sort present=" .. tostring(ns.Sort ~= nil))
 end
 
@@ -2439,7 +2531,14 @@ function Frame.EnsureStripEvents()
 end
 
 function Frame.OnLogin()
-    if Store and Store.db then Frame.ApplyDefaults(Store.db); Frame.MigrateDensity(Store.db) end
+    -- ORDER MATTERS: ApplyDefaults first (a DB with no scale key takes the NEW default,
+    -- so MigrateScale then sees a non-old value and is a no-op), then the two one-time
+    -- default heals.
+    if Store and Store.db then
+        Frame.ApplyDefaults(Store.db)
+        Frame.MigrateDensity(Store.db)
+        Frame.MigrateScale(Store.db)
+    end
     Frame.HookBagToggles()
     Frame.EnsureStripEvents()
     -- Subscribe to W1 capture's store-updated event (capture.lua fires
@@ -2759,26 +2858,58 @@ local function testKeyringOneRow(fails)
     ck(total == 48, "free/total counter still reports the ring's full 12 slots, got " .. total)
 end
 
--- WINDOW SCALE: 1.0-size parity default, additive seeding, clamped reads.
+-- WINDOW SCALE: the owner's bumped default, additive seeding, clamped reads.
 local function testWindowScale(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
-    -- The default is the 1.x composite (itemScale 0.91 * frame scale 0.98 = 0.8918).
-    ck(Frame.DEFAULT_SCALE == 0.89, "default window scale is the 1.0-parity 0.89")
-    -- Pitch parity: 2.0's (buttonSize + gap) * scale vs 1.x's 39 * 0.91 * 0.98 = 34.78.
+    -- OWNER DIRECTIVE 2026-08-03 ("bring the default scale of bags 2 up just a bit"):
+    -- the shipped default is 0.92, deliberately ABOVE the 1.x composite (0.91 * 0.98).
+    ck(Frame.DEFAULT_SCALE == 0.92, "default window scale is the owner's bumped 0.92")
+    ck(Frame.OLD_DEFAULT_SCALE == 0.89, "the superseded 1.0-parity default is named (0.89)")
+    ck(Frame.DEFAULT_SCALE > Frame.OLD_DEFAULT_SCALE, "the bump goes UP, not down")
+    -- "JUST A BIT": a few percent, not a redesign. Bounded on both sides so a future
+    -- round cannot quietly turn this into a different window.
+    local bump = Frame.DEFAULT_SCALE / Frame.OLD_DEFAULT_SCALE - 1
+    ck(bump > 0.01 and bump < 0.06,
+       "the bump is a 'just a bit' 1-6% step, got " .. string.format("%.3f", bump))
+    ck(Frame.DEFAULT_SCALE > Frame.MIN_SCALE and Frame.DEFAULT_SCALE < Frame.MAX_SCALE,
+       "the bumped default is inside the slider band")
+    -- The bump is a SIZE change only: pitch scales linearly, the cell/pitch SHAPE does not.
     local pitch2 = (Frame.DEFAULT_BUTTONSIZE + Frame.DEFAULT_GAP) * Frame.DEFAULT_SCALE
     local pitch1 = 39 * 0.91 * 0.98
-    ck(math.abs(pitch2 - pitch1) / pitch1 < 0.01,
-       "cell pitch within 1% of the 1.x window, got " .. pitch2 .. " vs " .. pitch1)
+    ck(pitch2 > pitch1, "the shipped pitch is larger than 1.x's 34.78, by design")
+    ck(math.abs(pitch2 - pitch1) / pitch1 < 0.06,
+       "…and still within a few percent of it, got " .. pitch2 .. " vs " .. pitch1)
 
     -- SEEDS ONLY WHEN ABSENT. A DB that predates the option has no key and takes the
     -- default; a user who already moved the slider keeps their number.
     local fresh = {}
     Frame.ApplyDefaults(fresh)
-    ck(fresh.scale == Frame.DEFAULT_SCALE, "absent scale seeded with the parity default")
+    ck(fresh.scale == Frame.DEFAULT_SCALE, "absent scale seeded with the bumped default (0.92)")
     local tuned = { scale = 1.15 }
     Frame.ApplyDefaults(tuned)
     ck(tuned.scale == 1.15, "an existing user scale is never clobbered")
+
+    -- The ONE deliberate write path clamps AND claims the user-chose marker.
+    local w = {}
+    ck(Frame.WriteScale(w, 1.10) == 1.10, "WriteScale returns the stored value")
+    ck(w.scale == 1.10, "WriteScale stores the slider value")
+    ck(w[Frame.SCALE_USER_CHOSE] == true, "a slider write claims the user-chose marker")
+    local clamped = {}
+    ck(Frame.WriteScale(clamped, 9) == Frame.MAX_SCALE, "WriteScale clamps high")
+    ck(clamped.scale == Frame.MAX_SCALE, "…and stores the clamped value, not the raw one")
+    ck(Frame.WriteScale(clamped, "nope") == Frame.DEFAULT_SCALE, "WriteScale coerces garbage to the default")
+    ck(clamped[Frame.SCALE_USER_CHOSE] == true, "…still a deliberate write, so the marker stands")
+    -- Setting the slider to exactly the OLD default is a real choice, and the marker is
+    -- what makes it survivable: MigrateScale must not mistake it for a shipped default.
+    local deliberate89 = {}
+    Frame.WriteScale(deliberate89, Frame.OLD_DEFAULT_SCALE)
+    ck(deliberate89.scale == Frame.OLD_DEFAULT_SCALE, "a deliberate 0.89 is stored as asked")
+    ck(deliberate89[Frame.SCALE_USER_CHOSE] == true, "…and is marked as chosen")
+    ck(Frame.MigrateScale(deliberate89) == false, "…so the heal leaves it alone")
+    ck(deliberate89.scale == Frame.OLD_DEFAULT_SCALE, "…and 0.89 survives")
+    -- nil db is a safe no-op that still reports a clamped value.
+    ck(Frame.WriteScale(nil, 0.75) == 0.75, "WriteScale with no db still clamps and returns")
 
     -- Clamp: garbage and out-of-band values can never produce a zero/huge window.
     ck(Frame.ClampScale(nil)      == Frame.DEFAULT_SCALE, "nil -> default")
@@ -2788,6 +2919,121 @@ local function testWindowScale(fails)
     ck(Frame.ClampScale(99)       == Frame.MAX_SCALE,     "huge -> max")
     ck(Frame.ClampScale(1.0)      == 1.0,                 "in-band value passes through")
     ck(Frame.ClampScale("0.75")   == 0.75,                "numeric string coerced")
+end
+
+-- WINDOW-SCALE DEFAULT HEAL (owner directive 2026-08-03, 0.89 -> 0.92).
+-- The match-by-value + user-chose pattern, pinned on every branch. This is the row that
+-- makes the bump actually REACH a live DB: ApplyDefaults has already written 0.89 into
+-- every character that has logged in since the scale option shipped, so seeding alone
+-- would change nothing on screen.
+local function testScaleHeal(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- (0) The value matcher: only the superseded default matches, on a tolerance far
+    -- finer than the slider's 0.01 grid.
+    ck(Frame.ScaleIsOldDefault(0.89) == true,  "0.89 is recognised as the old default")
+    ck(Frame.ScaleIsOldDefault("0.89") == true, "…as a numeric string too (SV round-trip)")
+    ck(Frame.ScaleIsOldDefault(0.89 + 1e-9) == true, "…and float noise still matches")
+    ck(Frame.ScaleIsOldDefault(0.88) == false, "0.88 (one slider notch down) is NOT the default")
+    ck(Frame.ScaleIsOldDefault(0.90) == false, "0.90 (one slider notch up) is NOT the default")
+    ck(Frame.ScaleIsOldDefault(0.92) == false, "the NEW default is not the old one")
+    ck(Frame.ScaleIsOldDefault(nil)  == false, "absent is not a match")
+    ck(Frame.ScaleIsOldDefault("x")  == false, "garbage is not a match")
+
+    -- (1) THE OWNER'S CASE. A DB seeded 0.89 by a previous build, never touched by the
+    -- slider, heals to the bumped default once and sets the marker.
+    local seeded = { scale = 0.89 }
+    ck(Frame.MigrateScale(seeded) == true, "a seeded 0.89 heals to the new default")
+    ck(seeded.scale == Frame.DEFAULT_SCALE, "…and lands on 0.92")
+    ck(seeded[Frame.SCALE_MARKER] == true, "one-time marker set")
+    -- Idempotent: a later deliberate change is never re-clobbered.
+    seeded.scale = 0.75
+    ck(Frame.MigrateScale(seeded) == false, "second run is a no-op (marker guards)")
+    ck(seeded.scale == 0.75, "post-heal value untouched by the re-run")
+
+    -- (2) ANY other stored value is intent and is left exactly alone.
+    for _, v in ipairs({ 0.5, 0.75, 0.88, 0.90, 0.92, 1.0, 1.15, 1.5 }) do
+        local db = { scale = v }
+        ck(Frame.MigrateScale(db) == false, "stored " .. v .. " is not healed")
+        ck(db.scale == v, "…and " .. v .. " survives verbatim")
+        ck(db[Frame.SCALE_MARKER] == true, "marker set even when nothing healed (" .. v .. ")")
+    end
+
+    -- (3) The explicit marker vetoes the heal even at EXACTLY the old default.
+    local chose = { scale = 0.89, [Frame.SCALE_USER_CHOSE] = true }
+    ck(Frame.MigrateScale(chose) == false, "scaleUserChose blocks the heal at 0.89")
+    ck(chose.scale == 0.89, "a deliberate 0.89 is preserved")
+
+    -- (4) Absent key: nothing to heal (ApplyDefaults owns the seed).
+    local absent = {}
+    ck(Frame.MigrateScale(absent) == false, "an absent scale is not a heal")
+    ck(absent.scale == nil, "…and MigrateScale never seeds — that is ApplyDefaults' job")
+
+    -- (5) nil / non-table guarded.
+    ck(Frame.MigrateScale(nil) == false, "nil db -> no heal")
+    ck(Frame.MigrateScale("db") == false, "non-table db -> no heal")
+
+    -- (6) THE LOGIN ORDER, end to end — the three DB shapes that actually exist.
+    --  a) fresh DB (no scale key at all) -> seeded straight to 0.92, heal is a no-op
+    local a = {}
+    Frame.ApplyDefaults(a); Frame.MigrateScale(a)
+    ck(a.scale == Frame.DEFAULT_SCALE, "login: a fresh DB lands on 0.92")
+    --  b) a DB the previous build seeded with 0.89 -> healed to 0.92
+    local b = { scale = 0.89 }
+    Frame.ApplyDefaults(b); Frame.MigrateScale(b)
+    ck(b.scale == Frame.DEFAULT_SCALE, "login: a 0.89-seeded DB is healed to 0.92")
+    --  c) a DB whose owner set the slider -> untouched, at any value
+    local c = {}
+    Frame.WriteScale(c, 1.20)
+    Frame.ApplyDefaults(c); Frame.MigrateScale(c)
+    ck(c.scale == 1.20, "login: a slider-set 1.20 is untouched")
+    -- ...and a SECOND login changes nothing anywhere (the whole thing is idempotent).
+    for _, db in ipairs({ a, b, c }) do
+        local before = db.scale
+        Frame.ApplyDefaults(db); Frame.MigrateScale(db)
+        ck(db.scale == before, "login 2 is a no-op (was " .. tostring(before) .. ")")
+    end
+
+    -- (7) THE CALL SITE. A heal nothing calls is worthless, and OnLogin is the only caller.
+    -- Headless-safe: HookBagToggles / EnsureStripEvents both no-op without _G.CreateFrame.
+    if Store then
+        local savedDb = Store.db
+        Store.db = { scale = 0.89 }
+        local okLogin, errLogin = pcall(Frame.OnLogin)
+        ck(okLogin, "LOGIN WIRING: Frame.OnLogin runs headless (" .. tostring(errLogin) .. ")")
+        ck(Store.db.scale == Frame.DEFAULT_SCALE,
+           "LOGIN WIRING: OnLogin heals a 0.89 DB to 0.92 (the bump actually reaches the owner)")
+        ck(Store.db[Frame.SCALE_MARKER] == true, "LOGIN WIRING: …and stamps the one-time marker")
+        Store.db = savedDb
+    end
+
+    -- (8) MUTATION GUARD. A heal that cannot fail is worthless. Point the matcher at a
+    -- value the owner's DB does NOT hold and the heal must stop firing; restore it and
+    -- the heal must come back. This proves the row is wired to the live constants.
+    local savedOld = Frame.OLD_DEFAULT_SCALE
+    Frame.OLD_DEFAULT_SCALE = 0.77
+    local m1 = { scale = 0.89 }
+    ck(Frame.MigrateScale(m1) == false and m1.scale == 0.89,
+       "MUTATION: a mis-aimed OLD_DEFAULT_SCALE stops healing 0.89 (the match row is live)")
+    Frame.OLD_DEFAULT_SCALE = savedOld
+    local m2 = { scale = 0.89 }
+    ck(Frame.MigrateScale(m2) == true and m2.scale == Frame.DEFAULT_SCALE,
+       "…and restoring 0.89 makes the heal fire again")
+
+    -- MUTATION: widen the tolerance past the slider grid and a NEIGHBOURING notch would
+    -- be wrongly swallowed — proving the 1e-6 epsilon is what protects 0.88 / 0.90.
+    local savedEps = Frame.SCALE_MATCH_EPS
+    Frame.SCALE_MATCH_EPS = 0.02
+    ck(Frame.ScaleIsOldDefault(0.90) == true,
+       "MUTATION: a 0.02 tolerance swallows the 0.90 notch (the epsilon row is live)")
+    Frame.SCALE_MATCH_EPS = savedEps
+    ck(Frame.ScaleIsOldDefault(0.90) == false, "…and restoring 1e-6 protects it again")
+
+    -- MUTATION: drop the marker discipline from the write path and a deliberate 0.89
+    -- would be healed away — the exact regression scaleUserChose exists to prevent.
+    local naive = { scale = Frame.ClampScale(0.89) }    -- a write with no marker claimed
+    ck(Frame.MigrateScale(naive) == true,
+       "MUTATION: an unmarked 0.89 write IS healed (marker discipline is load-bearing)")
 end
 
 -- HEADER: the title is the character NAME ONLY (no possessive, no noun).
@@ -3152,7 +3398,8 @@ function Frame.RunSelfTests(verbose)
         { name = "keyring gate",        fn = testKeyringGate },
         { name = "keyring dynamic size", fn = testKeyringDynamicSize },
         { name = "keyring one-row clamp", fn = testKeyringOneRow },
-        { name = "window scale (1.0 parity)", fn = testWindowScale },
+        { name = "window scale (owner default)", fn = testWindowScale },
+        { name = "window scale heal (0.89 -> 0.92)", fn = testScaleHeal },
         { name = "window title (name only)",  fn = testWindowTitle },
         { name = "category section size", fn = testCategorySectionSize },
         { name = "effective mode",       fn = testEffectiveMode },

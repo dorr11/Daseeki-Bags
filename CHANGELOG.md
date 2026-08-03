@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **The bag window opens a little bigger by default.** You asked to bring the default
+  scale up just a bit, so it moved from **89% to 92%** — about three percent, which is
+  roughly a pixel and a half on each slot. Only the *size* changed: the slot shape, the
+  spacing between slots and the glow proportions are all exactly what they were, so the
+  window is the same window, just slightly larger. The bank window follows it, as always.
+  - **It applies to you even though your setting already said 89%.** The 89% had been
+    written into your saved settings the first time you logged in with the scale option,
+    so simply changing the default would have done nothing. Bags 2 therefore does a
+    one-time check on the next login: if your window scale is *still sitting at the old
+    89% default* and you have never moved the slider, it becomes 92%. It happens once,
+    ever, and it is remembered so it can never happen twice.
+  - **If you ever moved the Window scale slider, nothing happens.** Any value other than
+    exactly the old default is treated as your choice and is left completely alone — and
+    from now on the slider records that you set it, so even deliberately choosing 89%
+    survives. Future default changes will never take back a number you picked.
+  - **You can still change it whenever you like**: Options → Grid → *Window scale*.
+  - This is the one place Bags 2 knowingly departs from matching Bags 1's size exactly.
+    That was a deliberate call from you, and the size-parity tests record it as such
+    rather than quietly loosening — they still prove Bags 2 reproduces Bags 1's window
+    pixel-for-pixel at the old value, and separately that the shipped default now sits a
+    few percent above it on purpose.
+
 - **Right-click the sort button to lock bag slots, exactly like Bags 1.** This is the
   feature that had not been carried over yet. Right-clicking the sort glyph puts the
   window into a **lock configuration mode**: a notice appears above the window explaining

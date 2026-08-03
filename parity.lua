@@ -146,12 +146,45 @@ function Parity.OneXComposite(itemScale, frameScale)
     }
 end
 
+----------------------------------------------------------------------
+-- THE TWO SCALES. Until 2026-08-03 these were the same number and this file only needed
+-- one; they are now deliberately different, and keeping them apart is what lets the suite
+-- stay green without quietly abandoning the parity proof.
+--
+--   STRICT_PARITY_SCALE — the composite of the owner's two 1.x knobs, 0.91 * 0.98. This
+--     is what "a 2.0 cell is a 1.x cell" MEANS, and every ABSOLUTE size comparison below
+--     is made at it. It is a property of 1.x and never moves.
+--
+--   ShippedScale()      — what 2.0 actually ships as Frame.DEFAULT_SCALE, read LIVE so
+--     this file can never drift from the addon (parity.lua loads BEFORE ui_frame.lua, so
+--     it must be resolved at CALL time, not at load time).
+--
+-- OWNER DIRECTIVE 2026-08-03, verbatim: "bring the default scale of bags 2 up just a
+-- bit." 0.89 -> 0.92. That is a KNOWING divergence from strict 1.x size parity — the
+-- owner lived with the parity window and asked for a slightly larger one — and it is the
+-- second entry on this file's short list of deliberate departures (the first is the
+-- new-item wax dot). It is a SIZE change only: the cell/pitch ratio, the halo/cell ratio
+-- and the icon fill are all scale-invariant, so the cell keeps 1.x's SHAPE exactly.
+-- The suite therefore asserts three separate things: (a) the 2.0 model still reproduces
+-- 1.x exactly when handed STRICT_PARITY_SCALE, (b) the shipped default sits above it,
+-- (c) by a bounded "just a bit" amount, so no later round can drift this into a redesign
+-- without turning the suite red.
+----------------------------------------------------------------------
+Parity.STRICT_PARITY_SCALE = 0.91 * 0.98        -- 0.8918
+Parity.MAX_OWNER_BUMP      = 0.06               -- "just a bit" — the authorised band
+
+function Parity.ShippedScale()
+    return (ns.Frame and ns.Frame.DEFAULT_SCALE) or 0.92
+end
+
 -- 2.0 has ONE scale and sizes the button directly, so its composite is buttonSize/gap
--- times the window scale. `size` and `gap` are the shipped defaults unless overridden.
+-- times the window scale. `size` and `gap` are the shipped defaults unless overridden;
+-- `scale` defaults to the SHIPPED default, so callers that want the strict-parity
+-- comparison must pass Parity.STRICT_PARITY_SCALE explicitly.
 function Parity.TwoOhComposite(scale, size, gap)
     local Items   = ns.Items
     local Borders = ns.Borders
-    scale = scale or 0.89                      -- ui_frame.lua Frame.DEFAULT_SCALE
+    scale = scale or Parity.ShippedScale()     -- ui_frame.lua Frame.DEFAULT_SCALE
     size  = size  or (Items and Items.DEFAULT_SIZE) or 37
     gap   = gap   or (Items and Items.DEFAULT_GAP)  or 2
     return {
@@ -257,12 +290,14 @@ local function ctxOf(quality, extra)
     return c
 end
 
--- ROW 1-5: the GEOMETRY composite. Both models must land on the same on-screen numbers at
--- the shipped defaults; the ratios must match exactly at every density.
+-- ROW 1-5: the GEOMETRY composite. The two models must land on the same on-screen numbers
+-- AT THE STRICT-PARITY SCALE, and the ratios must match exactly at every density and at
+-- the shipped scale — the owner's 2026-08-03 size bump is a size change, not a shape one.
 local function testGeometryComposite(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    local one = Parity.OneXComposite()
-    local two = Parity.TwoOhComposite()
+    local one    = Parity.OneXComposite()
+    local two    = Parity.TwoOhComposite()                              -- SHIPPED default
+    local twoPar = Parity.TwoOhComposite(Parity.STRICT_PARITY_SCALE)    -- strict 1.x parity
 
     -- 1.x at the owner's real settings: 0.91 * 0.98 = 0.8918
     ck(approx(one.cell,  37 * 0.8918, 1e-9), "1.x cell = 37 * 0.91 * 0.98 = 33.00")
@@ -270,17 +305,43 @@ local function testGeometryComposite(fails)
     ck(approx(one.gap,    2 * 0.8918, 1e-9), "1.x gap = 2 * 0.91 * 0.98 = 1.78")
     ck(approx(one.halo,  67 * 0.8918, 1e-9), "1.x halo = 67 * 0.91 * 0.98 = 59.75")
     ck(one.haloOff == 0, "1.x halo has no vertical offset")
+    ck(approx(Parity.STRICT_PARITY_SCALE, 0.8918, 1e-9),
+        "the strict-parity scale IS the 1.x composite (0.91 * 0.98)")
 
-    -- 2.0 at its shipped defaults: one window scale of 0.89 stands in for both 1.x knobs.
-    -- The absolute sizes agree to well under a pixel; the RATIOS agree exactly.
-    ck(math.abs(one.cell  - two.cell)  < 0.1, "cell parity within 0.1px")
-    ck(math.abs(one.pitch - two.pitch) < 0.1, "pitch parity within 0.1px")
-    ck(math.abs(one.gap   - two.gap)   < 0.1, "gap parity within 0.1px")
-    ck(math.abs(one.halo  - two.halo)  < 0.2, "halo parity within 0.2px")
+    -- THE MODEL IS STILL RIGHT. Hand 2.0 the strict-parity scale and ONE window scale still
+    -- stands in for both 1.x knobs: the absolute sizes agree to well under a pixel. This is
+    -- the original parity proof, unchanged — it simply no longer runs at the SHIPPED scale,
+    -- because the owner asked for a slightly larger window (next block).
+    ck(math.abs(one.cell  - twoPar.cell)  < 0.1, "cell parity within 0.1px at the parity scale")
+    ck(math.abs(one.pitch - twoPar.pitch) < 0.1, "pitch parity within 0.1px at the parity scale")
+    ck(math.abs(one.gap   - twoPar.gap)   < 0.1, "gap parity within 0.1px at the parity scale")
+    ck(math.abs(one.halo  - twoPar.halo)  < 0.2, "halo parity within 0.2px at the parity scale")
     ck(two.haloOff == 0, "2.0 halo has no vertical offset either (1.x item.lua:57)")
 
-    -- RATIOS are the density-invariant contract: whatever the density slider does, a 2.0
-    -- cell must be the same SHAPE as a 1.x cell.
+    -- THE OWNER'S DELIBERATE DIVERGENCE — directive 2026-08-03, verbatim: "bring the
+    -- default scale of bags 2 up just a bit." The shipped default sits ABOVE strict parity
+    -- on purpose, by a bounded amount. These rows are the RECORD of that decision: they are
+    -- what stops the bump being read as a regression by a later round, and what stops a
+    -- later round drifting it into a redesign.
+    ck(ns.Frame ~= nil, "ui_frame is loaded, so the shipped scale is resolvable")
+    ck(approx(Parity.ShippedScale(), (ns.Frame and ns.Frame.DEFAULT_SCALE) or -1, 1e-12),
+        "the shipped scale is read LIVE from ui_frame (no second copy to drift)")
+    ck(approx(Parity.ShippedScale(), 0.92, 1e-9), "…and it is the owner's 0.92")
+    ck(Parity.ShippedScale() > Parity.STRICT_PARITY_SCALE,
+        "2.0 ships LARGER than strict 1.x parity — owner-directed, not a defect")
+    local bump = Parity.ShippedScale() / Parity.STRICT_PARITY_SCALE - 1
+    ck(bump > 0 and bump <= Parity.MAX_OWNER_BUMP,
+        "…by 'just a bit' (<= " .. Parity.MAX_OWNER_BUMP .. "), got " .. string.format("%.4f", bump))
+    -- The divergence is EXACTLY the scale ratio in every absolute dimension, i.e. the
+    -- shipped cell is a uniformly scaled 1.x cell, never a re-proportioned one.
+    for _, k in ipairs({ "cell", "pitch", "gap", "halo" }) do
+        ck(approx(two[k] / twoPar[k], 1 + bump, 1e-9),
+            "the bump scales '" .. k .. "' uniformly (no re-proportioning)")
+    end
+
+    -- RATIOS are the density-invariant contract: whatever the density slider does — and
+    -- whatever the window scale is — a 2.0 cell must be the same SHAPE as a 1.x cell.
+    -- These run at the SHIPPED scale, because that is the cell the owner actually sees.
     ck(approx(one.cell / one.pitch, two.cell / two.pitch), "icon-to-pitch ratio identical (37/39)")
     ck(approx(one.halo / one.cell,  two.halo / two.cell),  "halo-to-cell ratio identical (67/37)")
 
@@ -289,14 +350,20 @@ local function testGeometryComposite(fails)
     local twoBig = Parity.TwoOhComposite(1.0, 48, math.floor(48 * 2 / 37 + 0.5))
     ck(approx(twoBig.halo / twoBig.cell, one.halo / one.cell), "halo ratio holds at cell 48")
 
-    -- PERCEIVED read-outs, the numbers the owner is actually looking at.
-    local p1, p2 = Parity.Perceived(one), Parity.Perceived(two)
+    -- PERCEIVED read-outs, the numbers the owner is actually looking at. The two ABSOLUTE
+    -- ones (overhang, bleed) are compared at the parity scale — they carry the window
+    -- scale, so at the shipped scale they are larger by exactly the bump, asserted below.
+    local p1, p2 = Parity.Perceived(one), Parity.Perceived(twoPar)
     ck(math.abs(p1.overhang - p2.overhang) < 0.1, "halo overhang past the icon matches (~13.4px)")
     ck(math.abs(p1.bleed    - p2.bleed)    < 0.1, "halo bleed onto the neighbour icon matches (~11.6px)")
-    ck(math.abs(p1.fill     - p2.fill)     < 1e-9, "icon fill of the pitch matches (0.949)")
+    -- FILL is a pure ratio, so it must match at the SHIPPED scale with no allowance at all.
+    ck(math.abs(p1.fill - Parity.Perceived(two).fill) < 1e-9, "icon fill of the pitch matches (0.949)")
     -- Sanity on the shape of the answer: the halo DOES reach the neighbour in both models
     -- (that is 1.x's look, not a defect) and it overhangs by more than the gap.
     ck(p1.bleed > 0 and p2.bleed > 0, "both models bleed onto the neighbour (1.x behaviour)")
+    local pShip = Parity.Perceived(two)
+    ck(approx(pShip.overhang / p2.overhang, 1 + bump, 1e-9),
+        "at the shipped scale the overhang grows by exactly the owner's bump")
 end
 
 -- ROW 6-9: the GLOW constants, 2.0's live values against the 1.x transcription.
@@ -461,29 +528,52 @@ end
 local function testMutations(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local X = Parity.ONE_X
+    -- The ABSOLUTE-size rows are the ones the geometry suite compares at the strict-parity
+    -- scale (the shipped default is deliberately larger — owner directive 2026-08-03), so
+    -- the mutations must be observed there too, or they would be testing the size bump
+    -- instead of the row they name.
+    local function twoAtParity() return Parity.TwoOhComposite(Parity.STRICT_PARITY_SCALE) end
 
     -- MUTATION 1 — the GLOW SIZE row. Put the previous round's spec value (68) back into the
     -- 1.x model and the geometry composite must diverge beyond its own tolerance.
     local saved = X.GLOW_SIZE
     X.GLOW_SIZE = 68
-    local one, two = Parity.OneXComposite(), Parity.TwoOhComposite()
+    local one, two = Parity.OneXComposite(), twoAtParity()
     ck(math.abs(one.halo - two.halo) >= 0.2 or math.abs(one.halo / one.cell - two.halo / two.cell) > 1e-9,
         "MUTATION: a 68px 1.x halo is detected as a mismatch (the glow-size row is live)")
     X.GLOW_SIZE = saved
-    local one2, two2 = Parity.OneXComposite(), Parity.TwoOhComposite()
+    local one2, two2 = Parity.OneXComposite(), twoAtParity()
     ck(math.abs(one2.halo - two2.halo) < 0.2, "…and restoring 67 makes the row pass again")
 
     -- MUTATION 2 — the CELL PITCH row. Loosen 1.x's spacing to the pre-parity 4 and the
     -- pitch/gap/fill checks must all diverge.
     local savedSp, savedPitch = X.SPACING, X.PITCH_UNITS
     X.SPACING, X.PITCH_UNITS = 4, 41
-    local one3, two3 = Parity.OneXComposite(), Parity.TwoOhComposite()
+    local one3, two3 = Parity.OneXComposite(), twoAtParity()
     ck(math.abs(one3.pitch - two3.pitch) >= 0.1, "MUTATION: a 41px 1.x pitch is detected (pitch row is live)")
     ck(math.abs(Parity.Perceived(one3).fill - Parity.Perceived(two3).fill) > 1e-9,
         "MUTATION: …and the icon-fill ratio moves with it")
     X.SPACING, X.PITCH_UNITS = savedSp, savedPitch
-    local one4, two4 = Parity.OneXComposite(), Parity.TwoOhComposite()
+    local one4, two4 = Parity.OneXComposite(), twoAtParity()
     ck(math.abs(one4.pitch - two4.pitch) < 0.1, "…and restoring 39 makes the row pass again")
+
+    -- MUTATION 2b — THE OWNER'S SIZE BUMP is itself a live row, not a comment. Point the
+    -- shipped scale back at strict parity and the divergence assertions must stop holding;
+    -- push it past the authorised band and the "just a bit" bound must catch it. This is
+    -- what keeps the 0.89 -> 0.92 decision an asserted fact rather than a stale note.
+    local realShipped = Parity.ShippedScale
+    Parity.ShippedScale = function() return Parity.STRICT_PARITY_SCALE end
+    ck(not (Parity.ShippedScale() > Parity.STRICT_PARITY_SCALE),
+        "MUTATION: a shipped scale back at strict parity is detected (the bump row is live)")
+    ck(math.abs(Parity.TwoOhComposite().cell - twoAtParity().cell) < 1e-9,
+        "MUTATION: …and the shipped composite collapses onto the parity composite")
+    Parity.ShippedScale = function() return Parity.STRICT_PARITY_SCALE * 1.5 end
+    ck(Parity.ShippedScale() / Parity.STRICT_PARITY_SCALE - 1 > Parity.MAX_OWNER_BUMP,
+        "MUTATION: a 50% scale is caught by the 'just a bit' bound")
+    Parity.ShippedScale = realShipped
+    local realBump = Parity.ShippedScale() / Parity.STRICT_PARITY_SCALE - 1
+    ck(realBump > 0 and realBump <= Parity.MAX_OWNER_BUMP,
+        "…and restoring the owner's 0.92 puts the bump back inside the band")
 
     -- MUTATION 3 — the DIM row, against the live 2.0 value rather than a local copy.
     local savedDim = X.DIM_ALPHA
