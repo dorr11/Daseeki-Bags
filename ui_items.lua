@@ -1423,8 +1423,10 @@ end
 -- Re-colour + show/hide the per-cell edge from the live profile value. Idempotent; safe on
 -- every repaint (texture ops only). Alpha 0 hides it outright, so 1.x's own default
 -- ({1,1,1,0}) reproduces 1.x's own "no visible edge" exactly.
+-- STRUCTURE IS BAKED AT CREATION (C rule 1): this NEVER creates the outline, so a repaint
+-- — which can land mid-combat — is a pure texture op. ensureDress owns the CreateFrame.
 local function applySlotBorder(button)
-    local o = button._dsSlotBorder or ensureSlotBorder(button)
+    local o = button._dsSlotBorder
     if not o then return end
     local r, g, b, a = Items.SlotBorderColor()
     if a <= 0 then o:Hide(); return end
