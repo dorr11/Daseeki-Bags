@@ -147,10 +147,29 @@ function ns:RunRegisteredSelfTests(verbose)
 end
 
 ----------------------------------------------------------------------
--- Slash routing — /bags (short /dbags). Subcommands mirror the surface the
--- feature waves fill in; `debug selftest` runs the pure suites in-game.
--- Guarded so the file loads headless (no SlashCmdList global).
+-- Slash routing — /bags (short /dbags), plus the two LEGACY 1.x commands.
+--
+-- RELEASE-GATE C.10 ("previous slash commands still resolve"), and the same reasoning
+-- as the legacy Bindings.xml action names (AT-RISK-4): 1.x registered `/Daseeki-Bags`
+-- and `/dbg` (its slashCommands.lua:26-28, keyed on the folder name). At the cutover the
+-- 1.x tree goes away and, with it, those two commands — so anything the owner has typed
+-- for years, or written into a macro, would start answering "Type /help for a list of
+-- commands". They are therefore re-registered here onto the SAME dispatcher. Four
+-- command strings on one SlashCmdList key is ordinary; the client scans SLASH_<KEY><n>.
+--
+-- Declared unconditionally (not inside the SlashCmdList guard) so the headless harness
+-- can assert the roster: this list is the C.10 regression guard, and losing an entry
+-- from it is the slash-command version of orphaning a keybinding.
+--
+-- Subcommands mirror the surface the feature waves fill in; `debug selftest` runs the
+-- pure suites in-game. `mesh` is a legacy 1.x subcommand kept as a SIGNPOST (gate E.19):
+-- cross-account sync moved to Daseeki-Nexus, and the point of loss is where it is said.
 ----------------------------------------------------------------------
+
+ns.SLASH_COMMANDS = { "/bags", "/dbags", "/dbg", "/daseeki-bags" }
+-- The subset inherited from 1.x. Dropping one is a user typing into the void.
+ns.SLASH_LEGACY   = { "/dbg", "/daseeki-bags" }
+
 
 local function dispatch(msg)
     local cmd, rest = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
@@ -182,8 +201,14 @@ local function dispatch(msg)
         else
             ns:Print("unknown debug command: " .. sub)
         end
+    elseif cmd == "mesh" then
+        -- 1.x's cross-account sync commands (/dbg mesh, mesh send, mesh clear). The
+        -- feature moved to Daseeki-Nexus; say so once, here, where it is missed.
+        ns:Print("cross-account sync moved to Daseeki Nexus. Your 1.x mesh data was " ..
+                 "imported and those characters are in the character list; the live " ..
+                 "sync itself is now the Nexus Inventory module.")
     elseif cmd == "help" then
-        ns:Print("commands (/bags, short /dbags):")
+        ns:Print("commands (/bags, short /dbags; 1.x's /dbg and /Daseeki-Bags still work):")
         ns:Print("  /bags [toggle]      - show/hide the bag window")
         ns:Print("  /bags bank          - show/hide the bank window")
         ns:Print("  /bags find <name>   - find an item across every character")
@@ -198,8 +223,9 @@ end
 ns.SlashDispatch = dispatch
 
 if _G.SlashCmdList then
-    _G.SLASH_DASEEKIBAGS1 = "/bags"
-    _G.SLASH_DASEEKIBAGS2 = "/dbags"
+    for i, cmdText in ipairs(ns.SLASH_COMMANDS) do
+        _G["SLASH_DASEEKIBAGS" .. i] = cmdText
+    end
     _G.SlashCmdList["DASEEKIBAGS"] = dispatch
 end
 
@@ -361,10 +387,36 @@ local function testEventRegistry(fails)
     ck(true, "RegisterEvent accepts multiple handlers")
 end
 
+-- Slash roster (release-gate C.10). The mirror of the harness's EXPECTED_BINDINGS check:
+-- a command the owner has typed for years, or baked into a macro, must not vanish because
+-- the addon it belonged to was rewritten. The two 1.x commands are named explicitly so
+-- deleting one from ns.SLASH_COMMANDS turns this suite red instead of shipping.
+local function testSlashRoster(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local declared = {}
+    for _, c in ipairs(ns.SLASH_COMMANDS or {}) do declared[c] = true end
+    ck(declared["/bags"],  "/bags is declared")
+    ck(declared["/dbags"], "/dbags is declared")
+    for _, c in ipairs(ns.SLASH_LEGACY or {}) do
+        ck(declared[c], "LEGACY 1.x command " .. c .. " is still declared (gate C.10)")
+    end
+    ck(type(ns.SlashDispatch) == "function", "one dispatcher backs every command")
+    -- The legacy `mesh` subcommand answers with the where-it-went notice rather than
+    -- "unknown command" (gate E.19: a moved feature announces itself at the point of loss).
+    local said = {}
+    local realPrint = ns.Print
+    ns.Print = function(_, ...) said[#said + 1] = table.concat({ ... }, " ") end
+    ns.SlashDispatch("mesh")
+    ns.Print = realPrint
+    ck(#said == 1 and said[1]:lower():find("nexus", 1, true) ~= nil,
+       "/dbg mesh points at Daseeki Nexus instead of failing as unknown")
+end
+
 function ns.CoreRunSelfTests(verbose)
     local suites = {
         { name = "bus + error routing", fn = testBusAndRouting },
         { name = "event registry",      fn = testEventRegistry },
+        { name = "slash roster",        fn = testSlashRoster },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
