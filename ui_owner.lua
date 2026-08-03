@@ -67,6 +67,29 @@ function Owner.FreshnessLabel(ageSeconds, isSelf)
     return string.format("Updated %dd ago", math.floor(ageSeconds / 86400))
 end
 
+-- PURE: the COMPRESSED freshness label — the character MENU's age column (header-selector
+-- round, owner directive 2: "instead of 'Updated 5d ago' just put '5d'").
+--
+-- FreshnessLabel above is unchanged and still the long form; it is what the BANK window's
+-- titlebar stamp reads (ui_bank Rebuild), where the sentence is the whole point — that
+-- stamp is a standing caption on an offline view, not a column header. In the menu the
+-- word "Updated" repeats on every one of up to ~30 rows and the word "ago" repeats after
+-- it, so the only glyphs that ever differ are the number and the unit. Dropping the two
+-- constant words takes the column from 104px to 44 and the whole menu 60px narrower.
+--
+-- The two NON-age states keep their words, because they are not durations and a bare
+-- token cannot say them: self reads "Online" (it is the live character, not a snapshot)
+-- and a never-captured owner reads "No data". Both fit the 44px column at the micro size.
+-- Sub-minute compresses to "now" rather than "0m", which would read as a stopped clock.
+function Owner.AgeLabel(ageSeconds, isSelf)
+    if isSelf then return "Online" end
+    if not ageSeconds or ageSeconds < 0 then return "No data" end
+    if ageSeconds < 60    then return "now" end
+    if ageSeconds < 3600  then return string.format("%dm", math.floor(ageSeconds / 60)) end
+    if ageSeconds < 86400 then return string.format("%dh", math.floor(ageSeconds / 3600)) end
+    return string.format("%dd", math.floor(ageSeconds / 86400))
+end
+
 -- Source badge text: a fully-captured owner ("Full", per-slot bags/bank) vs a mesh
 -- summary owner ("Summary", money + aggregate counts only, no browsable slots).
 function Owner.SourceBadge(source)
@@ -152,7 +175,13 @@ end
 -- column is clamped so one absurd name cannot push the age column off the menu; a name
 -- past the clamp ellipsizes (SetWordWrap(false) on a width-constrained fontstring).
 --
---   [8][pip 6][6][ NAME (class color, clamped) ][8][ TAG ][8][ AGE ][8][✕][2][★][8]
+--   [8][pip 6][6][ NAME (class color, clamped) ][8][ TAG ][8][AGE][8][✕][2][★][8]
+--
+-- The AGE column is the compressed one (Owner.AgeLabel — "5d", not "Updated 5d ago"),
+-- which is what let it drop from 104px to 44; the two CONTROL columns went the other way,
+-- 16 -> 18, because the favourite star is now a drawn glyph rather than a font character
+-- and needed the extra pixels to read. Net: the menu is ~56px narrower than the footer
+-- round shipped.
 --
 -- Metadata (tag + age) drops to the small/micro font in muted ink so a ~30-row menu
 -- reads as one scannable column of NAMES with quiet annotations, not five competing
@@ -167,8 +196,8 @@ Owner.MENU = {
     NAME_MAX = 190,  -- …nor grows past it (a long name ellipsizes instead)
     COL_GAP  = 8,
     BADGE_W  = 58,   -- fits "SUMMARY" at the micro-label size
-    AGE_W    = 104,  -- fits "Updated 12d ago" at the small size
-    CTRL_W   = 16,   -- the ✕ and the ★
+    AGE_W    = 44,   -- fits the compressed "27d" / "Online" / "No data" (Owner.AgeLabel)
+    CTRL_W   = 18,   -- the ✕ and the ★ (18, not 16: the star is drawn art now — see below)
     CTRL_GAP = 2,
     PAD_R    = 8,
     ROW_H    = 22,
@@ -197,11 +226,16 @@ end
 
 -- PURE: which way the owner flyout opens off its face button.
 --
--- The selector used to live in the title row, where the only sane direction is DOWN.
--- The footer round moved it to the window's bottom-left corner, and a menu that still
--- dropped downward from there would open BELOW the window — off the bottom of the
--- screen for anyone whose bags sit low, which is most people. `grow = "up"` anchors the
--- menu's BOTTOM edge to the button's TOP so it rises over the window instead.
+-- HISTORY, because both directions are live decisions and neither is a default:
+--   * The selector originally lived in the TITLE row, where the only sane direction is
+--     DOWN — the menu hangs over the window it belongs to.
+--   * The footer round moved it to the bottom-left corner, where a downward drop would
+--     have opened BELOW the window and off the bottom of the screen for anyone whose bags
+--     sit low. `grow = "up"` anchors the menu's BOTTOM edge to the button's TOP instead.
+--   * The header-selector round moved it BACK to the title row (as the arrow beside the
+--     character name), so both windows pass "down" again. The upward growth was a
+--     bottom-corner necessity and nothing else; it is kept because it is the correct
+--     answer for any future bottom-anchored face, and because it costs one branch.
 --
 -- Returns point, relPoint, x, y — the four arguments the frame layer feeds SetPoint.
 -- Anything other than "up" reads as the original downward drop, so an unset/garbage
@@ -544,51 +578,101 @@ local function confirmRemoveOwner(key, name, onDone)
     _G.StaticPopup_Show(REMOVE_POPUP, name or key, nil, { key = key, onDone = onDone })
 end
 
--- Create an owner selector: a compact button showing the viewed character's name
--- (class-colored) with a caret, opening a click-away flyout of register rows.
---   opts = { onSelect = function(key) ... end, width = <n>, menuGrow = "up"|"down" }
+-- Where this file finds the addon's own glyph art. Resolved at CALL time off ns.Frame so
+-- the two files cannot disagree about the folder, with the literal path as the fallback
+-- for a load order (or a stripped tree) where ui_frame is not there.
+local function artPath()
+    return (ns.Frame and ns.Frame.ART)
+           or ("Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\")
+end
+
+-- The header form's footprint: a square that holds the drawn caret beside the title text.
+Owner.ARROW_W = 16
+
+-- Create an owner selector — the face that opens the character menu. TWO FORMS:
+--
+--   HEADER (opts.arrowOnly = true) — the shipping form. A bare dropdown CARET drawn
+--     beside the window's gold character NAME, with NO mouse of its own: the window owns
+--     one hit area covering the name AND the arrow together and drives this widget through
+--     frame:Toggle(anchor). That is deliberate. If the arrow took its own clicks it would
+--     be a second mouse-enabled child overlapping the title's hit area at the same frame
+--     level, and which of the two got a given click would come down to creation order.
+--     One hit area, one answer. (See Frame.TitleClickAction for what each button means.)
+--
+--   STANDALONE (default) — the original 150px button: seal pip, class-coloured name and a
+--     caret, in its own control-filled frame. No live caller since the header round; it is
+--     the general form of the widget and the one any future non-title placement would use.
+--
+--   opts = { onSelect = function(key) ... end, width = <n>, menuGrow = "up"|"down",
+--            arrowOnly = <bool> }
 -- `menuGrow` is the flyout's direction (see Owner.MenuAnchor); it defaults to the
 -- historic downward drop, so an omitted value is exactly the old behaviour.
--- Returns a frame with :Refresh() (re-syncs the button label to the current view).
+-- Returns a frame with :Refresh() (re-syncs the face to the current view), :Toggle(anchor)
+-- (open/close the menu against `anchor`, defaulting to the widget itself) and
+-- :SetHot(bool) (drive the hover tint from the window's hit area, header form).
 function Owner.CreateSelector(parent, opts)
     opts = opts or {}
     if not _G.CreateFrame then return nil end
     UI = UI or _G.DaseekiUI
     if not UI then return nil end
 
-    local width = opts.width or 150
+    local arrowOnly = opts.arrowOnly and true or false
+    local width  = opts.width or (arrowOnly and Owner.ARROW_W or 150)
+    local height = arrowOnly and Owner.ARROW_W or 22
     local frame = _G.CreateFrame("Frame", nil, parent)
-    frame:SetSize(width, 22)
+    frame:SetSize(width, height)
 
-    -- The face button (current owner + caret), quiet control fill, crimson hover.
-    local btn = _G.CreateFrame("Button", nil, frame, "BackdropTemplate")
-    btn:SetAllPoints(frame)
-    UI.Skin(btn, function(self)
-        self:SetBackdrop(UI.FLAT_BACKDROP)
-        self:SetBackdropColor(UI.Color("control"))
-        self:SetBackdropBorderColor(UI.Color("controlBorder"))
-    end)
-    local hover = btn:CreateTexture(nil, "HIGHLIGHT")
-    hover:SetAllPoints()
-    UI.Skin(hover, function(self) self:SetColorTexture(UI.Color("brand", 0.14)) end)
-    btn:SetHighlightTexture(hover)
+    local btn, pip, nameFS
+    if arrowOnly then
+        -- The caret is DRAWN ART, not the text "v" the standalone form used: the suite's
+        -- picked faces carry no dropdown glyph, and a lowercase v beside a proper noun
+        -- reads as part of the name. `muted` at rest, `accent` while the window's title
+        -- hit area is hovered (SetHot), matching every other control in the row.
+        local caretTex = frame:CreateTexture(nil, "OVERLAY")
+        caretTex:SetAllPoints(frame)
+        caretTex:SetTexture(artPath() .. "icon-caret-down")
+        UI.Skin(caretTex, function(self)
+            self:SetVertexColor(UI.Color(frame._hot and "accent" or "muted"))
+        end)
+        frame._caret = caretTex
+        function frame:SetHot(hot)
+            self._hot = hot and true or nil
+            if self._caret then self._caret:SetVertexColor(UI.Color(self._hot and "accent" or "muted")) end
+        end
+    else
+        -- The face button (current owner + caret), quiet control fill, crimson hover.
+        btn = _G.CreateFrame("Button", nil, frame, "BackdropTemplate")
+        btn:SetAllPoints(frame)
+        UI.Skin(btn, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("control"))
+            self:SetBackdropBorderColor(UI.Color("controlBorder"))
+        end)
+        local hover = btn:CreateTexture(nil, "HIGHLIGHT")
+        hover:SetAllPoints()
+        UI.Skin(hover, function(self) self:SetColorTexture(UI.Color("brand", 0.14)) end)
+        btn:SetHighlightTexture(hover)
 
-    -- seal pip (BRAND_SPEC §5: one square pip per register row; online=lit, offline=idle)
-    local pip = btn:CreateTexture(nil, "OVERLAY")
-    pip:SetSize(6, 6)
-    pip:SetPoint("LEFT", btn, "LEFT", 6, 0)
+        -- seal pip (BRAND_SPEC §5: one square pip per register row; online=lit, offline=idle)
+        pip = btn:CreateTexture(nil, "OVERLAY")
+        pip:SetSize(6, 6)
+        pip:SetPoint("LEFT", btn, "LEFT", 6, 0)
 
-    local nameFS = btn:CreateFontString(nil, "OVERLAY")
-    nameFS:SetFontObject(UI.fonts.body)
-    nameFS:SetPoint("LEFT", pip, "RIGHT", 5, 0)
-    nameFS:SetPoint("RIGHT", btn, "RIGHT", -16, 0)
-    nameFS:SetJustifyH("LEFT")
-    nameFS:SetWordWrap(false)
+        nameFS = btn:CreateFontString(nil, "OVERLAY")
+        nameFS:SetFontObject(UI.fonts.body)
+        nameFS:SetPoint("LEFT", pip, "RIGHT", 5, 0)
+        nameFS:SetPoint("RIGHT", btn, "RIGHT", -22, 0)   -- clears the caret's 16px + inset
+        nameFS:SetJustifyH("LEFT")
+        nameFS:SetWordWrap(false)
 
-    local caret = btn:CreateFontString(nil, "OVERLAY")
-    caret:SetFontObject(UI.fonts.muted)
-    caret:SetPoint("RIGHT", btn, "RIGHT", -5, 0)
-    caret:SetText("v")
+        -- Parented to the BUTTON, not the outer frame: the button carries the backdrop, so
+        -- a caret drawn on the frame behind it would be painted over by the control fill.
+        local caret = btn:CreateTexture(nil, "OVERLAY")
+        caret:SetSize(Owner.ARROW_W, Owner.ARROW_W)
+        caret:SetPoint("RIGHT", btn, "RIGHT", -4, 0)
+        caret:SetTexture(artPath() .. "icon-caret-down")
+        UI.Skin(caret, function(self) self:SetVertexColor(UI.Color("muted")) end)
+    end
 
     frame._btn, frame._pip, frame._name = btn, pip, nameFS
 
@@ -677,15 +761,30 @@ function Owner.CreateSelector(parent, opts)
         row._fresh:SetJustifyH("RIGHT")
         row._fresh:SetWordWrap(false)
 
-        -- Favorite STAR (far right): ★ lit when favorite, ☆ idle otherwise. Toggles the
-        -- favorite and re-populates so the row re-sorts to the top. Non-self only (self is
-        -- always first); hidden on the self row.
+        -- Favorite STAR (far right): a filled star when favorite, a star OUTLINE when not.
+        -- Toggles the favorite and re-populates so the row re-sorts to the top. Non-self
+        -- only (self is always first); hidden on the self row.
+        --
+        -- DRAWN ART, not a font character (header-selector round, owner directive 3). This
+        -- pair used to be the text ★ (U+2605) / ☆ (U+2606); neither codepoint exists in the
+        -- suite's shipped default face NOR in the WoW built-ins the Core font picker
+        -- offers, so the client drew its missing-glyph box and the unlit state read as "a
+        -- meaningless hollow box". That is not a size or colour problem — no font setting
+        -- can render a glyph the font does not contain — so the control moved onto the same
+        -- art pipeline the window's other glyphs already use (dev/gen-bags-glyphs.lua).
+        -- The textures are white-on-transparent, so the STATE is still carried by the tint.
         row._star = _G.CreateFrame("Button", nil, row)
         row._star:SetSize(Owner.MENU.CTRL_W, Owner.MENU.CTRL_W)
         row._star:SetPoint("RIGHT", row, "RIGHT", -Owner.MENU.PAD_R, 0)
-        row._starFS = row._star:CreateFontString(nil, "OVERLAY")
-        row._starFS:SetFontObject(UI.fonts.body)
-        row._starFS:SetPoint("CENTER", row._star, "CENTER", 0, 0)
+        row._starTex = row._star:CreateTexture(nil, "OVERLAY")
+        row._starTex:SetAllPoints(row._star)
+        row._star:SetScript("OnEnter", function(self)
+            if self._tex then self._tex:SetVertexColor(UI.Color("warn")) end
+        end)
+        row._star:SetScript("OnLeave", function(self)
+            if self._tex then self._tex:SetVertexColor(UI.Color(self._lit and "warn" or "muted")) end
+        end)
+        row._star._tex = row._starTex
 
         -- DELETE ✕ (left of the star), non-self only. Opens a plain confirm before removing the
         -- cached owner (never the live self — guarded downstream). Danger-tinted on hover.
@@ -740,7 +839,7 @@ function Owner.CreateSelector(parent, opts)
             row._name:SetTextColor(classRGB(d.class))
             row._badge:SetText(Owner.SourceBadge(d.source):upper())
             row._badge:SetTextColor(UI.Color(d.source == "full" and "bronze" or "faint"))
-            row._fresh:SetText(Owner.FreshnessLabel(d.ageSeconds, d.isSelf))
+            row._fresh:SetText(Owner.AgeLabel(d.ageSeconds, d.isSelf))
             row._fresh:SetTextColor(UI.Color(d.isSelf and "ok" or "muted"))
             local w = (row._name.GetStringWidth and row._name:GetStringWidth()) or 0
             if w > widest then widest = w end
@@ -768,13 +867,19 @@ function Owner.CreateSelector(parent, opts)
                 if opts.onSelect then opts.onSelect(d.key) end
             end)
 
-            -- Favorite star: lit ★ when favorite, idle ☆ otherwise. Hidden on the self row.
+            -- Favorite star: the FILLED glyph in gold when favorite, the OUTLINE in muted
+            -- ink when not. Hidden on the self row.
             if d.isSelf then
                 row._star:Hide(); row._del:Hide()
             else
                 row._star:Show()
-                row._starFS:SetText(d.isFavorite and "\226\152\133" or "\226\152\134")   -- ★ / ☆
-                row._starFS:SetTextColor(UI.Color(d.isFavorite and "warn" or "faint"))
+                row._star._lit = d.isFavorite and true or nil
+                row._starTex:SetTexture(artPath() ..
+                    (d.isFavorite and "icon-star" or "icon-star-outline"))
+                -- `muted`, not `faint`: the unlit state is a real outline now and has to be
+                -- SEEN to be clickable — faint is the ink for text a row is de-emphasising,
+                -- not for the affordance that turns the row's own sort order on.
+                row._starTex:SetVertexColor(UI.Color(d.isFavorite and "warn" or "muted"))
                 row._star:SetScript("OnClick", function()
                     Owner.ToggleFavorite(d.key)
                     populate()   -- re-sort (favorite rises to the top)
@@ -803,22 +908,34 @@ function Owner.CreateSelector(parent, opts)
         popup:SetSize(rowW, panelH + 4)
     end
 
-    btn:SetScript("OnClick", function(self)
+    -- Open/close the flyout against `anchor` (default: this widget). Exposed as a METHOD
+    -- because the header form has no mouse of its own — the window's title hit area calls
+    -- sel:Toggle(hitArea) so the menu lines up with the NAME the user clicked, not with the
+    -- 16px arrow at the end of it.
+    function frame:Toggle(anchor)
         if popup and popup:IsShown() then popup:Hide(); return end
         if not popup then buildPopup() end
         populate()
         popup:ClearAllPoints()
         -- Direction is the CALLER's call (opts.menuGrow), because only the caller knows
-        -- where on its window the selector sits — the footer-anchored selectors open
-        -- upward, the historic title-row placement opens downward. Owner.MenuAnchor is
-        -- pure so the choice is harness-locked.
+        -- where on its window the selector sits — a bottom-anchored face opens upward, a
+        -- title-row face (both windows, since the header round) opens downward.
+        -- Owner.MenuAnchor is pure so the choice is harness-locked.
         local p, rp, ax, ay = Owner.MenuAnchor(opts.menuGrow)
-        popup:SetPoint(p, self, rp, ax, ay)
+        popup:SetPoint(p, anchor or self, rp, ax, ay)
         closer:Show()
         popup:Show()
-    end)
+    end
+    function frame:MenuShown() return (popup and popup:IsShown()) and true or false end
+    function frame:CloseMenu() if popup then popup:Hide() end end
 
+    if btn then btn:SetScript("OnClick", function() frame:Toggle() end) end
+
+    -- Re-sync the face to the current view. The header form has no face of its own (the
+    -- window's own gold title IS the label, repainted by that window's Rebuild), so every
+    -- part is guarded and this reduces to a no-op there rather than erroring on a nil.
     function frame:Refresh()
+        if not (self._name and self._pip) then return end
         local key = viewedKey()
         local o = Store and Store.GetOwner and Store.GetOwner(key)
         local selfKey = Owner.SelfKey()
@@ -1058,6 +1175,39 @@ local function testFreshnessAndBadge(fails)
     ck(Owner.SourceBadge(nil) == "Summary", "nil source -> Summary")
 end
 
+-- HEADER-SELECTOR ROUND, owner directive 2: the MENU's age column is the bare relative
+-- age. Pinned here because the long form still exists three lines up (the bank's titlebar
+-- stamp reads it), so "which label does the menu use" is exactly the kind of thing a later
+-- round re-crosses by accident.
+local function testAgeLabel(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- The owner's own examples, verbatim.
+    ck(Owner.AgeLabel(5 * 86400, false)  == "5d",  "5 days -> 5d")
+    ck(Owner.AgeLabel(3600, false)       == "1h",  "1 hour -> 1h")
+    ck(Owner.AgeLabel(4 * 60, false)     == "4m",  "4 minutes -> 4m")
+    ck(Owner.AgeLabel(27 * 86400, false) == "27d", "27 days -> 27d")
+    -- The word "Updated" and the word "ago" are gone from every age string.
+    for _, secs in ipairs({ 90, 3600, 7200, 86400, 259200, 30 * 86400 }) do
+        local s = Owner.AgeLabel(secs, false)
+        ck(not s:find("Updated"), "age " .. secs .. "s carries no 'Updated' (" .. s .. ")")
+        ck(not s:find("ago"),     "age " .. secs .. "s carries no 'ago' (" .. s .. ")")
+    end
+    -- Boundaries: each unit turns over at exactly the next unit's first second.
+    ck(Owner.AgeLabel(59, false)    == "now", "<1m -> now (never '0m')")
+    ck(Owner.AgeLabel(60, false)    == "1m",  "60s is the first minute")
+    ck(Owner.AgeLabel(3599, false)  == "59m", "the last minute before an hour")
+    ck(Owner.AgeLabel(86399, false) == "23h", "the last hour before a day")
+    ck(Owner.AgeLabel(86400, false) == "1d",  "86400s is the first day")
+    -- The two NON-age states keep their words (they are not durations).
+    ck(Owner.AgeLabel(nil, true)    == "Online",  "self -> Online")
+    ck(Owner.AgeLabel(999999, true) == "Online",  "self ignores age")
+    ck(Owner.AgeLabel(nil, false)   == "No data", "no age -> No data")
+    ck(Owner.AgeLabel(-1, false)    == "No data", "a negative age -> No data")
+    -- The long form is UNTOUCHED — the bank stamp still reads a sentence.
+    ck(Owner.FreshnessLabel(5 * 86400, false) == "Updated 5d ago",
+        "the long form is still the long form (bank titlebar stamp)")
+end
+
 local function testHasBankData(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     ck(Owner.HasBankData({ containers = { [0] = {}, [1] = {} } }) == false, "carried only -> no bank")
@@ -1104,9 +1254,9 @@ local function testOwnerListOrdering(fails)
     ck(list[1].ageSeconds == 0 and list[4].ageSeconds == 500, "age computed from ts vs now")
     ck(list[5].ageSeconds == nil, "ts 0 -> nil age")
     ck(list[5].source == "summary", "Rex source summary")
-    -- freshness rendering of the built descriptors
-    ck(Owner.FreshnessLabel(list[1].ageSeconds, list[1].isSelf) == "Online", "self row -> Online")
-    ck(Owner.FreshnessLabel(list[4].ageSeconds, list[4].isSelf) == "Updated 8m ago", "Cid 500s -> 8m ago")
+    -- freshness rendering of the built descriptors, as the MENU actually draws them
+    ck(Owner.AgeLabel(list[1].ageSeconds, list[1].isSelf) == "Online", "self row -> Online")
+    ck(Owner.AgeLabel(list[4].ageSeconds, list[4].isSelf) == "8m", "Cid 500s -> 8m")
     -- empty / nil guards
     ck(#Owner.BuildOwnerList(nil, "X", "a", 1) == 0, "nil owners -> empty list")
     -- no selfAccount => nobody is "own account" (all non-self are rank 2)
@@ -1160,9 +1310,21 @@ local function testMenuLayout(fails)
     -- The clamp must admit a useful number of rows before scrolling kicks in.
     ck(Owner.MENU_MAX_H >= 10 * (M.ROW_H + M.ROW_GAP), "at least 10 rows are visible at once")
 
-    -- FOOTER ROUND: the selector moved to the window's bottom-left corner, so its flyout
-    -- has to RISE. Locked here because a silent revert to the downward drop would open
-    -- the menu below the screen edge and read in-game as "the owner menu is gone".
+    -- HEADER-SELECTOR ROUND: the age column compressed (Owner.AgeLabel), so the whole menu
+    -- got NARROWER. Pinned as a number because "the menu can get narrower" was an explicit
+    -- owner ask and nothing else in the layout would fail if the column silently grew back.
+    ck(M.AGE_W == 44, "the age column is the compressed width (44), got " .. tostring(M.AGE_W))
+    ck(Owner.MenuLayout(M.NAME_MAX).width < 400,
+        "a full-width menu stays under 400px, got " .. Owner.MenuLayout(M.NAME_MAX).width)
+    -- The star is drawn art now and needs more room than a font character did.
+    ck(M.CTRL_W == 18, "the ✕/★ control columns are 18px, got " .. tostring(M.CTRL_W))
+    -- The header form's footprint is declared, so the two windows anchor the same square.
+    ck(Owner.ARROW_W == 16, "the header dropdown arrow is a 16px square")
+
+    -- BOTH growth directions stay live. The footer round needed "up" (a bottom-left face
+    -- whose menu would otherwise open below the screen edge); the header round put the
+    -- face back in the title row and needs "down" again. Locked because a silent revert
+    -- either way reads in-game as "the owner menu is gone".
     local p, rp, ax, ay = Owner.MenuAnchor("up")
     ck(p == "BOTTOMLEFT" and rp == "TOPLEFT", "grow=up anchors the menu's bottom to the button's top")
     ck(ax == 0 and ay == 2, "…with a 2px lift off the button")
@@ -1542,6 +1704,7 @@ end
 function Owner.RunSelfTests(verbose)
     local suites = {
         { name = "freshness + badge",   fn = testFreshnessAndBadge },
+        { name = "menu age column",     fn = testAgeLabel },
         { name = "has bank data",       fn = testHasBankData },
         { name = "owner-list ordering", fn = testOwnerListOrdering },
         { name = "menu column layout",  fn = testMenuLayout },

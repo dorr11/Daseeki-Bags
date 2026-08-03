@@ -353,11 +353,26 @@ function Bank.Ensure()
     UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
-    -- (The OWNER SELECTOR used to sit here, right of the gold title, at its full 150px
-    -- name-and-caret width. The footer round moved it to the window's bottom-left corner
-    -- in the same 22px glyph form the inventory window uses — see the footer block below.
-    -- Nothing about the widget changed; the bank's own title already names the character,
-    -- so the name column it used to carry was saying the same thing twice.)
+    -- ── OWNER DROPDOWN (header-selector round) ────────────────────────────────
+    -- The same arrow-after-the-name the inventory window grew, built by the SAME shared
+    -- constructor (ns.Frame.BuildOwnerHeader) so the two headers cannot drift apart. The
+    -- bank's title already reads "<Character> · Bank", so the arrow annotates a name that
+    -- is on screen either way — which is exactly why the 150px name-and-caret face this
+    -- window used to carry was saying the same thing twice.
+    --
+    -- Two deliberate differences from the inventory call, both pre-existing policy of THIS
+    -- window: the bank has never had a frame lock (so no dragOK gate), and it does not
+    -- persist its anchor (so no onDragStop). The drag itself still works, forwarded exactly
+    -- as this window's bare titlebar forwards it, five lines up.
+    local ownerArrow, ownerHit
+    if ns.Frame and ns.Frame.BuildOwnerHeader then
+        ownerArrow, ownerHit = ns.Frame.BuildOwnerHeader(titleBar, title, win, {
+            onSelect = function(key)
+                if ns.Frame and ns.Frame.SetViewedOwner then ns.Frame.SetViewedOwner(key) end
+            end,
+        })
+    end
+    win.ownerArrow, win.ownerHit = ownerArrow, ownerHit
 
     -- Offline "Updated …" stamp (shown when the viewed bank is a cached snapshot).
     local stamp = titleBar:CreateFontString(nil, "OVERLAY")
@@ -499,31 +514,12 @@ function Bank.Ensure()
     footer:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
     win.footer = footer
 
-    -- Owner selector (shared viewed-owner; flipping it re-renders both windows), MOVED
-    -- here from the title row so the bank matches the inventory window corner for corner.
-    -- Dressed by the inventory's own Frame.DressSelectorAsGlyph, so the two windows
-    -- cannot end up wearing different treatments of the same widget; the guard keeps the
-    -- widget in its default name-and-caret form if ui_frame is somehow not loaded.
-    if ns.Owner and ns.Owner.CreateSelector then
-        local F2 = ns.Frame
-        local sel = ns.Owner.CreateSelector(footer, {
-            width = (F2 and F2.ICONBTN) or 22,
-            menuGrow = "up",
-            onSelect = function(key)
-                if ns.Frame and ns.Frame.SetViewedOwner then ns.Frame.SetViewedOwner(key) end
-            end,
-        })
-        if sel then
-            sel:ClearAllPoints()
-            sel:SetPoint("LEFT", footer, "LEFT", 0, 0)
-            sel:SetSize((F2 and F2.ICONBTN) or 22, (F2 and F2.ICONBTN) or 22)
-            if F2 and F2.DressSelectorAsGlyph then F2.DressSelectorAsGlyph(sel, UI) end
-            win.ownerSelector = sel
-        end
-    end
-    -- (The decorative backpack glyph that used to sit in this corner is GONE. It was
-    -- ornament in the one footer position that is now a control, and the inventory
-    -- window retired its own corner glyph for the same reason a round earlier.)
+    -- (The OWNER SELECTOR sat in this corner for exactly one round, and the decorative
+    -- backpack glyph before that. Both are gone: the character menu is the dropdown arrow
+    -- beside the title, built up in the title block, and the corner is empty because this
+    -- window has no raid-prep sibling to put there. The bank footer is now purely the two
+    -- per-owner readouts the inventory footer also carries — slot count and money — which
+    -- is the corner-for-corner parity that matters.)
 
     -- ── Money bar (bank char's gold; cross-account total on hover) ────────────
     local money = _G.CreateFrame("Button", nil, footer)
@@ -740,11 +736,13 @@ function Bank.Rebuild()
     local Frame = ns.Frame
     local renderOwner, live, isSelf, viewed = bankRenderModel()
 
-    -- Owner selector face. MUST be a COLON call: ui_owner defines it as `function frame:Refresh()`
-    -- and the body dereferences self._name / self._pip, so a dot call passes self = nil and hard
-    -- errors. Bank.Open calls Bank.Rebuild UNPROTECTED, so that error aborted the repaint before
-    -- the title, money and grid were ever painted — the bank window came up blank.
-    if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
+    -- (There is no selector FACE to re-sync any more — the gold title below is the label,
+    -- and the arrow beside it holds no owner state. The call that used to be here had to be
+    -- a COLON call, because ui_owner declares `function frame:Refresh()` and its body
+    -- dereferenced self._name / self._pip; a dot call passed self = nil, hard-errored, and
+    -- since Bank.Open calls Bank.Rebuild UNPROTECTED it aborted the repaint before the
+    -- title, money and grid were ever painted — the bank window came up blank. Refresh is
+    -- now guarded at the source as well, so neither form can do that again.)
 
     -- Gold "<Character> · Bank" for the VIEWED owner (see Bank.WindowTitle).
     if win.title then
@@ -1004,9 +1002,19 @@ local function testBankFooterParity(fails)
     ck(Bank.FOOTER_H == F.ICONBTN, "the bank footer is one control tall, so its row shares a baseline")
     ck(Bank.PAD == F.PAD, "both windows inset their footer by the same padding")
     ck(Bank.MONEY_H == nil, "the money-only band metric is gone on the bank too")
-    -- The dressing helper the bank calls must exist on ns.Frame; without it the bank's
-    -- selector silently reverts to the 150px name form and the two footers diverge.
-    ck(type(F.DressSelectorAsGlyph) == "function", "the shared selector dressing helper is published")
+    -- HEADER-SELECTOR ROUND: the owner selector left BOTH footers. The constructor the
+    -- bank now calls must exist on ns.Frame; without it the bank silently loses its
+    -- dropdown arrow and the two title rows diverge — the same class of defect the retired
+    -- dressing-helper check guarded, one band up.
+    ck(type(F.BuildOwnerHeader) == "function", "the shared owner-header constructor is published")
+    ck(F.DressSelectorAsGlyph == nil, "the footer-glyph dressing helper is retired")
+    ck(type(F.TitleClickAction) == "function",
+        "the shared title-click matrix is published (both windows read it)")
+    ck(F.TitleClickAction("RightButton") == "layout",
+        "the bank's title right-click still toggles combined/split")
+    local footerSet = {}
+    for _, n in ipairs(F.FOOTER_CONTROLS or {}) do footerSet[n] = true end
+    ck(not footerSet.ownerSelector, "no owner selector in the shared footer roster")
     ck(type(F.MoneyRightInset) == "function" and F.MoneyRightInset() > F.PAD,
         "the shared money edge allowance is published and larger than the plain padding")
     -- The band must still be accounted for in the window height (a footer nobody measured

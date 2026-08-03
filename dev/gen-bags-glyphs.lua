@@ -8,10 +8,18 @@
 --   icon-sort.tga     — down arrow           (sort bags)
 --   icon-find.tga     — bulleted list        (find an item across all characters)
 --   icon-layout.tga   — two vertical panes   (combined <-> split toggle)
---   icon-owner.tga    — person bust          (owner selector)
+--   icon-owner.tga    — person bust          (the standalone owner selector's face; not
+--                                             drawn by either window since the character
+--                                             menu moved onto the title's dropdown arrow.
+--                                             KEPT: it is the general form's face, and the
+--                                             set regenerates byte-identically either way)
 --   icon-raidprep.tga — stoppered flask      (Daseeki-Raid-Prep checklist toggle)
 --   icon-lock-slot.tga — prohibition sign    (a SORT-LOCKED item cell; see its block
 --                                             below — cell-scale, not strip-scale)
+--   icon-caret-down.tga     — solid triangle (the owner DROPDOWN arrow beside the
+--                                             window's character name)
+--   icon-star.tga           — filled star    (a FAVOURITED owner in the character menu)
+--   icon-star-outline.tga   — star outline   (…and the unfavourited state of the same)
 --
 -- icon-gear.tga and icon-close.tga are NOT authored here: they are copied verbatim
 -- from Daseeki-Nexus/textures (our own assets, same 64x64 byte format), so the gear
@@ -217,6 +225,89 @@ local function glyphLockSlot(x, y)
     return false
 end
 
+-- CARET DOWN: a solid downward triangle — the universal "this opens a menu" mark, drawn
+-- beside the window's gold character NAME. Solid rather than a two-stroke chevron
+-- because it is the smallest glyph in the addon (≈10px drawn next to the title): at that
+-- size a 6px stroke chevron closes up into a blob, while a filled triangle keeps a clean
+-- silhouette. Reach 19.6, a hair inside the set's 20-24, which is right for a mark that
+-- is subordinate to the text it annotates. Vertically CENTRED on the field (apex and top
+-- edge equidistant from the middle) so the mark sits on the character name's optical line
+-- instead of hanging below it.
+local C_APEX_Y, C_TOP_Y, C_HALF_W = -12, 12, 17
+local function glyphCaretDown(x, y)
+    return inTriangle(x, y, 0, C_APEX_Y, -C_HALF_W, C_TOP_Y, C_HALF_W, C_TOP_Y)
+end
+
+-- STAR (filled) / STAR OUTLINE — the FAVOURITE control on a character-menu row.
+--
+-- WHY ART AND NOT A FONT GLYPH: the menu drew these as the text "\226\152\133" / "\226\152\134"
+-- (★ U+2605 / ☆ U+2606). Neither codepoint exists in the suite's shipped default face
+-- (FiraSansCondensed-Medium.ttf — verified against its cmap), nor in the WoW built-ins the
+-- font picker offers, so the client drew its missing-glyph box: the "meaningless hollow
+-- box" the owner reported. No size or colour can fix a glyph the font does not contain,
+-- which is why this one control moves onto the art pipeline the rest of the window
+-- already uses. Tinting still carries the state (accent when lit, muted when not).
+--
+-- Geometry: the canonical 5-point star — outer vertices every 72 degrees from straight up,
+-- inner vertices interleaved at the pentagram ratio 0.382. FILLED is the ten-vertex
+-- polygon; OUTLINE is the same ten EDGES drawn as round-capped capsules, which holds a
+-- uniform stroke all the way into the points (scaling a second star down and subtracting
+-- it does not — the band pinches at the tips and reads as a smudge at menu size).
+--
+-- SCALE DEVIATION (deliberate, like icon-lock-slot's): this pair does NOT sit at the
+-- set's 20-24 reach. It draws at 18px on a menu row, not 18px inside a 22px title-row
+-- button, and a five-point star is mostly negative space — at reach 23 the top spike
+-- downsampled to about two pixels and the outline's concave notches closed up. Reach 28
+-- with a 7px stroke is what actually reads at the size this control is used.
+--
+-- A star is also bottom-light: its top vertex reaches +R while its lowest points only
+-- reach -0.809R, so a star centred on the origin sits visually high in its box. The whole
+-- shape is therefore pushed DOWN by 0.09549*R, which puts its bounding box — not its
+-- construction circle — on the field's centre. Without it the glyph reads as floating
+-- above the ✕ beside it.
+local STAR_R      = 28           -- outer reach (see the scale note above)
+local STAR_RATIO  = 0.382        -- pentagram inner/outer radius
+local STAR_STROKE = 7            -- outline weight (heavier than the set's 6: see above)
+local STAR_DROP   = 0.09549 * STAR_R   -- bbox-centring offset
+local STAR_PTS = {}
+do
+    for i = 0, 9 do
+        local ang = math.rad(90 + i * 36)
+        local r = (i % 2 == 0) and STAR_R or (STAR_R * STAR_RATIO)
+        STAR_PTS[#STAR_PTS + 1] = { r * math.cos(ang), r * math.sin(ang) - STAR_DROP }
+    end
+end
+
+-- Even-odd point-in-polygon over the ten star vertices.
+local function glyphStar(x, y)
+    local inside = false
+    local n = #STAR_PTS
+    local j = n
+    for i = 1, n do
+        local xi, yi = STAR_PTS[i][1], STAR_PTS[i][2]
+        local xj, yj = STAR_PTS[j][1], STAR_PTS[j][2]
+        if ((yi > y) ~= (yj > y))
+           and (x < (xj - xi) * (y - yi) / (yj - yi) + xi) then
+            inside = not inside
+        end
+        j = i
+    end
+    return inside
+end
+
+local function glyphStarOutline(x, y)
+    local n = #STAR_PTS
+    local j = n
+    for i = 1, n do
+        if inSegment(x, y, STAR_PTS[j][1], STAR_PTS[j][2],
+                           STAR_PTS[i][1], STAR_PTS[i][2], STAR_STROKE / 2) then
+            return true
+        end
+        j = i
+    end
+    return false
+end
+
 ----------------------------------------------------------------------
 -- rasteriser
 ----------------------------------------------------------------------
@@ -258,3 +349,6 @@ writeTGA(dir .. "/icon-layout.tga", glyphLayout)
 writeTGA(dir .. "/icon-owner.tga",  glyphOwner)
 writeTGA(dir .. "/icon-raidprep.tga", glyphRaidPrep)
 writeTGA(dir .. "/icon-lock-slot.tga", glyphLockSlot)
+writeTGA(dir .. "/icon-caret-down.tga", glyphCaretDown)
+writeTGA(dir .. "/icon-star.tga", glyphStar)
+writeTGA(dir .. "/icon-star-outline.tga", glyphStarOutline)

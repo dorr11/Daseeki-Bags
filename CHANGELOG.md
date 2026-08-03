@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **Switch characters from the header now: click the name at the top of the window.**
+  The character name in the title bar has a small **dropdown arrow** after it, and clicking
+  the name *or* the arrow opens the same character list you already had. The list drops
+  **downward** from the title, over the window. The **button in the bottom-left corner is
+  gone** — that was the previous round's placement and you reversed it. This is the better
+  home for it: the list changes which character the title is naming, so it belongs on the
+  title rather than in a corner two bands away.
+  - **The bank window works exactly the same way.** Its title already read
+    *"<Character> · Bank"*, so the arrow simply joins the name there, and its bottom-left
+    button is gone too.
+  - **Dragging the window by its name still works.** Grab the character name and pull and
+    the window moves as it always did; only a click that *never became a drag* opens the
+    list.
+  - **Right-clicking the title still flips combined/split.** That gesture is older than the
+    dropdown and it survived intact — left-click picks a character, right-click flips the
+    layout. Hovering the name spells both out in a tooltip.
+  - The footer keeps everything else you asked to keep: the **Raid Prep flask**, the
+    **free/total slot count** and the **money**.
+
+- **The character list reads "5d", not "Updated 5d ago".** Just the age, as you asked —
+  `5d`, `1h`, `4m`, `27d`. The column shrank from 104 pixels to 44 and the whole menu got
+  narrower with it. Two entries keep their words because they are not ages: the character
+  you are logged in on still reads **Online**, and one that has never been captured still
+  reads **No data**. Anything under a minute reads **now** rather than "0m".
+  - The bank window's *"Updated …"* stamp under the title is untouched — that one is a
+    standing caption on an offline view, where the sentence is the point.
+
+- **The favourite star is a real star now, in both states.** The unfavourited state used to
+  draw as a meaningless hollow box. That was not a size or colour problem: the ★ and ☆
+  characters **do not exist** in the font the suite ships (nor in any of the built-in WoW
+  faces the font picker offers), so the game was drawing its "missing character" box. The
+  star is now **drawn artwork**, like every other glyph in the window — a filled gold star
+  when a character is favourited, and a clearly readable **star outline** when it is not.
+  It also lights up gold when you hover it, so you can see it is clickable.
+  - Everything else about the list is unchanged: the columns, the scrolling, the class
+    colours, the FULL/SUMMARY tags, the ✕ delete with its confirmation, and favourites
+    still lifting to the top.
+
 - **The bag window opens a little bigger by default.** You asked to bring the default
   scale up just a bit, so it moved from **89% to 92%** — about three percent, which is
   roughly a pixel and a half on each slot. Only the *size* changed: the slot shape, the

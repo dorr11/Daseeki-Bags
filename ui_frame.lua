@@ -142,31 +142,46 @@ Frame.STRIP_GLOW_ALPHA   = 0.75
 -- harness can gate it: a control quietly added or dropped in a later polish round then
 -- shows up as a test failure instead of as a screenshot the owner has to annotate.
 -- `layoutBtn` and `findBtn` are deliberately absent — see the build block. So is
--- `ownerSelector`, which the FOOTER round moved to the bottom-left corner (below).
+-- `ownerSelector`: the character menu is not opened from this cluster at all, it hangs off
+-- the NAME at the other end of the row (Frame.TITLE_NAME_CONTROLS, immediately below).
 Frame.TITLE_CONTROLS = { "closeBtn", "gearBtn", "magBtn", "sortBtn" }
 
--- ── FOOTER CONTROL ROSTER (footer round) ──────────────────────────────────────────
+-- ── TITLE NAME-ZONE ROSTER (header-selector round) ────────────────────────────────
+-- The title row's LEFT zone is the window's IDENTITY: the maker's mark, the gold character
+-- name, and — new this round — a small dropdown ARROW immediately after the name:
+--
+--   ◆  Poonyx ▾                                        [sort][search][gear][✕]
+--
+-- The owner's directive, verbatim: "rather than a button in the bottom left, id like to
+-- put a drop down arrow next to the character name in the header of the bag which will
+-- open the characters to select." That reverses the footer round's placement, and it is
+-- the better answer: the menu changes WHICH CHARACTER the title names, so the control
+-- belongs on the title, not in a corner two bands away from the thing it edits.
+--
+-- Listed as data for the same regression reason as the cluster above. The arrow itself has
+-- NO mouse: one hit area (`ownerHit`) covers the name AND the arrow, so a click anywhere
+-- on "Poonyx ▾" opens the menu and there is never a question of which child won the click.
+-- What each mouse button does there is Frame.TitleClickAction.
+Frame.TITLE_NAME_CONTROLS = { "ownerArrow" }
+
+-- ── FOOTER CONTROL ROSTER (footer round, trimmed by the header round) ─────────────
 -- The window's bottom band is no longer just the money strip. It is a proper FOOTER row
--- with three zones — controls LEFT, the free/total counter CENTRE, money RIGHT — and it
--- now carries the two controls the owner asked for at the bottom-left, listed here
--- LEFT→RIGHT in the order they are anchored from the window's bottom-left corner:
+-- with three zones — controls LEFT, the free/total counter CENTRE, money RIGHT:
 --
---   [ owner ][ raid prep ]            20/92                        412g 75s 3c
+--   [ raid prep ]                     20/92                        412g 75s 3c
 --
---   * ownerSelector — MOVED out of the title row. It is the one control in the strip
---     that is not a verb: sort/search/settings/close all DO something to this window,
---     while the selector changes WHOSE window you are looking at. Parking it beside the
---     character name it changes (the gold title) read as a sixth glyph in a row of five
---     verbs. In the footer it sits with the other per-owner readouts (that owner's slot
---     count, that owner's money), which is what it actually belongs to.
 --   * raidPrepBtn — RESTORED from 1.x, where Daseeki-Raid-Prep hooked the inventory
 --     frame's Layout and parked its own button at BOTTOMLEFT +8/+8. 2.0 owns the button
 --     instead of letting the companion reach in (its hook looks for the 1.x
 --     `_G['Daseeki-Bags']` object, which 2.0 does not publish), and soft-guards it so a
 --     client without the companion simply never sees it. See Frame.RaidPrepAvailable.
+--   * ownerSelector — GONE from this roster. The footer round put it in the bottom-left
+--     corner; the owner reversed that (see TITLE_NAME_CONTROLS). The slot count and the
+--     money readout stay — those are per-owner FACTS about the window, which is what a
+--     footer is for; the selector was the one thing down here that changed state.
 --
 -- Also declared as DATA, for the same regression reason as the title row.
-Frame.FOOTER_CONTROLS = { "ownerSelector", "raidPrepBtn" }
+Frame.FOOTER_CONTROLS = { "raidPrepBtn" }
 
 -- PURE: what a click on the dual-purpose magnifier means (ITEM 7b).
 --   "find"   — right-click: the cross-character Find window
@@ -191,6 +206,33 @@ end
 function Frame.SortClickAction(button)
     if button == "RightButton" then return "locks" end
     return "sort"
+end
+
+-- PURE: what a click on the TITLE NAME ZONE means (header-selector round).
+--   "layout" — right-click: flip combined/split
+--   "owner"  — anything else: open the character menu
+--
+-- THE COLLISION, and how it is resolved. The title row already carried two gestures
+-- before this round:
+--   * LEFT-DRAG moves the window (titleBar RegisterForDrag).
+--   * RIGHT-CLICK flips combined/split — an old binding, older than the layout button
+--     that was added and then retired, and the gear's tooltip still documents it.
+-- A plain LEFT-CLICK on the title did NOTHING, which is the seam the character menu now
+-- takes. So nothing was displaced: the menu occupies the one gesture that was free.
+--
+-- The DRAG is preserved by construction rather than by luck. The hit area over the name is
+-- a Button, and a Button that has started a drag does not fire OnClick — so grabbing the
+-- character name and pulling still moves the window, and only a click that never became a
+-- drag opens the menu. The hit area also forwards the right-click to the same layout
+-- toggle the bare titlebar runs, so the gesture does not die in the middle of the row.
+--
+-- Deliberately the same shape as SearchClickAction / SortClickAction above, so all three
+-- dual-purpose surfaces in this window obey ONE rule: left does the everyday verb, right
+-- opens the thing that reconfigures the window. Both windows read this function (the bank
+-- resolves it off ns.Frame), so the two title rows cannot drift apart.
+function Frame.TitleClickAction(button)
+    if button == "RightButton" then return "layout" end
+    return "owner"
 end
 
 Frame.ICONBTN     = 22   -- title-row control button (Nexus dashboard parity)
@@ -1054,45 +1096,94 @@ local function restoreGeometry(win)
     win:SetPoint(point, _G.UIParent, relPoint, x, y)
 end
 
--- Retrofit ui_owner's selector into the suite's 22x22 GLYPH language.
+-- Build the TITLE NAME ZONE's character-menu affordance: the dropdown ARROW after the
+-- gold title, plus the single hit area that covers the name AND the arrow.
 --
--- ui_owner.lua owns the widget and both windows share it, so it is NOT restyled at the
--- source. Its exposed parts are dressed here instead, guarded: the name text and seal
--- pip are hidden and the owner glyph is laid over the face button. If ui_owner ever
--- stops exposing _btn/_name/_pip, the guards simply leave the widget in its default
--- form — the control keeps working either way.
+-- Lives on ns.Frame (not as a file-local) because ui_bank.lua builds the identical thing
+-- on its own title row: the two windows' headers must not drift apart, and one shared
+-- constructor is the only way to guarantee that. It is deliberately parameterised on
+-- nothing but the pieces the caller already has —
+--   titleBar        the row frame both windows build
+--   titleFS         that row's gold character-name fontstring
+--   win             the window (moved on drag, and the tooltip's owner)
+--   opts.dragOK     function() -> bool, may this drag move the window? (the inventory
+--                   honours the frame lock; the bank has never had one). Absent = always.
+--   opts.onDragStop function(win), run after the move — the inventory persists its anchor
+--                   here, the bank does not persist one at all. Absent = nothing.
+--   opts.onSelect   function(key), what selecting an owner does
+-- — so neither window has to hand over anything it does not already own, and neither
+-- inherits the other's drag/persistence policy by accident.
 --
--- Lives on ns.Frame (not as a file-local) because ui_bank.lua dresses its own selector
--- with the same call: the inventory and the bank footers must not drift apart, and one
--- shared function is the only way to guarantee that.
-function Frame.DressSelectorAsGlyph(sel, UIkit)
-    UIkit = UIkit or _G.DaseekiUI
-    if not (sel and UIkit) then return sel end
-    if sel._name and sel._name.Hide then sel._name:Hide() end
-    if sel._pip  and sel._pip.Hide  then sel._pip:Hide()  end
-    local btn = sel._btn
-    if not btn then return sel end
-    local inset = Frame.ICON_INSET
-    local og = btn:CreateTexture(nil, "ARTWORK")
-    og:SetPoint("TOPLEFT", btn, "TOPLEFT", inset, -inset)
-    og:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset, inset)
-    og:SetTexture(Frame.ART .. "icon-owner")
-    btn._face = og
-    UIkit.Skin(btn, function(self)
-        self:SetBackdrop(UIkit.FLAT_BACKDROP)
-        self:SetBackdropColor(UIkit.Color("inset"))
-        self:SetBackdropBorderColor(UIkit.Color("borderLite"))
-        if self._face then self._face:SetVertexColor(UIkit.Color(self._hot and "accent" or "muted")) end
+-- Returns arrow, hit (or nil, nil when ui_owner is absent — a stripped tree keeps a plain,
+-- inert gold title rather than a dead control).
+--
+-- (This replaces Frame.DressSelectorAsGlyph, which retro-fitted the selector's 150px face
+-- button into a 22px footer glyph. There is no face button any more: the window's own
+-- title IS the label, which is what the owner asked for and one fewer place for the
+-- viewed character's name to be drawn twice.)
+function Frame.BuildOwnerHeader(titleBar, titleFS, win, opts)
+    opts = opts or {}
+    if not (ns.Owner and ns.Owner.CreateSelector and titleBar and titleFS) then return nil, nil end
+    local UIkit = _G.DaseekiUI
+    if not UIkit then return nil, nil end
+
+    local arrow = ns.Owner.CreateSelector(titleBar, {
+        arrowOnly = true,
+        -- The title row is at the TOP of the window, so the menu drops DOWNWARD again.
+        -- (The footer round's upward growth was a bottom-corner necessity; see
+        -- Owner.MenuAnchor, which still carries both directions.)
+        menuGrow  = "down",
+        onSelect  = opts.onSelect,
+    })
+    if not arrow then return nil, nil end
+    arrow:ClearAllPoints()
+    arrow:SetPoint("LEFT", titleFS, "RIGHT", 5, 0)
+    arrow:SetFrameLevel((titleBar:GetFrameLevel() or 1) + 2)
+
+    -- ONE hit area over "Poonyx ▾". Anchored to the title's LEFT and the arrow's RIGHT, so
+    -- it re-measures itself for free every time the viewed character's name changes length.
+    local hit = _G.CreateFrame("Button", nil, titleBar)
+    hit:SetPoint("LEFT",  titleFS, "LEFT",  -3, 0)
+    hit:SetPoint("RIGHT", arrow,   "RIGHT",  3, 0)
+    hit:SetHeight(Frame.ICONBTN)
+    -- Levels set EXPLICITLY rather than left to creation order: this button has to win the
+    -- click against the titlebar it sits on (which owns the window drag) and against the
+    -- arrow it covers. Two siblings at the same level resolve by internal stacking, which
+    -- is not a contract — an explicit +4 is.
+    hit:SetFrameLevel((titleBar:GetFrameLevel() or 1) + 4)
+    hit:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    -- The window drag lives on the bare titlebar; a mouse-enabled child would otherwise
+    -- punch a dead zone in the middle of it, so the hit area forwards the drag verbatim.
+    hit:RegisterForDrag("LeftButton")
+    hit:SetScript("OnDragStart", function()
+        if (not opts.dragOK) or opts.dragOK() then win:StartMoving() end
     end)
-    btn:HookScript("OnEnter", function(self)
-        self._hot = true
-        if self._face then self._face:SetVertexColor(UIkit.Color("accent")) end
+    hit:SetScript("OnDragStop", function()
+        win:StopMovingOrSizing()
+        if opts.onDragStop then opts.onDragStop(win) end
     end)
-    btn:HookScript("OnLeave", function(self)
-        self._hot = nil
-        if self._face then self._face:SetVertexColor(UIkit.Color("muted")) end
+    hit:SetScript("OnClick", function(_, button)
+        if Frame.TitleClickAction(button) == "layout" then
+            Frame.SetLayout(Frame.Layout() == "split" and "combined" or "split")
+        else
+            arrow:Toggle(hit)
+        end
     end)
-    return sel
+    hit:SetScript("OnEnter", function(self)
+        if arrow.SetHot then arrow:SetHot(true) end
+        if _G.GameTooltip then
+            _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            _G.GameTooltip:SetText("Viewing this character", UIkit.Color("text"))
+            _G.GameTooltip:AddLine("Left-click: pick another character", UIkit.Color("muted"))
+            _G.GameTooltip:AddLine("Right-click: toggle combined/split", UIkit.Color("muted"))
+            _G.GameTooltip:Show()
+        end
+    end)
+    hit:SetScript("OnLeave", function()
+        if arrow.SetHot then arrow:SetHot(false) end
+        if _G.GameTooltip then _G.GameTooltip:Hide() end
+    end)
+    return arrow, hit
 end
 
 -- Re-evaluate the footer's conditional controls. Today that is exactly one thing: the
@@ -1196,6 +1287,18 @@ function Frame.Ensure()
     title:SetText(Frame.WindowTitle(nil))
     UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
+
+    -- ── OWNER DROPDOWN (header-selector round) ────────────────────────────────
+    -- The arrow after the name, plus the one hit area covering both. Selecting an
+    -- alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner) and
+    -- re-renders this window (and the bank) read-only. Guarded: no ui_owner, no arrow,
+    -- and the gold title behaves exactly as it did before this round.
+    local ownerArrow, ownerHit = Frame.BuildOwnerHeader(titleBar, title, win, {
+        dragOK     = function() return Frame.DragAllowed(Frame.FrameLocked()) end,
+        onDragStop = function(w) saveGeometry(w) end,
+        onSelect   = function(key) Frame.SetViewedOwner(key) end,
+    })
+    win.ownerArrow, win.ownerHit = ownerArrow, ownerHit
 
     -- Control factory — the NEXUS DASHBOARD button, verbatim in behaviour:
     -- 22x22 BackdropTemplate, FLAT_BACKDROP filled `inset` with a `borderLite` edge,
@@ -1333,9 +1436,10 @@ function Frame.Ensure()
     sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -SPACE, 0)
     win.sortBtn = sortBtn
 
-    -- (The OWNER SELECTOR used to be anchored here, left of the sort glyph. The footer
-    -- round moved it to the window's bottom-left corner — see the footer block below and
-    -- Frame.FOOTER_CONTROLS for why. Nothing about the widget changed; only its anchor.)
+    -- (The OWNER SELECTOR used to be anchored here, left of the sort glyph, and then in the
+    -- window's bottom-left corner for one round. It is neither now: it is the dropdown
+    -- ARROW beside the character name at the other end of this row — see the title block
+    -- above and Frame.TITLE_NAME_CONTROLS. This cluster is five verbs and nothing else.)
 
     -- Collapsed inline SEARCH box (1.0: search lived behind a toggle, not a standing
     -- toolbar). Hidden until the magnifier opens it; grows leftward from the cluster.
@@ -1349,7 +1453,9 @@ function Frame.Ensure()
     local searchWrap = UI.FlatFrame(titleBar, "inset", "controlBorder")
     searchWrap:SetHeight(18)
     searchWrap:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
-    searchWrap:SetPoint("LEFT", title, "RIGHT", 10, 0)
+    -- Left edge clears the whole NAME ZONE, arrow included — anchoring to the title
+    -- fontstring alone would let the open search box draw over the dropdown arrow.
+    searchWrap:SetPoint("LEFT", win.ownerHit or title, "RIGHT", 10, 0)
     searchWrap:Hide()
     local search = _G.CreateFrame("EditBox", nil, searchWrap)
     search:SetPoint("TOPLEFT", searchWrap, "TOPLEFT", 6, 0)
@@ -1424,29 +1530,14 @@ function Frame.Ensure()
     footer:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
     win.footer = footer
 
-    -- Owner selector (W3), MOVED here from the title row. Selecting an alt/remote owner
-    -- flips the SHARED viewed-owner state (Frame.SetViewedOwner), re-rendering this
-    -- window (and the bank) read-only. The widget itself is unchanged — same ui_owner
-    -- surface, same bridge guards, same column-laid flyout — it is only re-parented and
-    -- re-anchored, and told to open its menu UPWARD now that it lives at the bottom.
-    if ns.Owner and ns.Owner.CreateSelector then
-        local sel = ns.Owner.CreateSelector(footer, {
-            width = Frame.ICONBTN,
-            menuGrow = "up",
-            onSelect = function(key) Frame.SetViewedOwner(key) end,
-        })
-        if sel then
-            sel:ClearAllPoints()
-            sel:SetPoint("LEFT", footer, "LEFT", 0, 0)
-            sel:SetSize(Frame.ICONBTN, Frame.ICONBTN)
-            Frame.DressSelectorAsGlyph(sel, UI)
-            win.ownerSelector = sel
-        end
-    end
+    -- (The OWNER SELECTOR occupied this corner for exactly one round. The owner reversed
+    -- it — the character menu is the dropdown arrow beside the title now, built up in the
+    -- title block. The footer keeps only per-owner FACTS: raid prep, the slot count and
+    -- the money. See Frame.FOOTER_CONTROLS.)
 
-    -- RAID PREP (footer round, ITEM 2): the 1.x companion button, restored — beside the
-    -- owner selector, in the suite's own glyph language instead of 1.x's raw potion item
-    -- icon. Built unconditionally but shown only while the companion is actually there
+    -- RAID PREP (footer round, ITEM 2): the 1.x companion button, restored — in the
+    -- bottom-left corner, in the suite's own glyph language instead of 1.x's raw potion
+    -- item icon. Built unconditionally but shown only while the companion is actually there
     -- (Frame.RefreshFooter, re-evaluated on every Rebuild), so this costs a hidden 22px
     -- button on a client that has never installed Daseeki-Raid-Prep.
     local raidPrepBtn = makeIconButton({ icon = "icon-raidprep",
@@ -1457,13 +1548,7 @@ function Frame.Ensure()
     })
     raidPrepBtn:SetParent(footer)
     raidPrepBtn:ClearAllPoints()
-    if win.ownerSelector then
-        raidPrepBtn:SetPoint("LEFT", win.ownerSelector, "RIGHT", SPACE, 0)
-    else
-        -- No selector (ui_owner absent): the raid-prep glyph takes the corner itself
-        -- rather than anchoring to a frame that was never built.
-        raidPrepBtn:SetPoint("LEFT", footer, "LEFT", 0, 0)
-    end
+    raidPrepBtn:SetPoint("LEFT", footer, "LEFT", 0, 0)
     raidPrepBtn:Hide()          -- RefreshFooter decides; never flashes on a client without it
     win.raidPrepBtn = raidPrepBtn
 
@@ -1938,15 +2023,19 @@ function Frame.DebugToolbar()
     -- Listed right-to-left, i.e. the order they are anchored from the window edge.
     -- ITEM 7: four controls. The layout toggle and the separate Find button are retired;
     -- layout stays on the title right-click and Find moved onto the magnifier's
-    -- right-click. The footer round took the owner selector out of this row entirely.
+    -- right-click. The character menu is not in this cluster: it hangs off the NAME at the
+    -- other end of the row, printed below as its own zone.
     d("closeBtn", win.closeBtn)
     d("gearBtn", win.gearBtn)
     d("magBtn(search)", win.magBtn)
     d("sortBtn", win.sortBtn)
     d("searchWrap", win.searchWrap)
+    P("[title-row] name zone (title · arrow · the hit area covering both):")
+    d("title", win.title)
+    d("ownerArrow", win.ownerArrow)
+    d("ownerHit", win.ownerHit)
     P("[footer] left-to-right from the window's bottom-left corner:")
     d("footer", win.footer)
-    d("ownerSelector", win.ownerSelector)
     d("raidPrepBtn", win.raidPrepBtn)
     d("slotCount", win.slotCount)
     d("money", win.money)
@@ -2082,7 +2171,8 @@ function Frame.Rebuild()
         end
         win.title:SetText(Frame.WindowTitle(nm))
     end
-    if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
+    -- (No selector face to re-sync: the gold title above IS the label now, and the arrow
+    -- beside it carries no owner state of its own.)
     -- The raid-prep companion may have loaded since this window was built.
     Frame.RefreshFooter(win)
     -- money (viewed owner) — the "Show money bar" toggle (audit §9.4) is now live: hide/show the
@@ -3285,7 +3375,33 @@ local function testHeaderStripRoster(fails)
     -- The RETIRED / RELOCATED controls must never come back to this row silently.
     ck(set.layoutBtn == nil, "the layout toggle button is retired (title right-click still toggles)")
     ck(set.findBtn == nil, "the separate Find button is retired (right-click the magnifier)")
-    ck(set.ownerSelector == nil, "the owner selector moved to the footer, not the title row")
+    ck(set.ownerSelector == nil, "the character menu is not a glyph in the right cluster")
+
+    -- ── HEADER-SELECTOR ROUND: the NAME ZONE at the other end of the row ─────────
+    local nameZone = Frame.TITLE_NAME_CONTROLS
+    ck(type(nameZone) == "table", "the title name-zone roster is declared as data")
+    ck(#nameZone == 1, "one name-zone control (the dropdown arrow), got " .. tostring(nameZone and #nameZone))
+    ck(nameZone[1] == "ownerArrow", "the name zone's control is the owner dropdown arrow")
+    -- It must belong to exactly ONE roster: double-listing is how a control gets drawn twice.
+    for _, name in ipairs(Frame.TITLE_CONTROLS) do
+        ck(name ~= "ownerArrow", "the arrow is not also in the right-hand cluster")
+    end
+    -- The two constructors the windows share must both be published — without them the
+    -- bank silently loses its arrow and the two headers diverge.
+    ck(type(Frame.BuildOwnerHeader) == "function", "the shared owner-header constructor is published")
+    ck(Frame.DressSelectorAsGlyph == nil,
+        "the footer-glyph dressing helper is retired with the footer selector")
+
+    -- The TITLE's two scopes (header-selector round). The owner asked for the menu on the
+    -- name; the right-click layout toggle is older than that and had to survive it, so
+    -- both are pinned as data — see Frame.TitleClickAction for the collision write-up.
+    ck(Frame.TitleClickAction("LeftButton")   == "owner",  "left-click the name = the character menu")
+    ck(Frame.TitleClickAction("RightButton")  == "layout", "right-click the name = combined/split")
+    ck(Frame.TitleClickAction(nil)            == "owner",  "no button arg -> the character menu")
+    ck(Frame.TitleClickAction("MiddleButton") == "owner",  "any other button -> the character menu")
+    -- All three dual-purpose surfaces obey one rule: RIGHT is the reconfiguring click.
+    ck(Frame.TitleClickAction("RightButton")  ~= Frame.TitleClickAction("LeftButton"),
+        "the title's two buttons really do different things")
 
     -- The magnifier's two scopes.
     ck(Frame.SearchClickAction("LeftButton")  == "search", "left-click = inline search")
@@ -3332,15 +3448,20 @@ local function testFooterRoster(fails)
     -- ── ITEM 1 + 2: the roster, LEFT→RIGHT from the bottom-left corner ────────────
     local roster = Frame.FOOTER_CONTROLS
     ck(type(roster) == "table", "the footer roster is declared as data")
-    ck(#roster == 2, "two footer controls, got " .. tostring(roster and #roster))
+    ck(#roster == 1, "one footer control, got " .. tostring(roster and #roster))
     local set = {}
     for i, name in ipairs(roster) do set[name] = i end
-    ck(set.ownerSelector == 1, "the owner selector is the bottom-left corner control")
-    ck(set.raidPrepBtn == 2, "raid prep sits immediately right of the owner selector")
-    -- The selector belongs to exactly ONE roster — it must not be double-listed while a
-    -- move is half-finished, which is how a control ends up drawn twice.
+    ck(set.raidPrepBtn == 1, "raid prep is the bottom-left corner control")
+    -- HEADER-SELECTOR ROUND: the owner selector left this band. The corner is raid prep's.
+    ck(set.ownerSelector == nil, "the owner selector is out of the footer (it is the title arrow)")
+    ck(set.ownerArrow == nil, "…and the title arrow is not double-listed down here")
+    -- Every control belongs to exactly ONE roster — a control listed twice is a control
+    -- that gets drawn twice.
     for _, name in ipairs(Frame.TITLE_CONTROLS) do
         ck(set[name] == nil, "\"" .. name .. "\" is in both the title and footer rosters")
+    end
+    for _, name in ipairs(Frame.TITLE_NAME_CONTROLS) do
+        ck(set[name] == nil, "\"" .. name .. "\" is in both the name zone and the footer")
     end
 
     -- The footer band is exactly one control tall, so the four elements share a baseline.
