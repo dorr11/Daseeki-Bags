@@ -1,12 +1,16 @@
 -- =====================================================================
 -- Daseeki-Bags 2.0 headless self-test harness  (REAL Lua 5.1)
 --
--- Loads store.lua / capture.lua / migrate.lua under a minimal WoW API stub,
--- runs every ns:RegisterSelfTest suite, then runs a migration suite against the
--- committed reduced 1.x fixture (harness/fixtures/bags1x-sample.lua).
+-- Loads the whole shipping load list under a minimal WoW API stub, runs the release
+-- gates (toc parse / bindings / toc identity), runs every ns:RegisterSelfTest suite,
+-- then two fixture-driven suites this file registers itself:
+--   fixture-migration      — the owner pass + lock pass against the committed reduced
+--                            1.x fixture (harness/fixtures/bags1x-sample.lua)
+--   cutover-orchestration  — the FULL first-post-cutover login chain against a
+--                            synthetic complete 1.x file (fixtures/bags1x-full.lua)
 --
--- Usage:  lua5.1 run-selftests.lua [BAGS2_DIR]
---   BAGS2_DIR defaults to the repo root two levels up from this file.
+-- Usage:  lua5.1 run-selftests.lua [BAGS_DIR]
+--   BAGS_DIR defaults to the repo root two levels up from this file.
 --   Exit code 0 = ALL PASS.
 -- =====================================================================
 
@@ -42,7 +46,13 @@ local function flushlog() for i = 1, #LOG do realprint(LOG[i]) end LOG = {} end
 -- it is invisible. This gate parse-asserts (loadfile, no execution) EVERY .lua
 -- entry in the .toc and cross-checks the two lists, before anything is run.
 ----------------------------------------------------------------------
-local TOC_FILE = "Daseeki-Bags2.toc"
+-- Post-cutover (2.0.0) there is exactly ONE .toc: the shipping Daseeki-Bags.toc, which
+-- now loads the 2.0 tree. The side-by-side beta tocs (Daseeki-Bags2.toc, v2.toc) and the
+-- whole 1.x source tree were deleted at the cutover, so every gate below targets this
+-- single file. If a second .toc ever reappears in this folder, the client would load
+-- neither reliably (it loads the .toc whose name matches the FOLDER) -- add it to the
+-- candidate lists rather than switching this one.
+local TOC_FILE = "Daseeki-Bags.toc"
 
 -- .toc grammar: "## Key: value" directives and "#" comments are skipped; every
 -- other non-blank line is a file path relative to the addon folder. Non-.lua
@@ -115,9 +125,10 @@ realprint("")
 --      a property of the machine's install, not of this repo).
 ----------------------------------------------------------------------
 local BINDINGS_FILE = "Bindings.xml"
--- Every .toc this addon ships. A .toc that is absent is skipped (branches
--- differ); a .toc that exists MUST NOT list Bindings.xml.
-local TOC_CANDIDATES = { "Daseeki-Bags2.toc", "v2.toc", "Daseeki-Bags.toc" }
+-- Every .toc this addon ships. Post-cutover that is one file; the retired beta names are
+-- still listed so a stray re-added copy is caught. A .toc that is absent is skipped (old
+-- branches differ); a .toc that exists MUST NOT list Bindings.xml.
+local TOC_CANDIDATES = { "Daseeki-Bags.toc", "Daseeki-Bags2.toc", "v2.toc" }
 
 -- Release-gate C.9 ("no Bindings.xml action name is changed or removed"): the exact
 -- roster this addon must declare. FIVE names are legitimate as of the cutover work:
@@ -129,13 +140,22 @@ local EXPECTED_BINDINGS = {
     "DASEEKIBAGS2_TOGGLE", "DASEEKIBAGS2_BANK_TOGGLE", "DASEEKIBAGS2_FIND",
     "DASEEKIBAGS_TOGGLE", "DASEEKIBAGS_BANK_TOGGLE",
 }
--- The subset that exists purely for cutover continuity, and is therefore EXPECTED to
--- also be declared by the installed 1.x folder for as long as both are installed.
+-- The subset that exists purely for cutover continuity: the 1.x action names, re-declared
+-- by 2.0 so a key bound under 1.x survives. Dropping one of these is the AT-RISK-4
+-- regression, so a missing legacy name is a hard FAIL below just like a 2.0 name.
+--
+-- POST-CUTOVER NOTE: while the beta ran side by side, these two names were legitimately
+-- declared by TWO of our folders at once and the live probe classified that as expected.
+-- That case cannot occur any more -- the cutover leaves exactly one folder (Daseeki-Bags)
+-- and the beta folder is uninstalled -- so the probe no longer has an "expected overlap"
+-- bucket. Any name declared by two folders is now a real collision to fix in the install.
 local LEGACY_BINDINGS = { DASEEKIBAGS_TOGGLE = true, DASEEKIBAGS_BANK_TOGGLE = true }
--- Our own installed folder names. WoW loads the .toc whose name matches the FOLDER, so
--- the repo ships one .toc per install identity: the 1.x/cutover folder and the
--- side-by-side beta folder. Anything else declaring our names is a third party.
-local OUR_FOLDERS = { ["Daseeki-Bags"] = true, ["Daseeki-Bags2"] = true }
+-- Our one installed folder name. WoW loads the .toc whose name matches the FOLDER, and
+-- since the cutover the repo ships exactly one .toc for exactly one folder.
+local OUR_FOLDERS = { ["Daseeki-Bags"] = true }
+-- Folders that were ours during the beta and must NOT still be installed. A collision
+-- naming one of these is the leftover-beta-install defect, with a one-line fix.
+local RETIRED_FOLDERS = { ["Daseeki-Bags2"] = true }
 
 local function readFile(path)
     local fh = io.open(path, "r")
@@ -266,12 +286,11 @@ do
             ph:close()
         end
     end
-    -- Per-NAME folder map, because the two kinds of overlap are no longer the same
-    -- thing. Since the cutover work, this file deliberately re-declares the two LEGACY
-    -- 1.x action names so a key bound under 1.x survives the cutover (AT-RISK-4). While
-    -- 1.x is still installed, those two names ARE declared by two folders -- both ours.
-    -- That overlap is expected, self-resolving (it ends when 1.x is uninstalled), and
-    -- must not read as the install-topology defect the probe was written to catch.
+    -- Per-NAME folder map. Post-cutover the rule is simple again: exactly ONE installed
+    -- folder (Daseeki-Bags) may declare any of our action names. The beta's expected
+    -- two-folder overlap on the legacy names is gone with the beta folder, so every
+    -- multi-folder name below is a genuine collision -- reported with the specific fix
+    -- when the second folder is the retired beta one.
     local hits = {}                 -- ordered { folder=, names={} }
     local foldersByName = {}        -- name -> { folder, ... }
     for _, folder in ipairs(siblings) do
@@ -292,19 +311,13 @@ do
         end
     end
 
-    -- Classify every name declared by more than one folder.
-    local expected, genuine = {}, {}
+    -- Every name declared by more than one folder is a collision now (see above).
+    local genuine, staleBeta = {}, {}
     for name, folders in pairs(foldersByName) do
         if #folders > 1 then
-            local allOurs = true
+            genuine[#genuine + 1] = { name = name, folders = folders }
             for _, f in ipairs(folders) do
-                if not OUR_FOLDERS[f] then allOurs = false end
-            end
-            local entry = { name = name, folders = folders }
-            if LEGACY_BINDINGS[name] and allOurs then
-                expected[#expected + 1] = entry
-            else
-                genuine[#genuine + 1] = entry
+                if RETIRED_FOLDERS[f] then staleBeta[f] = true end
             end
         end
     end
@@ -318,22 +331,15 @@ do
         realprint('         "Binding <NAME> was attempted to be loaded more than once"')
         realprint("         naming the SECOND folder as Source. Only one installed folder")
         realprint("         may ship these names -- this is install topology, not repo content.")
-        realprint("         (A duplicated checkout junctioned in as a second addon folder is")
-        realprint("         the usual cause; a genuinely third-party addon claiming our")
-        realprint("         names would need one of us renamed.)")
-    end
-    if #expected > 0 then
-        realprint("  [ok] expected legacy-continuity overlap (not a defect):")
-        for _, e in ipairs(expected) do
-            realprint("         " .. e.name .. "  <-  " .. table.concat(e.folders, ", "))
+        for folder in pairs(staleBeta) do
+            realprint("         FIX: " .. folder .. " is the retired side-by-side BETA folder.")
+            realprint("         The cutover moved everything into Daseeki-Bags; delete that")
+            realprint("         folder (or its junction) and the warning goes away.")
         end
-        realprint("         2.0 re-declares the 1.x action names on purpose so keys bound")
-        realprint("         under 1.x keep working after cutover. The client logs its")
-        realprint("         load-more-than-once line for these two while BOTH folders are")
-        realprint("         installed, and stops once 1.x is removed. Do not 'fix' it by")
-        realprint("         renaming: that is what orphans the owner's keys.")
+        realprint("         Never 'fix' a collision by renaming an action: that is what")
+        realprint("         orphans every key the owner has already bound (audit AT-RISK-4).")
     end
-    if #genuine == 0 and #expected == 0 then
+    if #genuine == 0 then
         if #hits == 1 then
             realprint("  [ok] live install: " .. hits[1].folder .. " is the only folder declaring our names")
         elseif addonsDir then
@@ -358,14 +364,18 @@ realprint("")
 --
 --  1. SAVEDVARIABLES (gate A.1; audit AT-RISK-1). The client rewrites this addon's SV
 --     file at every logout from the DECLARED names only, so a global dropped from that
---     line is deleted at the next logout, silently. Both 2.0 tocs must declare all FIVE
---     globals: the 2.0 pair plus the three 1.x globals kept as the cutover rollback net
---     (2.0 reads them read-only and never writes them). This gate is the regression
---     guard for the single most destructive defect in the rollout audit.
+--     line is deleted at the next logout, silently. The shipping toc must declare all
+--     FIVE globals: the 2.0 pair plus the three 1.x globals kept as the cutover rollback
+--     net (2.0 reads them read-only and never writes them). This gate is the regression
+--     guard for the single most destructive defect in the rollout audit, and it matters
+--     MORE after cutover than before: until now the 1.x toc was the one the client
+--     actually loaded, so the 1.x globals were declared no matter what the beta tocs
+--     said. Now this file is the only thing standing between the owner's 1.x data and
+--     the next logout.
 --
 --  2. VERSION (gate C.12; audit NW-8, which found the shipped toc reading 1.1.4 while
---     the released tag was v1.1.5). The 2.0 tocs must agree with each other and with
---     core.lua's ns.VERSION.
+--     the released tag was v1.1.5). The shipping toc must agree with core.lua's
+--     ns.VERSION -- 2.0.0 at the cutover -- and, at release time, with the tag.
 --
 --  3. OPTIONALDEPS (added with the W2 Nexus bridge). Daseeki-Nexus must stay on the
 --     OptionalDeps line. It is NOT a dependency -- nexus.lua is fully type-guarded and
@@ -387,7 +397,14 @@ local REQUIRED_SV_2X = {
 }
 local REQUIRED_OPTIONAL_DEPS = { "Daseeki-Core", "Daseeki-Nexus" }
 local FORBIDDEN_HARD_DEPS    = { "Daseeki-Core", "Daseeki-Nexus" }
-local TOCS_2X = { "Daseeki-Bags2.toc", "v2.toc" }
+-- Post-cutover this is the single SHIPPING toc. It was { "Daseeki-Bags2.toc", "v2.toc" }
+-- while the 2.0 tree rode in beside a 1.x Daseeki-Bags.toc; both beta files are gone and
+-- the name below is the one the client loads. A .toc absent on a branch is skipped, so
+-- this list is safe to grow if a second identity ever ships.
+local TOCS_2X = { "Daseeki-Bags.toc" }
+-- Retired beta tocs. Present here only so their RETURN is caught: two .toc files in one
+-- folder is ambiguous to the client and re-introduces the duplicate-binding warning.
+local RETIRED_TOCS = { "Daseeki-Bags2.toc", "v2.toc" }
 
 local function tocDirective(src, key)
     for line in src:gmatch("[^\r\n]+") do
@@ -400,10 +417,22 @@ end
 realprint("=== toc identity gate :: SavedVariables declaration + ## Version ===")
 local idFails = 0
 
+-- The beta tocs must stay deleted: a folder holding more than one .toc is ambiguous, and
+-- a stray Daseeki-Bags2.toc is also what makes a leftover beta FOLDER load and re-declare
+-- our binding names.
+for _, toc in ipairs(RETIRED_TOCS) do
+    if readFile(P(toc)) then
+        idFails = idFails + 1
+        realprint("  [FAIL] " .. toc .. " is back. The 2.0 cutover retired the side-by-side")
+        realprint("         beta tocs; the shipping identity is Daseeki-Bags.toc alone.")
+    end
+end
+
 for _, toc in ipairs(TOCS_2X) do
     local src = readFile(P(toc))
     if not src then
-        realprint("  [skip] " .. toc .. " absent on this branch")
+        idFails = idFails + 1
+        realprint("  [FAIL] " .. toc .. " is missing -- that is the file the client loads")
     else
         local decl = tocDirective(src, "SavedVariables") or ""
         local declared = {}
@@ -486,7 +515,7 @@ do
             end
         end
         if idFails == 0 then
-            realprint("  [ok] ## Version " .. coreVersion .. " consistent across the 2.0 tocs and core.lua")
+            realprint("  [ok] ## Version " .. coreVersion .. " consistent across the shipping toc and core.lua")
             realprint("       (release-gate C.12 also requires this to match the tag at release time)")
         end
     end
@@ -591,8 +620,9 @@ end
 -- core.lua loads FIRST — it provides the ns runtime the other files consume at
 -- load time (ns:RegisterSelfTest, ns:RegisterEvent, ns:On/Fire). It is headless-
 -- safe (CreateFrame / SlashCmdList / geterrorhandler are all guarded).
--- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
--- attach borders at paint), then ui_frame last (it consumes ns.Items).
+-- Load order mirrors the shipping Daseeki-Bags.toc: W1 engine, then borders before
+-- ui_items (buttons attach borders at paint), then ui_frame after (it consumes ns.Items).
+-- The drift sub-check below proves this list and the .toc's are the same, in order.
 local TOC_ORDER = { "core.lua", "store.lua", "locks.lua", "nexus.lua", "capture.lua", "migrate.lua",
                     "migrate_settings.lua",
                     "borders.lua", "ui_items.lua", "parity.lua", "ui_frame.lua",
@@ -667,8 +697,8 @@ end
 --
 -- Regenerate the roster from the Daseeki-Bags repo root with:
 --   grep -rho --include=*.lua 'RegisterSelfTest("[^"]*"' . | sed 's/.*("//; s/"$//' | sort -u
--- then drop "fixture-migration" -- that one is registered by THIS file, below,
--- which is deliberately after this gate runs.
+-- then drop "fixture-migration" and "cutover-orchestration" -- those two are registered
+-- by THIS file, below, which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
     "borders", "capture", "cell-parity", "core", "features", "locks", "migrate", "migrate_settings", "nexus",
@@ -762,6 +792,219 @@ ns:RegisterSelfTest("fixture-migration", function(verbose)
 
     for _, f in ipairs(fails) do ns:Print("  FAIL fixture-migration :: " .. f) end
     if #fails == 0 and verbose then ns:Print("  PASS fixture-migration") end
+    return #fails == 0
+end)
+
+----------------------------------------------------------------------
+-- CUTOVER ONE-SHOT ORCHESTRATION SUITE  (added 2026-08-03 with the 2.0 cutover)
+--
+-- Every individual migration pass has its own unit suite. What none of them can see is
+-- the thing the cutover actually risks: whether ALL of them fire, ONCE, IN THE RIGHT
+-- ORDER, on the FIRST login of a real 1.x install — and then never again.
+--
+-- Post-cutover that first login is the only chance any of them get. It is driven by a
+-- chain that crosses five files and two events:
+--
+--   ADDON_LOADED  core.lua:257  Store.Init()                     attach + defaults
+--                               Migrate.Migrate()                migrate.lua:391
+--                                 -> Migrate.Run                 owners / bags / gold
+--                                 -> Migrate.SelfHeal            sticky-marker repair
+--                                 -> MigrateSettings.Migrate()   migrate_settings:584
+--                                      -> MigrateSettings.Run    settings + rules
+--                                      -> Locks.Migrate()        locks.lua:408
+--                               ns:Fire("STORE_READY")
+--   STORE_READY                 Rules.ApplyDefaults / MigrateDefaultFlip  rules2:466
+--                               Options.ApplyDefaults, Features.ApplyDefaults
+--   PLAYER_LOGIN  Frame.OnLogin Frame.ApplyDefaults -> MigrateDensity -> MigrateScale
+--
+-- The suite runs that whole chain against harness/fixtures/bags1x-full.lua and asserts
+-- the ORDER-SENSITIVE outcomes, not just the individual reports. The load-bearing one:
+-- the fixture's 1.x grid is EXACTLY the pre-parity 12/4 pair that Frame.MigrateDensity
+-- flips to 11/2. The settings pass claims db.densityUserChose when it writes a grid
+-- from 1.x, and MigrateDensity honours that marker — so 12/4 survives if and only if
+-- the settings pass ran first. Invert the order and the owner's imported 1.x grid is
+-- silently re-defaulted on the same login that imported it.
+--
+-- It also asserts the two properties the whole rollback net rests on: the three 1.x
+-- globals are still deep-equal to what the fixture loaded (READ-ONLY on the source),
+-- and a second full login changes nothing at all (every marker holds).
+----------------------------------------------------------------------
+ns:RegisterSelfTest("cutover-orchestration", function(verbose)
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function deepcopy(v)
+        if type(v) ~= "table" then return v end
+        local t = {}
+        for k, x in pairs(v) do t[k] = deepcopy(x) end
+        return t
+    end
+    local function deepeq(a, b, path)
+        path = path or ""
+        if type(a) ~= type(b) then return false, path .. " type" end
+        if type(a) ~= "table" then
+            if a ~= b then return false, path .. " value" end
+            return true
+        end
+        for k, v in pairs(a) do
+            local ok, why = deepeq(v, b[k], path .. "." .. tostring(k))
+            if not ok then return false, why end
+        end
+        for k in pairs(b) do
+            if a[k] == nil then return false, path .. "." .. tostring(k) .. " added" end
+        end
+        return true
+    end
+
+    -- A FRESH install meeting a full 1.x file: no 2.0 globals at all.
+    _G.DaseekiBags2DB, _G.DaseekiBags2Data = nil, nil
+    _G.DaseekiBagsAccount, _G.DaseekiBagsSets, _G.DaseekiBagsMesh = nil, nil, nil
+
+    local fn, err = loadfile(H("fixtures/bags1x-full.lua"))
+    if not fn then
+        ns:Print("  FAIL cutover-orchestration :: cannot load fixture: " .. tostring(err))
+        return false
+    end
+    fn()
+    ck(type(_G.DaseekiBagsAccount) == "table", "fixture set DaseekiBagsAccount")
+    ck(type(_G.DaseekiBagsSets)    == "table", "fixture set DaseekiBagsSets")
+    ck(type(_G.DaseekiBagsMesh)    == "table", "fixture set DaseekiBagsMesh")
+
+    -- Pristine copies, for the read-only assertion at the end.
+    local pristine = {
+        DaseekiBagsAccount = deepcopy(_G.DaseekiBagsAccount),
+        DaseekiBagsSets    = deepcopy(_G.DaseekiBagsSets),
+        DaseekiBagsMesh    = deepcopy(_G.DaseekiBagsMesh),
+    }
+
+    -- One full login, in the client's order. Mirrors core.lua's ADDON_LOADED handler,
+    -- the STORE_READY fire, and Frame.OnLogin's migration prologue.
+    local Frame = ns.Frame
+    local function login()
+        local out = {}
+        ns.Store.Init()
+        out.migrate = ns.Migrate.Migrate()
+        ns:Fire("STORE_READY")
+        if Frame then
+            Frame.ApplyDefaults(ns.Store.db)
+            out.density = Frame.MigrateDensity(ns.Store.db)
+            out.scale   = Frame.MigrateScale(ns.Store.db)
+        end
+        return out
+    end
+
+    local r1  = login()
+    local db  = ns.Store.db
+    local dat = ns.Store.data
+
+    -- ── 1. Owners / bags / gold ───────────────────────────────────────────────────
+    local m = r1.migrate
+    ck(m and not m.skipped, "owner pass ran on the first login")
+    ck(m.full == 2, "2 full characters imported (got " .. tostring(m and m.full) .. ")")
+    ck(m.summary == 2, "2 summary-only characters imported (got " .. tostring(m and m.summary) .. ")")
+    ck(m.owners == 4, "4 owners total (got " .. tostring(m and m.owners) .. ")")
+    ck(dat.migratedFrom1x == true, "owner marker set")
+    ck(dat.owners["Puuchoco-Whitemane"].source == "full",
+       "a character present in BOTH sources stays FULL (never downgraded to summary)")
+    local gold = 0
+    for _, o in pairs(dat.owners) do gold = gold + (o.money or 0) end
+    ck(gold == 39000 + 63 + 1022693 + 500, "cross-account gold total (got " .. gold .. ")")
+
+    -- ── 2. Settings ───────────────────────────────────────────────────────────────
+    local s = m.settings
+    ck(s and s.ran, "settings pass ran at the same migration moment")
+    ck(s.markerSet == true and db.migratedSettingsFrom1x == true, "settings marker set")
+    ck(s.settings.source == "global", "1.x profile precedence picked the global profile")
+    ck(db.layout == "split", "bagBreak 2 became the split layout")
+    ck(db.showMoney == false, "an explicit 1.x money=false carried over")
+    ck(db.showItemCounts == false, "countItems=false carried over")
+    ck(db.qualityBorders == false, "glowQuality=false carried over")
+    ck(db.moneyTooltipFaction == true and db.moneyTooltipMinGold == 25,
+       "money-tooltip options carried over")
+    ck(type(db.autoDisplay) == "table" and db.autoDisplay.merchant == false
+       and db.autoDisplay.mail == false, "the explicit display OFFs carried over")
+    -- A 1.x display=true is not carried (both sides default ON), so `bank` reaches its
+    -- value from Features.ApplyDefaults at STORE_READY, not from the import. Asserting
+    -- the RESULT rather than the absence: the interactions the owner left on stay on.
+    ck(db.autoDisplay.bank == true, "a display ON survives as ON (seeded, not imported)")
+    ck(db.setMarkers ~= true, "1.x glowSets is deliberately NOT carried (inert on Era)")
+
+    -- ── 3. THE ORDERING ASSERTION ─────────────────────────────────────────────────
+    ck(db.densityUserChose == true, "the settings pass claimed the density marker")
+    ck(db.columns == 12 and db.gap == 4,
+       "the 1.x grid SURVIVED the density heal on the same login (settings pass ran " ..
+       "first) — got columns=" .. tostring(db.columns) .. " gap=" .. tostring(db.gap))
+    ck(r1.density == false, "…and MigrateDensity correctly declined to flip it")
+    ck(db[Frame.DENSITY_MARKER] == true, "…while still stamping its one-time marker")
+    ck(db.scale == Frame.DEFAULT_SCALE, "a fresh DB takes the CURRENT default scale")
+    ck(r1.scale == false, "…so the 0.89 heal is a no-op rather than a double-move")
+    ck(db[Frame.SCALE_MARKER] == true, "…and stamps its marker too")
+
+    -- ── 4. Rules -> categories ────────────────────────────────────────────────────
+    ck(m.settings.rules.imported == 1, "the convertible search rule became a category")
+    ck(m.settings.rules.skipped == 1, "the macro rule was reported, not silently dropped")
+    ck(db.categories[1] and db.categories[1].name == "Herbs",
+       "imported categories sit ABOVE the seeded defaults (first-match-wins)")
+    ck(db.categoriesUserChose == true, "…and claim the user-chose marker")
+    ck(db.categoriesEnabled == false,
+       "the R3 flat-grid default is NOT overridden by an import")
+    ck(db[ns.Rules.DEFAULT_FLIP_MARKER] == true, "the R3 flip stamped its marker")
+
+    -- ── 5. Sort locks ─────────────────────────────────────────────────────────────
+    local L = m.settings.locks
+    ck(L and L.ran, "the lock pass ran, on its OWN marker")
+    ck(L.imported == 5, "5 locked slots imported (got " .. tostring(L and L.imported) .. ")")
+    ck(L.characters == 2, "across 2 characters (got " .. tostring(L and L.characters) .. ")")
+    ck(db[ns.Locks.MIGRATION_MARKER] == true, "lock marker set")
+    local roots = db[ns.Locks.DB_KEY]
+    ck(ns.Locks.RootIsLocked(roots["Puuchoco-Whitemane"], 0, 3)
+       and ns.Locks.RootIsLocked(roots["Puuchoco-Whitemane"], 1, 13)
+       and ns.Locks.RootIsLocked(roots["Itchey-Whitemane"], 1, 9),
+       "locks landed on the right character, container and slot")
+    ck(ns.Locks.RootIsLocked(roots["Itchey-Whitemane"], 0, 1) == false,
+       "an empty 1.x lock table contributes nothing")
+
+    -- ── 6. READ-ONLY on the source (the rollback net) ─────────────────────────────
+    for name, before in pairs(pristine) do
+        local ok, why = deepeq(before, _G[name])
+        ck(ok, "the 1.x global " .. name .. " was not modified (" .. tostring(why) .. ")")
+    end
+
+    -- ── 7. The SECOND login changes nothing ───────────────────────────────────────
+    local snapshot = deepcopy(db)
+    local r2 = login()
+    ck(r2.migrate.skipped == true, "second login: owner pass skipped by its marker")
+    ck(r2.migrate.selfHealed ~= true,
+       "second login: the self-heal did NOT fire (owners are present, marker is honest)")
+    ck(r2.migrate.settings.skipped == true, "second login: settings pass skipped")
+    ck(r2.density == false and r2.scale == false, "second login: no default heal re-ran")
+    local ok2, why2 = deepeq(snapshot, db)
+    ck(ok2, "second login left the settings DB byte-identical (" .. tostring(why2) .. ")")
+    ck(db.columns == 12 and db.gap == 4, "…the imported grid in particular")
+
+    -- ── 8. The sticky-marker self-heal still has a door ───────────────────────────
+    -- The AT-RISK-1c anomaly: marker set, zero owners, source sitting right there.
+    dat.owners = {}
+    local r3 = ns.Migrate.Migrate()
+    ck(r3.selfHealed == true, "a marked-but-empty store self-heals from the 1.x source")
+    ck(r3.owners == 4, "…recovering all 4 owners (got " .. tostring(r3.owners) .. ")")
+
+    if verbose then
+        ns:Print(string.format(
+            "  cutover: owners=%d (full=%d summary=%d) gold=%dg | settings applied=%d matched=%d kept=%d | " ..
+            "rules in=%d skipped=%d | locks=%d/%d chars",
+            m.owners, m.full, m.summary, math.floor(gold / 10000),
+            m.settings.appliedCount or 0, m.settings.matchedCount or 0, m.settings.keptCount or 0,
+            m.settings.rules.imported, m.settings.rules.skipped,
+            L and L.imported or -1, L and L.characters or -1))
+    end
+
+    -- Leave the globals as we found them for anything that runs after us.
+    _G.DaseekiBags2DB, _G.DaseekiBags2Data = nil, nil
+    ns.Store.db, ns.Store.data = nil, nil
+
+    for _, f in ipairs(fails) do ns:Print("  FAIL cutover-orchestration :: " .. f) end
+    if #fails == 0 and verbose then ns:Print("  PASS cutover-orchestration") end
     return #fails == 0
 end)
 
