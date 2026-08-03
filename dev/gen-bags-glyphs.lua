@@ -1,14 +1,15 @@
--- Daseeki-Bags 2.0 — title-row control glyphs (owned assets).
+-- Daseeki-Bags 2.0 — window control glyphs (owned assets).
 --
--- Authors the icon set for the window's top-right control strip, in the SAME
--- stroke family as the Nexus dashboard icons (icon-gear / icon-close), so the two
--- addons read as one system:
+-- Authors the icon set for the window's control strips, in the SAME stroke family
+-- as the Nexus dashboard icons (icon-gear / icon-close), so the two addons read as
+-- one system:
 --
---   icon-search.tga  — magnifier            (filter this window as you type)
---   icon-sort.tga    — down arrow           (sort bags)
---   icon-find.tga    — bulleted list        (find an item across all characters)
---   icon-layout.tga  — two vertical panes   (combined <-> split toggle)
---   icon-owner.tga   — person bust          (owner selector)
+--   icon-search.tga   — magnifier            (filter this window as you type)
+--   icon-sort.tga     — down arrow           (sort bags)
+--   icon-find.tga     — bulleted list        (find an item across all characters)
+--   icon-layout.tga   — two vertical panes   (combined <-> split toggle)
+--   icon-owner.tga    — person bust          (owner selector)
+--   icon-raidprep.tga — stoppered flask      (Daseeki-Raid-Prep checklist toggle)
 --
 -- icon-gear.tga and icon-close.tga are NOT authored here: they are copied verbatim
 -- from Daseeki-Nexus/textures (our own assets, same 64x64 byte format), so the gear
@@ -159,6 +160,33 @@ local function glyphOwner(x, y)
     return false
 end
 
+-- RAID PREP: a stoppered FLASK — a round-bottomed body arc, two shoulders rising to a
+-- narrow neck, capped by a stopper bar. Raid Prep is a consumables checklist, and 1.x's
+-- own button wore a potion item icon (Mighty Rage Potion), so the flask is the honest
+-- symbol for it. Drawn as an OUTLINE, not a filled bottle, so it keeps the set's open
+-- silhouette; the arc is deliberately cut at the shoulders instead of closing into a
+-- circle, which is what stops it reading as the gear or the owner bust beside it.
+local P_BODY_CY, P_BODY_R = -6, 13     -- body arc centre + radius (reach 22 downward)
+local P_NECK_X            = 6.5        -- neck half-separation
+local P_NECK_TOP          = 15.5
+local P_SHOULDER_Y        = 7
+local P_CAP_Y, P_CAP_X    = 18, 9.5    -- stopper bar (reach 21 upward)
+local function glyphRaidPrep(x, y)
+    -- body: the arc from the left shoulder round the bottom to the right shoulder
+    if inArcAt(x, y, 0, P_BODY_CY, P_BODY_R, 150, 30, HALF) then return true end
+    -- shoulders: arc ends (r*cos150, cy + r*sin150) angling in to the neck
+    local ax = P_BODY_R * math.cos(math.rad(150))
+    local ay = P_BODY_CY + P_BODY_R * math.sin(math.rad(150))
+    if inSegment(x, y, ax, ay, -P_NECK_X, P_SHOULDER_Y, HALF) then return true end
+    if inSegment(x, y, -ax, ay, P_NECK_X, P_SHOULDER_Y, HALF) then return true end
+    -- neck: two uprights to the stopper
+    if inSegment(x, y, -P_NECK_X, P_SHOULDER_Y, -P_NECK_X, P_NECK_TOP, 2.8) then return true end
+    if inSegment(x, y,  P_NECK_X, P_SHOULDER_Y,  P_NECK_X, P_NECK_TOP, 2.8) then return true end
+    -- stopper
+    if inSegment(x, y, -P_CAP_X, P_CAP_Y, P_CAP_X, P_CAP_Y, HALF) then return true end
+    return false
+end
+
 ----------------------------------------------------------------------
 -- rasteriser
 ----------------------------------------------------------------------
@@ -198,3 +226,4 @@ writeTGA(dir .. "/icon-sort.tga",   glyphSort)
 writeTGA(dir .. "/icon-find.tga",   glyphFind)
 writeTGA(dir .. "/icon-layout.tga", glyphLayout)
 writeTGA(dir .. "/icon-owner.tga",  glyphOwner)
+writeTGA(dir .. "/icon-raidprep.tga", glyphRaidPrep)

@@ -59,7 +59,12 @@ local Store = ns.Store
 Bank.PAD       = 8
 Bank.TITLE_H   = 30   -- matches Frame.TITLE_H: room for the 22px title-row controls
 Bank.STRIP_H   = 22   -- bank-bag purchase/toggle strip
-Bank.MONEY_H   = 20
+-- FOOTER band, sibling of Frame.FOOTER_H (was MONEY_H = 20). The footer round moved the
+-- owner selector out of the title row into the bottom-left corner on BOTH windows, so
+-- this band now holds a 22px control and is one control tall. Its three zones — controls
+-- LEFT, free/total CENTRE, money RIGHT — are the inventory footer's, element for element,
+-- minus the raid-prep glyph (1.x only ever put that on the inventory frame).
+Bank.FOOTER_H  = 22
 Bank.VGAP      = 6
 
 ----------------------------------------------------------------------
@@ -160,7 +165,7 @@ function Bank.ComputeWindowSize(owner, opts)
             + Bank.PAD
             + Bank.STRIP_H + Bank.VGAP
             + math.max(content.height, 1) + Bank.VGAP
-            + Bank.MONEY_H
+            + Bank.FOOTER_H
             + Bank.PAD
     return { width = w, height = h }
 end
@@ -348,15 +353,11 @@ function Bank.Ensure()
     UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
-    -- Owner selector (shared viewed-owner; flipping it re-renders both windows).
-    if ns.Owner and ns.Owner.CreateSelector then
-        local sel = ns.Owner.CreateSelector(titleBar, {
-            onSelect = function(key)
-                if ns.Frame and ns.Frame.SetViewedOwner then ns.Frame.SetViewedOwner(key) end
-            end,
-        })
-        if sel then sel:SetPoint("LEFT", title, "RIGHT", 12, 0); win.ownerSelector = sel end
-    end
+    -- (The OWNER SELECTOR used to sit here, right of the gold title, at its full 150px
+    -- name-and-caret width. The footer round moved it to the window's bottom-left corner
+    -- in the same 22px glyph form the inventory window uses — see the footer block below.
+    -- Nothing about the widget changed; the bank's own title already names the character,
+    -- so the name column it used to carry was saying the same thing twice.)
 
     -- Offline "Updated …" stamp (shown when the viewed bank is a cached snapshot).
     local stamp = titleBar:CreateFontString(nil, "OVERLAY")
@@ -472,10 +473,51 @@ function Bank.Ensure()
     empty:Hide()
     win.emptyFS = empty
 
+    -- ── FOOTER ROW (sibling of the inventory footer, same three zones) ────────
+    -- controls LEFT · free/total CENTRE · money RIGHT, all anchored INSIDE this band so
+    -- they share one baseline. Built from Bank.FOOTER_H, which matches Frame.FOOTER_H.
+    local footer = _G.CreateFrame("Frame", nil, win)
+    footer:SetPoint("BOTTOMLEFT",  win, "BOTTOMLEFT",   PAD, PAD)
+    footer:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    footer:SetHeight(Bank.FOOTER_H)
+    -- Float the band above the grid's frame-level stack (see the inventory footer note).
+    footer:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
+    win.footer = footer
+
+    -- Owner selector (shared viewed-owner; flipping it re-renders both windows), MOVED
+    -- here from the title row so the bank matches the inventory window corner for corner.
+    -- Dressed by the inventory's own Frame.DressSelectorAsGlyph, so the two windows
+    -- cannot end up wearing different treatments of the same widget; the guard keeps the
+    -- widget in its default name-and-caret form if ui_frame is somehow not loaded.
+    if ns.Owner and ns.Owner.CreateSelector then
+        local F2 = ns.Frame
+        local sel = ns.Owner.CreateSelector(footer, {
+            width = (F2 and F2.ICONBTN) or 22,
+            menuGrow = "up",
+            onSelect = function(key)
+                if ns.Frame and ns.Frame.SetViewedOwner then ns.Frame.SetViewedOwner(key) end
+            end,
+        })
+        if sel then
+            sel:ClearAllPoints()
+            sel:SetPoint("LEFT", footer, "LEFT", 0, 0)
+            sel:SetSize((F2 and F2.ICONBTN) or 22, (F2 and F2.ICONBTN) or 22)
+            if F2 and F2.DressSelectorAsGlyph then F2.DressSelectorAsGlyph(sel, UI) end
+            win.ownerSelector = sel
+        end
+    end
+    -- (The decorative backpack glyph that used to sit in this corner is GONE. It was
+    -- ornament in the one footer position that is now a control, and the inventory
+    -- window retired its own corner glyph for the same reason a round earlier.)
+
     -- ── Money bar (bank char's gold; cross-account total on hover) ────────────
-    local money = _G.CreateFrame("Button", nil, win)
-    money:SetSize(160, Bank.MONEY_H)
-    money:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    local money = _G.CreateFrame("Button", nil, footer)
+    money:SetSize(160, Bank.FOOTER_H)
+    -- Same right-edge allowance as the inventory money strip (Frame.MONEY_EDGE_INSET):
+    -- GetCoinTextureString draws each coin 2px right of the width it measures, so the
+    -- trailing coin used to paint onto the window's keyline. Read off ns.Frame so the two
+    -- windows can never disagree about the inset.
+    money:SetPoint("RIGHT", footer, "RIGHT", -((ns.Frame and ns.Frame.MONEY_EDGE_INSET) or 6), 0)
     -- Defensive mouse wiring, mirrored from the inventory money bar: explicitly enable mouse
     -- and float the bar ABOVE the content grid's frame-level stack so a hover always lands on
     -- it (the owner reported the inventory gold hover doing nothing before this was added; the
@@ -495,21 +537,13 @@ function Bank.Ensure()
     money:SetScript("OnClick", function() Bank.OnMoneyClick() end)
     win.money, win.moneyFS = money, moneyFS
 
-    -- Free/total bank-slot counter, bottom-CENTER (sibling of the inventory SlotCount).
-    local slotCount = win:CreateFontString(nil, "OVERLAY")
+    -- Free/total bank-slot counter, footer CENTRE (sibling of the inventory SlotCount).
+    local slotCount = footer:CreateFontString(nil, "OVERLAY")
     slotCount:SetFontObject(UI.fonts.numeral or UI.fonts.body)
-    slotCount:SetPoint("BOTTOM", win, "BOTTOM", 0, PAD)
+    slotCount:SetPoint("CENTER", footer, "CENTER", 0, 0)
     slotCount:SetJustifyH("CENTER")
     UI.Skin(slotCount, function(self) self:SetTextColor(UI.Color("muted")) end)
     win.slotCount = slotCount
-
-    -- Small icon, bottom-LEFT (1.0 sibling): a quiet bank glyph (decorative anchor).
-    local footIcon = win:CreateTexture(nil, "ARTWORK")
-    footIcon:SetSize(18, 18)
-    footIcon:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", PAD, PAD)
-    footIcon:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
-    UI.Skin(footIcon, function(self) self:SetVertexColor(UI.Color("muted")) end)
-    win.footIcon = footIcon
 
     win._group = nil   -- pooled ns.Items group (built on first Rebuild)
     Bank.window = win
@@ -932,6 +966,31 @@ local function testBankEntriesAndSizing(fails)
     ck(wz2.height >= wz.height, "populated bank at least as tall as empty")
 end
 
+-- FOOTER ROUND: the bank's bottom band is the inventory footer's sibling — same height,
+-- same three zones, same money edge allowance, and it now carries the owner selector in
+-- the bottom-left corner. Pinned here because the two windows drifting apart on any of
+-- those is exactly the class of defect the owner keeps having to screenshot.
+local function testBankFooterParity(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local F = ns.Frame
+    ck(F ~= nil, "ui_frame is loaded (the bank reads its footer metrics)")
+    if not F then return end
+    ck(Bank.FOOTER_H == F.FOOTER_H,
+        "bank footer band (" .. tostring(Bank.FOOTER_H) .. ") = inventory footer band (" .. tostring(F.FOOTER_H) .. ")")
+    ck(Bank.FOOTER_H == F.ICONBTN, "the bank footer is one control tall, so its row shares a baseline")
+    ck(Bank.PAD == F.PAD, "both windows inset their footer by the same padding")
+    ck(Bank.MONEY_H == nil, "the money-only band metric is gone on the bank too")
+    -- The dressing helper the bank calls must exist on ns.Frame; without it the bank's
+    -- selector silently reverts to the 150px name form and the two footers diverge.
+    ck(type(F.DressSelectorAsGlyph) == "function", "the shared selector dressing helper is published")
+    ck(type(F.MoneyRightInset) == "function" and F.MoneyRightInset() > F.PAD,
+        "the shared money edge allowance is published and larger than the plain padding")
+    -- The band must still be accounted for in the window height (a footer nobody measured
+    -- is a footer that overlaps the last grid row).
+    local tall = Bank.ComputeWindowSize(nil, { columns = 12, buttonSize = 37, gap = 4 }).height
+    ck(tall > Bank.TITLE_H + Bank.STRIP_H + Bank.FOOTER_H, "the footer band is inside the window height")
+end
+
 -- 1.0-LOOK PARITY: bank title format + free/total counter (bottom-center sibling).
 local function testBankTitleAndCounts(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -1054,6 +1113,7 @@ function Bank.RunSelfTests(verbose)
         { name = "purchase-state matrix",  fn = testPurchaseStateMatrix },
         { name = "cached-view proxy",      fn = testCachedViewProxy },
         { name = "bank entries + sizing",  fn = testBankEntriesAndSizing },
+        { name = "footer parity",          fn = testBankFooterParity },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

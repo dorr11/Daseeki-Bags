@@ -121,13 +121,37 @@ Frame.STRIP_GLOW_ALPHA   = 0.75
 --
 -- icon-gear and icon-close are byte-identical copies of the Nexus assets; the rest are
 -- authored in the same stroke family by dev/gen-bags-glyphs.lua.
--- ── TITLE-ROW CONTROL ROSTER (display round, ITEM 7) ──────────────────────────────
--- The five controls the title row ships, RIGHT→LEFT from the window edge (so the visual
--- left-to-right order is owner · sort · search · gear · ✕). Declared as DATA so the
--- headless harness can gate it: a control quietly added or dropped in a later polish
--- round then shows up as a test failure instead of as a screenshot the owner has to
--- annotate. `layoutBtn` and `findBtn` are deliberately absent — see the build block.
-Frame.TITLE_CONTROLS = { "closeBtn", "gearBtn", "magBtn", "sortBtn", "ownerSelector" }
+-- ── TITLE-ROW CONTROL ROSTER (display round ITEM 7, revised in the footer round) ──
+-- The four controls the title row ships, RIGHT→LEFT from the window edge (so the visual
+-- left-to-right order is sort · search · gear · ✕). Declared as DATA so the headless
+-- harness can gate it: a control quietly added or dropped in a later polish round then
+-- shows up as a test failure instead of as a screenshot the owner has to annotate.
+-- `layoutBtn` and `findBtn` are deliberately absent — see the build block. So is
+-- `ownerSelector`, which the FOOTER round moved to the bottom-left corner (below).
+Frame.TITLE_CONTROLS = { "closeBtn", "gearBtn", "magBtn", "sortBtn" }
+
+-- ── FOOTER CONTROL ROSTER (footer round) ──────────────────────────────────────────
+-- The window's bottom band is no longer just the money strip. It is a proper FOOTER row
+-- with three zones — controls LEFT, the free/total counter CENTRE, money RIGHT — and it
+-- now carries the two controls the owner asked for at the bottom-left, listed here
+-- LEFT→RIGHT in the order they are anchored from the window's bottom-left corner:
+--
+--   [ owner ][ raid prep ]            20/92                        412g 75s 3c
+--
+--   * ownerSelector — MOVED out of the title row. It is the one control in the strip
+--     that is not a verb: sort/search/settings/close all DO something to this window,
+--     while the selector changes WHOSE window you are looking at. Parking it beside the
+--     character name it changes (the gold title) read as a sixth glyph in a row of five
+--     verbs. In the footer it sits with the other per-owner readouts (that owner's slot
+--     count, that owner's money), which is what it actually belongs to.
+--   * raidPrepBtn — RESTORED from 1.x, where Daseeki-Raid-Prep hooked the inventory
+--     frame's Layout and parked its own button at BOTTOMLEFT +8/+8. 2.0 owns the button
+--     instead of letting the companion reach in (its hook looks for the 1.x
+--     `_G['Daseeki-Bags']` object, which 2.0 does not publish), and soft-guards it so a
+--     client without the companion simply never sees it. See Frame.RaidPrepAvailable.
+--
+-- Also declared as DATA, for the same regression reason as the title row.
+Frame.FOOTER_CONTROLS = { "ownerSelector", "raidPrepBtn" }
 
 -- PURE: what a click on the dual-purpose magnifier means (ITEM 7b).
 --   "find"   — right-click: the cross-character Find window
@@ -147,7 +171,24 @@ Frame.WINDOW_BG_ALPHA = 0.94   -- 1.0-parity near-solid dark ground (Bags-side, 
 Frame.ICON_BACKPACK = "Interface\\Buttons\\Button-Backpack-Up"
 Frame.ICON_KEYRING  = "Interface\\ContainerFrame\\KeyRing-Bag-Icon"
 Frame.STRIP_ICON_TRIM = 0.08   -- SetTexCoord trim to crop an icon's built-in border (suite icon treatment)
-Frame.MONEY_H     = 20   -- bottom bar (slot icon · free/total · money)
+-- FOOTER band (was MONEY_H = 20, when the band held nothing but text). The footer round
+-- put two 22px Nexus-language controls in it, so the band is exactly one control tall:
+-- 22, not 20. Two extra pixels of window height is the whole cost, and in exchange every
+-- footer element — selector, raid-prep glyph, free/total counter, money — is centred on
+-- ONE baseline instead of the old mixture (the money text was vertically centred in a
+-- 20px button while the counter sat on the window's bottom padding, so they never quite
+-- lined up). Everything in the footer is anchored inside the `footer` frame built from
+-- this metric, which is what makes that alignment structural rather than eyeballed.
+Frame.FOOTER_H    = 22   -- bottom bar (owner · raid prep | free/total | money)
+-- The money text's total inset from the window's RIGHT edge is PAD + this. PAD alone put
+-- the coin string's right edge exactly on the padding line, and it read as overhanging
+-- the frame: GetCoinTextureString's coin markup is `|T…:0:0:2:0|t`, i.e. each inline coin
+-- texture is drawn 2px to the RIGHT of the advance width the string measures, so the
+-- trailing coin always paints past the box the layout engine sized. Add the bronze
+-- keyline sitting on the window edge itself and the last coin is effectively touching
+-- the border. This is a deliberate, named allowance — the money strip is the only
+-- element in the window whose drawn width exceeds its measured width.
+Frame.MONEY_EDGE_INSET = 6
 Frame.VGAP        = 6     -- vertical gap between chrome bands
 Frame.GROUP_HDR_H = 16   -- small per-bag header (split layout)
 Frame.GROUP_GAP   = 8    -- vertical gap between split groups
@@ -156,6 +197,95 @@ Frame.GROUP_GAP   = 8    -- vertical gap between split groups
 -- the two can be tuned independently.
 Frame.SECTION_HDR_H = 16 -- microLabel + count header above each category section
 Frame.SECTION_GAP   = 8  -- vertical gap between category sections
+
+-- PURE: how far the money text's right edge sits in from the window's right edge.
+-- One number, used by BOTH the inventory and the bank footer (ui_bank reads it off
+-- ns.Frame), so the two windows cannot drift into disagreeing about the same defect.
+function Frame.MoneyRightInset() return Frame.PAD + Frame.MONEY_EDGE_INSET end
+
+-- ── RAID-PREP COMPANION (footer round, ITEM 2) ────────────────────────────────────
+-- PURE: is the Daseeki-Raid-Prep companion actually there to be toggled?
+--   hasToggle — the companion published `DaseekiPrep:ToggleChecklist` (the real test:
+--               we call that function, so its presence is what "available" means)
+--   loaded    — C_AddOns.IsAddOnLoaded("Daseeki-Raid-Prep") said yes
+-- BOTH are accepted independently, deliberately: the addon can be loaded a frame before
+-- its globals settle, and a stripped client can carry the object with no addon list. The
+-- button is only DRAWN when this is true, so a user without the companion sees the
+-- footer exactly as if the button had never been added — the 1.x contract, where the
+-- companion supplied its own button and simply never appeared when absent.
+function Frame.RaidPrepAvailable(hasToggle, loaded)
+    if hasToggle then return true end
+    return loaded and true or false
+end
+
+-- Live read of the same question. Every global is existence-guarded: C_AddOns is the
+-- 1.15.9-catalog surface (C_AddOns.IsAddOnLoaded), with the legacy flat global as a
+-- fallback for older clients, and neither is required.
+function Frame.RaidPrepLoaded()
+    local prep = _G.DaseekiPrep
+    local hasToggle = (type(prep) == "table" and type(prep.ToggleChecklist) == "function")
+    local isLoaded = false
+    local CA = _G.C_AddOns
+    if CA and CA.IsAddOnLoaded then isLoaded = CA.IsAddOnLoaded("Daseeki-Raid-Prep") and true or false
+    elseif _G.IsAddOnLoaded then    isLoaded = _G.IsAddOnLoaded("Daseeki-Raid-Prep") and true or false end
+    return Frame.RaidPrepAvailable(hasToggle, isLoaded)
+end
+
+-- Toggle the companion's checklist, anchored to the LEFT of this window — the side 1.x
+-- opened it on (button.lua: Prep:ShowChecklist(parent, 'LEFT')). Prefers the companion's
+-- own anchored ShowChecklist/Hide pair so the panel lands beside the bags; falls back to
+-- its anchorless ToggleChecklist when only that is published. Fully guarded: a missing
+-- companion is a silent no-op, never an error.
+function Frame.ToggleRaidPrep()
+    local prep = _G.DaseekiPrep
+    if type(prep) ~= "table" then return end
+    local list = prep.ChecklistFrame
+    if list and list.IsShown and list:IsShown() then
+        if list.Hide then list:Hide() end
+        return
+    end
+    if type(prep.ShowChecklist) == "function" and Frame.window then
+        prep:ShowChecklist(Frame.window, "LEFT")
+    elseif type(prep.ToggleChecklist) == "function" then
+        prep:ToggleChecklist()
+    end
+end
+
+-- PURE: should the checklist open ALONGSIDE the bags on this show?
+--
+-- 1.x's companion carried two of its own settings for this ("Open with bags", and a
+-- "City only" sub-option that suppressed it outside a rest area) and applied them from
+-- inside its own hook on the 1.x frame. 2.0 owns the button, so 2.0 must honour those
+-- two flags or a user who has them on silently loses the behaviour at the cutover. This
+-- is the whole decision, isolated and harness-locked; the live caller only supplies the
+-- three facts. Note the sub-option is subordinate: cityOnly with the master flag off is
+-- still off.
+function Frame.RaidPrepAutoOpen(enabled, cityOnly, resting)
+    if not enabled then return false end
+    if cityOnly and not resting then return false end
+    return true
+end
+
+-- Live counterpart. Reads the companion's OWN settings table, deliberately: those are the
+-- checkboxes the user ticked in Raid Prep's options, and duplicating them on our side
+-- would give one behaviour two switches. Every hop is type-guarded, so a companion that
+-- is absent, half-loaded, or has renamed its keys simply yields "do not auto-open".
+function Frame.MaybeOpenRaidPrepWithBags()
+    local prep = _G.DaseekiPrep
+    if type(prep) ~= "table" or type(prep.db) ~= "table" then return end
+    if type(prep.ShowChecklist) ~= "function" then return end
+    local resting = (_G.IsResting and _G.IsResting()) and true or false
+    if not Frame.RaidPrepAutoOpen(prep.db.openWithBags, prep.db.bagsCityOnly, resting) then return end
+    prep:ShowChecklist(Frame.window, "LEFT")
+end
+
+-- …and the other half of the 1.x contract: the checklist closes with the bags.
+function Frame.CloseRaidPrepWithBags()
+    local prep = _G.DaseekiPrep
+    if type(prep) ~= "table" then return end
+    local list = prep.ChecklistFrame
+    if list and list.IsShown and list:IsShown() and list.Hide then list:Hide() end
+end
 
 -- Settings accessors (guarded; the store owns the DB). These read the live
 -- DaseekiBags2DB when present, else the documented defaults — so the pure math
@@ -640,7 +770,7 @@ end
 -- Full window size (content + all 1.0 chrome bands). Returns { width, height }.
 -- The in-game arrange positions bands to these exact numbers, so a static test of
 -- this function proves the rendered window is never zero-sized. Bands (top→bottom):
---   TITLE_H · VGAP · [bag strip, dynamic rows] · VGAP · content · VGAP · MONEY_H · PAD
+--   TITLE_H · VGAP · [bag strip, dynamic rows] · VGAP · content · VGAP · FOOTER_H · PAD
 function Frame.ComputeWindowSize(owner, layout, opts)
     opts = opts or {}
     local content = Frame.ComputeContentSize(owner, layout, opts)
@@ -650,7 +780,7 @@ function Frame.ComputeWindowSize(owner, layout, opts)
             + Frame.VGAP
             + stripH          + Frame.VGAP
             + content.height  + Frame.VGAP
-            + Frame.MONEY_H
+            + Frame.FOOTER_H
             + Frame.PAD
     return { width = w, height = h }
 end
@@ -821,6 +951,58 @@ local function restoreGeometry(win)
     win:SetPoint(point, _G.UIParent, relPoint, x, y)
 end
 
+-- Retrofit ui_owner's selector into the suite's 22x22 GLYPH language.
+--
+-- ui_owner.lua owns the widget and both windows share it, so it is NOT restyled at the
+-- source. Its exposed parts are dressed here instead, guarded: the name text and seal
+-- pip are hidden and the owner glyph is laid over the face button. If ui_owner ever
+-- stops exposing _btn/_name/_pip, the guards simply leave the widget in its default
+-- form — the control keeps working either way.
+--
+-- Lives on ns.Frame (not as a file-local) because ui_bank.lua dresses its own selector
+-- with the same call: the inventory and the bank footers must not drift apart, and one
+-- shared function is the only way to guarantee that.
+function Frame.DressSelectorAsGlyph(sel, UIkit)
+    UIkit = UIkit or _G.DaseekiUI
+    if not (sel and UIkit) then return sel end
+    if sel._name and sel._name.Hide then sel._name:Hide() end
+    if sel._pip  and sel._pip.Hide  then sel._pip:Hide()  end
+    local btn = sel._btn
+    if not btn then return sel end
+    local inset = Frame.ICON_INSET
+    local og = btn:CreateTexture(nil, "ARTWORK")
+    og:SetPoint("TOPLEFT", btn, "TOPLEFT", inset, -inset)
+    og:SetPoint("BOTTOMRIGHT", btn, "BOTTOMRIGHT", -inset, inset)
+    og:SetTexture(Frame.ART .. "icon-owner")
+    btn._face = og
+    UIkit.Skin(btn, function(self)
+        self:SetBackdrop(UIkit.FLAT_BACKDROP)
+        self:SetBackdropColor(UIkit.Color("inset"))
+        self:SetBackdropBorderColor(UIkit.Color("borderLite"))
+        if self._face then self._face:SetVertexColor(UIkit.Color(self._hot and "accent" or "muted")) end
+    end)
+    btn:HookScript("OnEnter", function(self)
+        self._hot = true
+        if self._face then self._face:SetVertexColor(UIkit.Color("accent")) end
+    end)
+    btn:HookScript("OnLeave", function(self)
+        self._hot = nil
+        if self._face then self._face:SetVertexColor(UIkit.Color("muted")) end
+    end)
+    return sel
+end
+
+-- Re-evaluate the footer's conditional controls. Today that is exactly one thing: the
+-- raid-prep button is shown only while Daseeki-Raid-Prep is actually present. Called
+-- once at build and again on every Rebuild, because the companion can finish loading
+-- after our window was built (LoadOnDemand, or a mid-session /reload of just that addon)
+-- and the button must appear without the owner having to reopen anything.
+function Frame.RefreshFooter(win)
+    win = win or Frame.window
+    if not win or not win.raidPrepBtn then return end
+    win.raidPrepBtn:SetShown(Frame.RaidPrepLoaded())
+end
+
 -- Build the window chrome once. Returns the window frame.
 function Frame.Ensure()
     if Frame.window then return Frame.window end
@@ -912,13 +1094,17 @@ function Frame.Ensure()
     UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
-    -- Title-row control factory — the NEXUS DASHBOARD button, verbatim in behaviour:
+    -- Control factory — the NEXUS DASHBOARD button, verbatim in behaviour:
     -- 22x22 BackdropTemplate, FLAT_BACKDROP filled `inset` with a `borderLite` edge,
     -- and a white glyph mask inset 2px on all four sides (18x18 drawn). The glyph — not
     -- the border — carries the hover: `muted` at rest, `spec.hot` (default "accent") on
     -- enter. `_hot` is stashed on the button so the UI.Skin callback, which re-runs on
     -- every ThemeChanged, re-reads the CURRENT hover state instead of resetting a button
     -- the cursor is parked on. Pure child textures — no protected op. Returns the button.
+    --
+    -- `spec.tipAnchor` exists for the FOOTER controls: a title-row glyph drops its tooltip
+    -- downward (ANCHOR_BOTTOM, the default), but a footer glyph doing the same would open
+    -- the tip below the window edge, so those pass "ANCHOR_TOP" and the tip rises instead.
     local function makeIconButton(spec)
         local b = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
         b:SetSize(Frame.ICONBTN, Frame.ICONBTN)
@@ -943,7 +1129,7 @@ function Frame.Ensure()
             self._hot = true
             self._face:SetVertexColor(UI.Color(hot))
             if _G.GameTooltip and spec.tooltip then
-                _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+                _G.GameTooltip:SetOwner(self, spec.tipAnchor or "ANCHOR_BOTTOM")
                 _G.GameTooltip:SetText(spec.tooltip, UI.Color("text"))
                 if spec.tooltip2 then _G.GameTooltip:AddLine(spec.tooltip2, UI.Color("muted")) end
                 if spec.tooltip3 then _G.GameTooltip:AddLine(spec.tooltip3, UI.Color("muted")) end
@@ -1032,52 +1218,9 @@ function Frame.Ensure()
     sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -SPACE, 0)
     win.sortBtn = sortBtn
 
-    -- Owner selector (W3): compact flyout trigger in the icon cluster. Selecting an
-    -- alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
-    -- re-rendering this window (and the bank) read-only.
-    --
-    -- ui_owner.lua owns the selector widget (and the bank reuses it at full width with a
-    -- name label), so it is NOT restyled at the source. Instead its exposed parts are
-    -- retrofitted HERE, guarded: the name text and seal pip are hidden and a 22x22 owner
-    -- glyph is laid over the face button, so the strip reads in one icon language. If
-    -- ui_owner ever stops exposing _btn/_name/_pip, the guards simply leave the widget
-    -- in its default form — the control keeps working either way.
-    if ns.Owner and ns.Owner.CreateSelector then
-        local sel = ns.Owner.CreateSelector(titleBar, {
-            width = Frame.ICONBTN,
-            onSelect = function(key) Frame.SetViewedOwner(key) end,
-        })
-        if sel then
-            sel:ClearAllPoints()
-            sel:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
-            sel:SetSize(Frame.ICONBTN, Frame.ICONBTN)
-            if sel._name and sel._name.Hide then sel._name:Hide() end
-            if sel._pip  and sel._pip.Hide  then sel._pip:Hide()  end
-            if sel._btn then
-                local inset = Frame.ICON_INSET
-                local og = sel._btn:CreateTexture(nil, "ARTWORK")
-                og:SetPoint("TOPLEFT", sel._btn, "TOPLEFT", inset, -inset)
-                og:SetPoint("BOTTOMRIGHT", sel._btn, "BOTTOMRIGHT", -inset, inset)
-                og:SetTexture(Frame.ART .. "icon-owner")
-                sel._btn._face = og
-                UI.Skin(sel._btn, function(self)
-                    self:SetBackdrop(UI.FLAT_BACKDROP)
-                    self:SetBackdropColor(UI.Color("inset"))
-                    self:SetBackdropBorderColor(UI.Color("borderLite"))
-                    if self._face then self._face:SetVertexColor(UI.Color(self._hot and "accent" or "muted")) end
-                end)
-                sel._btn:HookScript("OnEnter", function(self)
-                    self._hot = true
-                    if self._face then self._face:SetVertexColor(UI.Color("accent")) end
-                end)
-                sel._btn:HookScript("OnLeave", function(self)
-                    self._hot = nil
-                    if self._face then self._face:SetVertexColor(UI.Color("muted")) end
-                end)
-            end
-            win.ownerSelector = sel
-        end
-    end
+    -- (The OWNER SELECTOR used to be anchored here, left of the sort glyph. The footer
+    -- round moved it to the window's bottom-left corner — see the footer block below and
+    -- Frame.FOOTER_CONTROLS for why. Nothing about the widget changed; only its anchor.)
 
     -- Collapsed inline SEARCH box (1.0: search lived behind a toggle, not a standing
     -- toolbar). Hidden until the magnifier opens it; grows leftward from the cluster.
@@ -1086,10 +1229,11 @@ function Frame.Ensure()
     -- both cover the new glyphs and — with the strip several controls wide — run into the
     -- character name. Two-point anchoring lets the box take exactly the space that is
     -- actually free, at any window width or character-name length. (ITEM 7 shrank the
-    -- strip from seven controls to five, so the box gets two glyphs' worth more room.)
+    -- strip from seven controls to five; the footer round took the owner selector out
+    -- too, so the box now runs all the way to the sort glyph.)
     local searchWrap = UI.FlatFrame(titleBar, "inset", "controlBorder")
     searchWrap:SetHeight(18)
-    searchWrap:SetPoint("RIGHT", win.ownerSelector or sortBtn, "LEFT", -SPACE, 0)
+    searchWrap:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
     searchWrap:SetPoint("LEFT", title, "RIGHT", 10, 0)
     searchWrap:Hide()
     local search = _G.CreateFrame("EditBox", nil, searchWrap)
@@ -1149,10 +1293,75 @@ function Frame.Ensure()
     win.content = content
     win._groups = {}     -- pooled ns.Items groups (index 1 = combined; 1..N = split)
 
-    -- ── Money bar (bottom-right; viewed owner, cross-account total on tooltip) ─
-    local money = _G.CreateFrame("Button", nil, win)
-    money:SetSize(160, Frame.MONEY_H)
-    money:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    -- ── FOOTER ROW ────────────────────────────────────────────────────────────
+    -- One band, three zones: controls LEFT · free/total CENTRE · money RIGHT. Everything
+    -- below anchors INSIDE this frame, which is what makes the four elements share a
+    -- baseline (see the FOOTER_H note). The band spans the full window width inset by
+    -- PAD, so "bottom-left corner" and "bottom-right corner" are the same PAD the bag
+    -- strip above uses — the footer lines up with the grid, not with the raw frame edge.
+    local footer = _G.CreateFrame("Frame", nil, win)
+    footer:SetPoint("BOTTOMLEFT",  win, "BOTTOMLEFT",   PAD, PAD)
+    footer:SetPoint("BOTTOMRIGHT", win, "BOTTOMRIGHT", -PAD, PAD)
+    footer:SetHeight(Frame.FOOTER_H)
+    -- Float the whole band above the content grid's frame-level stack, for the reason the
+    -- money bar already had to do it alone: the grid's pooled groups sit on top otherwise
+    -- and a hover/click on a footer control lands on nothing.
+    footer:SetFrameLevel((win:GetFrameLevel() or 1) + 10)
+    win.footer = footer
+
+    -- Owner selector (W3), MOVED here from the title row. Selecting an alt/remote owner
+    -- flips the SHARED viewed-owner state (Frame.SetViewedOwner), re-rendering this
+    -- window (and the bank) read-only. The widget itself is unchanged — same ui_owner
+    -- surface, same bridge guards, same column-laid flyout — it is only re-parented and
+    -- re-anchored, and told to open its menu UPWARD now that it lives at the bottom.
+    if ns.Owner and ns.Owner.CreateSelector then
+        local sel = ns.Owner.CreateSelector(footer, {
+            width = Frame.ICONBTN,
+            menuGrow = "up",
+            onSelect = function(key) Frame.SetViewedOwner(key) end,
+        })
+        if sel then
+            sel:ClearAllPoints()
+            sel:SetPoint("LEFT", footer, "LEFT", 0, 0)
+            sel:SetSize(Frame.ICONBTN, Frame.ICONBTN)
+            Frame.DressSelectorAsGlyph(sel, UI)
+            win.ownerSelector = sel
+        end
+    end
+
+    -- RAID PREP (footer round, ITEM 2): the 1.x companion button, restored — beside the
+    -- owner selector, in the suite's own glyph language instead of 1.x's raw potion item
+    -- icon. Built unconditionally but shown only while the companion is actually there
+    -- (Frame.RefreshFooter, re-evaluated on every Rebuild), so this costs a hidden 22px
+    -- button on a client that has never installed Daseeki-Raid-Prep.
+    local raidPrepBtn = makeIconButton({ icon = "icon-raidprep",
+        tooltip   = "Raid Prep",
+        tooltip2  = "Toggle the raid consumables checklist",
+        tipAnchor = "ANCHOR_TOP",   -- footer control: the tip rises, it does not drop off-window
+        onClick   = function() Frame.ToggleRaidPrep() end,
+    })
+    raidPrepBtn:SetParent(footer)
+    raidPrepBtn:ClearAllPoints()
+    if win.ownerSelector then
+        raidPrepBtn:SetPoint("LEFT", win.ownerSelector, "RIGHT", SPACE, 0)
+    else
+        -- No selector (ui_owner absent): the raid-prep glyph takes the corner itself
+        -- rather than anchoring to a frame that was never built.
+        raidPrepBtn:SetPoint("LEFT", footer, "LEFT", 0, 0)
+    end
+    raidPrepBtn:Hide()          -- RefreshFooter decides; never flashes on a client without it
+    win.raidPrepBtn = raidPrepBtn
+
+    -- ── Money bar (footer RIGHT; viewed owner, cross-account total on tooltip) ─
+    local money = _G.CreateFrame("Button", nil, footer)
+    money:SetSize(160, Frame.FOOTER_H)
+    -- MONEY OVERFLOW FIX (footer round, ITEM 3): the coin string is inset a further
+    -- MONEY_EDGE_INSET from the footer's right edge, because GetCoinTextureString draws
+    -- each coin texture 2px right of the width it measures — the trailing coin used to
+    -- paint onto (and slightly past) the window's bronze keyline. Growth is leftward and
+    -- unbounded, so this holds at every magnitude: a 3-digit, 4-digit or 5-digit gold
+    -- value all end on the same right edge.
+    money:SetPoint("RIGHT", footer, "RIGHT", -Frame.MONEY_EDGE_INSET, 0)
     -- Defensive mouse wiring: explicitly enable mouse and float the money bar ABOVE the
     -- content grid's frame-level stack so a hover always lands on it (the owner reported
     -- the gold hover doing nothing). Buttons enable mouse by default, but the reskin path
@@ -1186,12 +1395,14 @@ function Frame.Ensure()
     win.money   = money
     win.moneyFS = moneyFS
 
-    -- Free/total slot counter, bottom-CENTER (1.x SlotCount: "free/total"). Condensed
+    -- Free/total slot counter, footer CENTRE (1.x SlotCount: "free/total"). Condensed
     -- numerals, muted so the grid stays the focus (attention inversion). Filled per
-    -- viewed owner in Rebuild via the pure Frame.SlotCounts.
-    local slotCount = win:CreateFontString(nil, "OVERLAY")
+    -- viewed owner in Rebuild via the pure Frame.SlotCounts. Centred on the FOOTER's
+    -- vertical midline (it used to sit on the window's bottom padding, which put it a
+    -- few pixels below the money text it shares a row with).
+    local slotCount = footer:CreateFontString(nil, "OVERLAY")
     slotCount:SetFontObject(UI.fonts.numeral or UI.fonts.body)   -- ARIALN numerals (§3)
-    slotCount:SetPoint("BOTTOM", win, "BOTTOM", 0, PAD)
+    slotCount:SetPoint("CENTER", footer, "CENTER", 0, 0)
     slotCount:SetJustifyH("CENTER")
     UI.Skin(slotCount, function(self) self:SetTextColor(UI.Color("muted")) end)
     win.slotCount = slotCount
@@ -1199,8 +1410,16 @@ function Frame.Ensure()
     -- (The bottom-left options glyph is RETIRED. It was a second, competing settings
     -- entry point parked in the footer where it read as decoration rather than as a
     -- control; settings now live on the gear in the title row beside the ✕, matching the
-    -- Nexus dashboard. Nothing else used the corner, so the corner is simply empty.)
+    -- Nexus dashboard. The corner it vacated is now the owner selector's.)
 
+    -- RAID-PREP COMPANION PAIRING (1.x button.lua parity): the checklist opens with the
+    -- bags when the user has asked for that in Raid Prep's own options, and always closes
+    -- with them. In 1.x the companion hooked the frame itself to do this; 2.0 owns the
+    -- surface, so 2.0 drives it. Scripts, not HookScripts — the window has none of its own.
+    win:SetScript("OnShow", function() Frame.MaybeOpenRaidPrepWithBags() end)
+    win:SetScript("OnHide", function() Frame.CloseRaidPrepWithBags() end)
+
+    Frame.RefreshFooter(win)
     Frame.window = win
     Frame.ApplyScale(win)
     restoreGeometry(win)
@@ -1595,15 +1814,28 @@ function Frame.DebugToolbar()
     end
     P("[title-row] control geometry (left/right in screen px; overlaps => crowding):")
     -- Listed right-to-left, i.e. the order they are anchored from the window edge.
-    -- ITEM 7: five controls. The layout toggle and the separate Find button are retired;
-    -- layout stays on the title right-click and Find moved onto the magnifier's right-click.
+    -- ITEM 7: four controls. The layout toggle and the separate Find button are retired;
+    -- layout stays on the title right-click and Find moved onto the magnifier's
+    -- right-click. The footer round took the owner selector out of this row entirely.
     d("closeBtn", win.closeBtn)
     d("gearBtn", win.gearBtn)
     d("magBtn(search)", win.magBtn)
     d("sortBtn", win.sortBtn)
-    d("ownerSelector", win.ownerSelector)
     d("searchWrap", win.searchWrap)
+    P("[footer] left-to-right from the window's bottom-left corner:")
+    d("footer", win.footer)
+    d("ownerSelector", win.ownerSelector)
+    d("raidPrepBtn", win.raidPrepBtn)
     d("slotCount", win.slotCount)
+    d("money", win.money)
+    -- The overflow the footer round fixed is a RIGHT-EDGE question, so print both edges.
+    if win.money and win.GetRight then
+        P(string.format("  money right=%.1f window right=%.1f inset=%.1f (want >= %d before scale)",
+            win.money:GetRight() or -1, win:GetRight() or -1,
+            (win:GetRight() or 0) - (win.money:GetRight() or 0), Frame.MoneyRightInset()))
+    end
+    P("  raid-prep available=" .. tostring(Frame.RaidPrepLoaded())
+        .. " DaseekiPrep=" .. tostring(_G.DaseekiPrep ~= nil))
     P(string.format("  window scale=%.2f (default %.2f)", Frame.Scale(), Frame.DEFAULT_SCALE))
     P("  ns.Find present=" .. tostring(ns.Find ~= nil) .. " ns.Sort present=" .. tostring(ns.Sort ~= nil))
 end
@@ -1723,6 +1955,8 @@ function Frame.Rebuild()
         win.title:SetText(Frame.WindowTitle(nm))
     end
     if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
+    -- The raid-prep companion may have loaded since this window was built.
+    Frame.RefreshFooter(win)
     -- money (viewed owner) — the "Show money bar" toggle (audit §9.4) is now live: hide/show the
     -- money display region per db.showMoney. The bottom band stays (it also holds the slot
     -- counter + options glyph), so hiding money never clips those; it just drops the coin region.
@@ -2531,36 +2765,37 @@ local function testParityAnatomy(fails)
     ck(Frame.StripBandHeight(6, 4 * 28 + 3 * 4, 28, 4) == 2 * 28 + 4, "wrapped strip band = 2 rows + gap")
 
     -- Window math dropped the (removed) toolbar band: height = TITLE + VGAP + strip + VGAP
-    -- + content + VGAP + MONEY + PAD; width = band + 2*PAD.
+    -- + content + VGAP + FOOTER + PAD; width = band + 2*PAD.
     local opts = { columns = 11, buttonSize = 37, gap = 2, showKeyring = true, live = false }
     local content = Frame.ComputeContentSize(o, "combined", opts)
     local stripH  = Frame.StripBandHeight(Frame.StripCount(o, opts), content.width)
     local expH = Frame.TITLE_H + Frame.VGAP + stripH + Frame.VGAP
-               + content.height + Frame.VGAP + Frame.MONEY_H + Frame.PAD
+               + content.height + Frame.VGAP + Frame.FOOTER_H + Frame.PAD
     local sz = Frame.ComputeWindowSize(o, "combined", opts)
-    ck(sz.height == expH, "window height = title+strip+content+money bands (no toolbar), got " .. sz.height .. " exp " .. expH)
+    ck(sz.height == expH, "window height = title+strip+content+footer bands (no toolbar), got " .. sz.height .. " exp " .. expH)
     ck(sz.width == content.width + Frame.PAD * 2, "window width = band + 2*pad")
     ck(Frame.TOOLBAR_H == nil, "the modern toolbar band metric is gone (controls relocated)")
 end
 
--- ITEM 7 (display round): the consolidated header strip — FIVE controls, the layout
--- toggle and the separate Find button retired, and the magnifier made dual-purpose.
+-- ITEM 7 (display round): the consolidated header strip — the layout toggle and the
+-- separate Find button retired, and the magnifier made dual-purpose. FOOTER ROUND: the
+-- owner selector left this row too, so the strip is down to FOUR controls.
 local function testHeaderStripRoster(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local roster = Frame.TITLE_CONTROLS
     ck(type(roster) == "table", "the title-row roster is declared as data")
-    ck(#roster == 5, "five title-row controls, got " .. #roster)
+    ck(#roster == 4, "four title-row controls, got " .. #roster)
     local set = {}
     for i, name in ipairs(roster) do set[name] = i end
-    -- Right-to-left anchoring order: ✕ at the edge, then gear, search, sort, owner.
+    -- Right-to-left anchoring order: ✕ at the edge, then gear, search, sort.
     ck(set.closeBtn == 1, "close anchors at the window edge")
     ck(set.gearBtn == 2, "gear sits beside the close (Nexus top-right pair)")
     ck(set.magBtn == 3, "search is the third control in")
-    ck(set.sortBtn == 4, "sort is the fourth")
-    ck(set.ownerSelector == 5, "the owner selector is leftmost")
-    -- The two RETIRED controls must never come back silently.
+    ck(set.sortBtn == 4, "sort is the leftmost title-row control")
+    -- The RETIRED / RELOCATED controls must never come back to this row silently.
     ck(set.layoutBtn == nil, "the layout toggle button is retired (title right-click still toggles)")
     ck(set.findBtn == nil, "the separate Find button is retired (right-click the magnifier)")
+    ck(set.ownerSelector == nil, "the owner selector moved to the footer, not the title row")
 
     -- The magnifier's two scopes.
     ck(Frame.SearchClickAction("LeftButton")  == "search", "left-click = inline search")
@@ -2575,6 +2810,67 @@ local function testHeaderStripRoster(fails)
     ck(Frame.STRIP_GLOW_ALPHA > 0 and Frame.STRIP_GLOW_ALPHA < 1,
         "glow alpha is dimmer than 1.x's full-strength draw")
     ck(Frame.STRIP_GLOW_ALPHA == 0.75, "glow alpha is the agreed 0.75 constant")
+end
+
+-- FOOTER ROUND: the bottom band's roster, its height, the raid-prep soft guard, and the
+-- money strip's right inset. Everything the owner annotated on the screenshot has a pin
+-- here, so a later polish round cannot quietly undo one of the three.
+local function testFooterRoster(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- ── ITEM 1 + 2: the roster, LEFT→RIGHT from the bottom-left corner ────────────
+    local roster = Frame.FOOTER_CONTROLS
+    ck(type(roster) == "table", "the footer roster is declared as data")
+    ck(#roster == 2, "two footer controls, got " .. tostring(roster and #roster))
+    local set = {}
+    for i, name in ipairs(roster) do set[name] = i end
+    ck(set.ownerSelector == 1, "the owner selector is the bottom-left corner control")
+    ck(set.raidPrepBtn == 2, "raid prep sits immediately right of the owner selector")
+    -- The selector belongs to exactly ONE roster — it must not be double-listed while a
+    -- move is half-finished, which is how a control ends up drawn twice.
+    for _, name in ipairs(Frame.TITLE_CONTROLS) do
+        ck(set[name] == nil, "\"" .. name .. "\" is in both the title and footer rosters")
+    end
+
+    -- The footer band is exactly one control tall, so the four elements share a baseline.
+    ck(Frame.FOOTER_H == Frame.ICONBTN,
+        "footer band height (" .. Frame.FOOTER_H .. ") = one control (" .. Frame.ICONBTN .. ")")
+    ck(Frame.MONEY_H == nil, "the money-only band metric is gone (the band is a footer now)")
+
+    -- ── ITEM 2: the raid-prep soft guard ─────────────────────────────────────────
+    ck(Frame.RaidPrepAvailable(true, false) == true, "a published DaseekiPrep toggle is enough")
+    ck(Frame.RaidPrepAvailable(false, true) == true, "IsAddOnLoaded alone is enough")
+    ck(Frame.RaidPrepAvailable(true, true) == true, "both present -> available")
+    ck(Frame.RaidPrepAvailable(false, false) == false, "companion absent -> button hidden")
+    ck(Frame.RaidPrepAvailable(nil, nil) == false, "nil facts -> hidden (never a nil leak)")
+    -- Headless, nothing is loaded and there is no DaseekiPrep, so the live read must be
+    -- false rather than erroring on a missing global.
+    ck(Frame.RaidPrepLoaded() == false, "headless: no companion -> not available")
+    -- The toggle and the two window-pairing hooks are all no-ops without the companion
+    -- (none of them may ever index a nil global — that would be a Lua error on every
+    -- bag open for anyone who has not installed Raid Prep).
+    ck(pcall(Frame.ToggleRaidPrep), "ToggleRaidPrep is a safe no-op with no companion loaded")
+    ck(pcall(Frame.MaybeOpenRaidPrepWithBags), "the open-with-bags hook is a safe no-op")
+    ck(pcall(Frame.CloseRaidPrepWithBags), "the close-with-bags hook is a safe no-op")
+
+    -- 1.x's two companion-owned flags, honoured by 2.0 (button.lua maybeOpenWithBags).
+    ck(Frame.RaidPrepAutoOpen(true, false, false) == true, "open-with-bags on, no city gate -> open")
+    ck(Frame.RaidPrepAutoOpen(true, true, true) == true, "city gate satisfied while resting -> open")
+    ck(Frame.RaidPrepAutoOpen(true, true, false) == false, "city gate blocks it out in the world")
+    ck(Frame.RaidPrepAutoOpen(false, false, true) == false, "master flag off -> never opens")
+    ck(Frame.RaidPrepAutoOpen(false, true, true) == false, "the city sub-option cannot revive the master flag")
+    ck(Frame.RaidPrepAutoOpen(nil, nil, nil) == false, "no settings at all -> never opens")
+
+    -- ── ITEM 3: the money strip sits INSIDE the frame edge ───────────────────────
+    ck(Frame.MONEY_EDGE_INSET > 0, "the money strip carries a named edge allowance")
+    ck(Frame.MoneyRightInset() == Frame.PAD + Frame.MONEY_EDGE_INSET,
+        "money right inset = pad + the coin-overhang allowance")
+    ck(Frame.MoneyRightInset() > Frame.PAD,
+        "money is inset FURTHER than the window padding (that is the whole fix)")
+    -- The allowance must clear the 2px x-offset baked into GetCoinTextureString's coin
+    -- markup even after the window scale shrinks it. Worst case is the smallest scale.
+    ck(Frame.MONEY_EDGE_INSET * Frame.MIN_SCALE > 2,
+        "the allowance still clears the 2px coin overhang at the smallest window scale")
 end
 
 function Frame.RunSelfTests(verbose)
@@ -2598,6 +2894,7 @@ function Frame.RunSelfTests(verbose)
         { name = "strip slots",          fn = testStripSlots },
         { name = "strip button state",   fn = testStripButtonState },
         { name = "header strip roster",  fn = testHeaderStripRoster },
+        { name = "footer roster",        fn = testFooterRoster },
         { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
     }
     local allPass = true

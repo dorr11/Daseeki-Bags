@@ -195,6 +195,22 @@ function Owner.MenuLayout(nameWidth)
              badgeW = M.BADGE_W, ageW = M.AGE_W, ctrlW = M.CTRL_W }
 end
 
+-- PURE: which way the owner flyout opens off its face button.
+--
+-- The selector used to live in the title row, where the only sane direction is DOWN.
+-- The footer round moved it to the window's bottom-left corner, and a menu that still
+-- dropped downward from there would open BELOW the window — off the bottom of the
+-- screen for anyone whose bags sit low, which is most people. `grow = "up"` anchors the
+-- menu's BOTTOM edge to the button's TOP so it rises over the window instead.
+--
+-- Returns point, relPoint, x, y — the four arguments the frame layer feeds SetPoint.
+-- Anything other than "up" reads as the original downward drop, so an unset/garbage
+-- value can never change an existing call site's behaviour.
+function Owner.MenuAnchor(grow)
+    if grow == "up" then return "BOTTOMLEFT", "TOPLEFT", 0, 2 end
+    return "TOPLEFT", "BOTTOMLEFT", 0, -2
+end
+
 -- PURE: the menu's content height for `rowCount` rows, and whether it must scroll.
 -- Returns height, needsScroll, scrollRange.
 function Owner.MenuHeight(rowCount)
@@ -528,9 +544,11 @@ local function confirmRemoveOwner(key, name, onDone)
     _G.StaticPopup_Show(REMOVE_POPUP, name or key, nil, { key = key, onDone = onDone })
 end
 
--- Create a titlebar owner selector: a compact button showing the viewed character's
--- name (class-colored) with a caret, opening a click-away flyout of register rows.
---   opts = { onSelect = function(key) ... end, width = <n> }
+-- Create an owner selector: a compact button showing the viewed character's name
+-- (class-colored) with a caret, opening a click-away flyout of register rows.
+--   opts = { onSelect = function(key) ... end, width = <n>, menuGrow = "up"|"down" }
+-- `menuGrow` is the flyout's direction (see Owner.MenuAnchor); it defaults to the
+-- historic downward drop, so an omitted value is exactly the old behaviour.
 -- Returns a frame with :Refresh() (re-syncs the button label to the current view).
 function Owner.CreateSelector(parent, opts)
     opts = opts or {}
@@ -790,7 +808,12 @@ function Owner.CreateSelector(parent, opts)
         if not popup then buildPopup() end
         populate()
         popup:ClearAllPoints()
-        popup:SetPoint("TOPLEFT", self, "BOTTOMLEFT", 0, -2)
+        -- Direction is the CALLER's call (opts.menuGrow), because only the caller knows
+        -- where on its window the selector sits — the footer-anchored selectors open
+        -- upward, the historic title-row placement opens downward. Owner.MenuAnchor is
+        -- pure so the choice is harness-locked.
+        local p, rp, ax, ay = Owner.MenuAnchor(opts.menuGrow)
+        popup:SetPoint(p, self, rp, ax, ay)
         closer:Show()
         popup:Show()
     end)
@@ -1136,6 +1159,18 @@ local function testMenuLayout(fails)
     ck(Owner.MenuHeight(-3) == M.ROW_GAP, "a negative count is treated as empty")
     -- The clamp must admit a useful number of rows before scrolling kicks in.
     ck(Owner.MENU_MAX_H >= 10 * (M.ROW_H + M.ROW_GAP), "at least 10 rows are visible at once")
+
+    -- FOOTER ROUND: the selector moved to the window's bottom-left corner, so its flyout
+    -- has to RISE. Locked here because a silent revert to the downward drop would open
+    -- the menu below the screen edge and read in-game as "the owner menu is gone".
+    local p, rp, ax, ay = Owner.MenuAnchor("up")
+    ck(p == "BOTTOMLEFT" and rp == "TOPLEFT", "grow=up anchors the menu's bottom to the button's top")
+    ck(ax == 0 and ay == 2, "…with a 2px lift off the button")
+    local dp, drp, dx, dy = Owner.MenuAnchor("down")
+    ck(dp == "TOPLEFT" and drp == "BOTTOMLEFT" and dx == 0 and dy == -2,
+        "grow=down is the historic downward drop")
+    ck(select(1, Owner.MenuAnchor(nil)) == "TOPLEFT", "an unset direction stays the old downward drop")
+    ck(select(1, Owner.MenuAnchor("sideways")) == "TOPLEFT", "an unknown direction falls back to down")
 end
 
 local function testRemoveOwnerSafety(fails)

@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- **The bottom of the bag window is a proper footer now.** It used to be a money strip
+  with a slot count floating near it; it is now one row with three zones — controls on
+  the left, the free/total count in the middle, your gold on the right — and everything
+  in it sits on the same line. The band grew by two pixels so a button fits in it
+  properly, which is the entire change to the window's size.
+  - **The character selector moved to the bottom-left corner.** It was the odd one out in
+    the top-right cluster: sort, search, settings and close all do something *to* this
+    window, while the selector changes *whose* window you are looking at. Down in the
+    footer it sits with the other per-character readouts — that character's slot count,
+    that character's gold. It behaves exactly as before, with the same menu; the menu now
+    opens upward, since the button is at the bottom. The search box also gets the extra
+    width the selector used to occupy.
+  - **The Raid Prep button is back**, next to the character selector, where Bags 1 put it.
+    It toggles the raid consumables checklist, opens it beside the bags, and honours the
+    "open with bags" and "city only" options you set in Raid Prep itself. If you do not
+    have Daseeki Raid Prep installed you will never see the button.
+  - **Your gold no longer touches the window's right edge.** The coin icons are drawn a
+    couple of pixels wider than the game reports them to be, so the last coin was
+    overhanging the border. The whole strip is inset a little further in, and it now stays
+    inside the frame at any amount of gold.
+- **The bank window got the same footer**, corner for corner: its character selector moved
+  down to the bottom-left in the same compact form, its gold sits inside the border, and
+  the decorative backpack icon that used to occupy that corner is gone. The bank's title
+  already names the character, so the selector no longer says it twice.
+- Nothing you had configured changed, and no new settings were added.
+
 - **The bag cell is now Bags 1's bag cell, element for element.** Two earlier rounds fixed
   the glow and then the panel underneath it, and the grid still read busier than Bags 1
   side by side. The cause was never one detail — it was that a 2.0 cell simply had more
