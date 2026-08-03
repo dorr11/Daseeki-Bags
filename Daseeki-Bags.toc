@@ -4,9 +4,118 @@
 ## Category: Bags & Inventory
 ## X-License: MIT
 ## X-Curse-Project-ID: 1592410
-## SavedVariables: DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
-## OptionalDeps: Daseeki-Core
+## OptionalDeps: Daseeki-Core, Daseeki-Nexus
 ## Interface: 11507, 11508, 11509
-## Version: 1.1.4
-
-main.xml
+## Version: 2.0.0
+## SavedVariables: DaseekiBags2DB, DaseekiBags2Data, DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
+##
+## Daseeki-Bags 2.0 — the clean rewrite, now SHIPPING. This is the one and only
+## .toc: the addon folder is still Daseeki-Bags, so the client still loads this
+## file, and every 1.x install upgrades in place. The side-by-side beta tocs
+## (Daseeki-Bags2.toc, v2.toc) were retired at this cutover, and the 1.x source
+## tree (main.xml + core/ config/ frames/ skin/ libs/) was removed with them;
+## git history keeps it, and tag v1.1.5 is the last release that loaded it.
+##
+## IDENTITY IS UNCHANGED ACROSS THE CUTOVER (release-gate C.11): same folder name
+## (Daseeki-Bags), same X-Curse-Project-ID (1592410), same SavedVariables FILE
+## (WTF/.../SavedVariables/Daseeki-Bags.lua — it is named for the folder), same
+## Bindings.xml action names, same slash commands. Nothing here asks the client,
+## CurseForge, or the user's WTF folder to treat this as a different addon.
+##
+## SAVEDVARIABLES CONTRACT (ROLLOUT_CONTINUITY_AUDIT AT-RISK-1 — the cutover's
+## most destructive defect, and the reason all FIVE globals are declared here):
+## the client rewrites this addon's SavedVariables file at every logout from the
+## DECLARED names only. Any global not listed above is simply not written back —
+## so a 2.0 toc that declared only the 2.0 pair would erase the three 1.x globals
+## at the first logout, silently and for good. Migration would get exactly ONE
+## attempt and rollback would be impossible.
+##
+## 2.0 therefore DECLARES the 1.x trio while never writing it: migrate.lua,
+## migrate_settings.lua and locks.lua read it READ-ONLY. Declaring it keeps it on
+## disk as a rollback net, so a partial or failed import can re-run on a later
+## login and the owner can downgrade to 1.x with data intact.
+##
+## KEEP ALL FIVE DECLARED FOR AT LEAST 2 RELEASES AFTER CUTOVER (through 2.2.0 at
+## the earliest). Dropping a 1.x name from this line deletes that data at the very
+## next logout.
+##   DaseekiBags2DB     — 2.0 settings (schema-versioned)
+##   DaseekiBags2Data   — 2.0 inventory cache DB (owners graph; per-container identity)
+##   DaseekiBagsAccount — 1.x full per-character bag data   (read-only source)
+##   DaseekiBagsSets    — 1.x settings + custom rules       (read-only source)
+##   DaseekiBagsMesh    — 1.x cross-account summaries       (read-only source)
+##
+core.lua
+store.lua
+# locks.lua: SORT LOCKS — the per-slot "never move this" marks and the LOCK CONFIG MODE
+# the owner enters by RIGHT-CLICKING the sort glyph. 1.x carried this feature (sortButton
+# OnLocking -> item PostClick/UpdateIgnored -> sorting GetSpaces); 2.0 had lost it.
+# PURE: no WoW API at all, so the mode state machine and the 1.x lock import are fully
+# harness-driven. Loads right after store.lua because it is a SETTINGS surface — locks
+# nest inside the already-declared DaseekiBags2DB, so NO new SavedVariable is introduced
+# (identity gate satisfied). Every consumer (sort.lua, ui_items.lua, ui_frame.lua,
+# migrate_settings.lua) resolves ns.Locks at CALL time, so its position relative to
+# them is free.
+locks.lua
+# nexus.lua: the SOFT-REQUIRED Daseeki-Nexus Inventory bridge. Bags sources its SUMMARY
+# owners (the money tooltip's "Other Accounts" section and the cross-character tooltip
+# counts) from the Nexus owners graph when that module is present and populated, and
+# defers migrate.lua's DaseekiBagsMesh import to it. ZERO hard dependency: every call is
+# type-guarded and falls back to Bags' own store, so the addon is unchanged without
+# Nexus. Daseeki-Nexus is on the OptionalDeps line above for LOAD ORDER only -- so its
+# SavedVariables are attached before our ADDON_LOADED runs Store.Init -> Migrate.Migrate
+# and the deferral decision can see them. We never declare its globals here: declaring
+# another addon's SavedVariables would make both addons write the same file.
+# Loads after store.lua (it builds store-shaped owner records); every consumer resolves
+# ns.Nexus at call time, so its position relative to them is free.
+nexus.lua
+capture.lua
+migrate.lua
+# migrate_settings.lua: the 1.x SETTINGS + custom-rules pass (audit NW-1), run at
+# the same migration moment as migrate.lua's owner pass (migrate.Migrate calls it).
+# Separate file because it converts DaseekiBagsSets, a different source with a
+# different marker, and it consumes the search grammar at CALL time (not load time),
+# so its position here is free.
+migrate_settings.lua
+# --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
+borders.lua
+ui_items.lua
+# parity.lua: the CELL-PARITY GATE. A line-cited transcription of what Daseeki-Bags 1.x
+# draws in one bag cell, kept next to what 2.0 draws, with an assertion on every row. It
+# exists to stop the "the grid still reads cluttered" loop becoming a fourth round of
+# guessing: any per-cell element that drifts from the 1.x model turns the suite red and
+# names the row. Pure Lua, no frames; loads after ui_items so both models are resolvable.
+# Its 1.x line citations point at the source tree this cutover deleted: read them against
+# tag v1.1.5 (or branch main), where those files are preserved verbatim.
+parity.lua
+ui_frame.lua
+ui_owner.lua
+ui_bank.lua
+# --- W4 (search / sort / options) --- pure engines + DaseekiUI settings page ---
+search.lua
+# rules2 (W4.5): simplified custom-categories engine (a category = a saved search
+# query; reuses the search.lua matcher). Consumed by ui_frame (combined-view category
+# SECTIONS) and options.lua (the editor). MUST load — without it ns.Rules is nil, so
+# Frame.CategoriesEnabled() is false and the combined view falls back to a flat grid
+# with zero section headers (was the missing-categories beta defect). After search.lua
+# (its matcher), before options.lua (the editor consumes ns.Rules).
+rules2.lua
+sort.lua
+ui_find.lua
+options.lua
+features.lua
+#
+# Bindings.xml is deliberately NOT listed here. The client auto-discovers
+# Bindings.xml at the addon root and hands it to the KEYBINDINGS parser. Listing
+# it as a .toc file entry ALSO feeds it to the generic UI-XML parser, which does
+# not know the <Binding> element -- that is what produced the LUA_WARNINGs the
+# owner saw on every load ("Unrecognized XML: Binding", "Unrecognized XML
+# attribute: header/category"). No shipping Era addon lists Bindings.xml in its
+# .toc, and 1.x never did either. Do not re-add it.
+#
+# Corollary: because discovery is per FOLDER and by file name, this .toc cannot
+# suppress Bindings.xml either. After the cutover there is exactly ONE Daseeki
+# folder shipping it, so the "attempted to be loaded more than once" warning the
+# side-by-side beta produced is gone by construction. If it ever returns, a second
+# folder declaring our action names is installed -- an install-topology defect (a
+# stray beta junction, a leftover Daseeki-Bags2 folder), never a reason to rename
+# the actions: renaming is what orphans the owner's keys.
