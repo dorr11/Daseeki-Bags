@@ -94,6 +94,23 @@ Frame.TITLE_H     = 30   -- title row: gold title + right-cluster icon buttons +
                          --  above and below instead of sitting on the title rule)
 Frame.STRIP_ICON  = 28   -- equipped-bag icon button (1.x Bag.Size 32, tightened to suite)
 Frame.STRIP_GAP   = 4    -- 1.x bag pitch 36 = 32 + 4
+-- ── ACTIVE-BAG GLOW (display round, ITEM 5) ───────────────────────────────────────
+-- 1.x builds every bag-strip button as a CHECKBUTTON and gives it a checked texture of
+-- 'Interface/Buttons/CheckButtonHilight' with SetBlendMode('ADD'), SetAllPoints —
+-- core/classes/bag.lua:63-66 — shown by Bag:UpdateToggle -> SetChecked(owned and
+-- IsShowingBag(id)). That additive wash is the gold halo the owner wants back: the bags
+-- whose slots are currently displayed read lit, the hidden ones read dark.
+--
+-- 2.0's strip buttons are plain Buttons (the strip is also the bag MANAGER, with its own
+-- drag/drop handlers), so the same texture is drawn directly and driven from the SAME
+-- `_on` state the bronze underline already uses. It is inset -2/+2 so the halo bleeds a
+-- hair outside the button instead of stopping hard at the edge.
+--
+-- INTENSITY: 1.x draws the checked texture at full alpha. The owner asked for slightly
+-- LESS bright, so it ships at 0.75 — a CONSTANT matched to 1.x-minus-a-notch, not a
+-- setting (no new persisted SavedVariables key for a look decision).
+Frame.STRIP_GLOW_TEXTURE = "Interface\\Buttons\\CheckButtonHilight"
+Frame.STRIP_GLOW_ALPHA   = 0.75
 -- ── Title-row control strip (NEXUS DASHBOARD ICON LANGUAGE) ────────────────────────
 -- The strip is the same object as the Nexus titlebar's: a 22x22 BackdropTemplate button
 -- filled `inset` with a `borderLite` edge, holding a 64x64 white-on-transparent glyph
@@ -104,6 +121,22 @@ Frame.STRIP_GAP   = 4    -- 1.x bag pitch 36 = 32 + 4
 --
 -- icon-gear and icon-close are byte-identical copies of the Nexus assets; the rest are
 -- authored in the same stroke family by dev/gen-bags-glyphs.lua.
+-- ── TITLE-ROW CONTROL ROSTER (display round, ITEM 7) ──────────────────────────────
+-- The five controls the title row ships, RIGHT→LEFT from the window edge (so the visual
+-- left-to-right order is owner · sort · search · gear · ✕). Declared as DATA so the
+-- headless harness can gate it: a control quietly added or dropped in a later polish
+-- round then shows up as a test failure instead of as a screenshot the owner has to
+-- annotate. `layoutBtn` and `findBtn` are deliberately absent — see the build block.
+Frame.TITLE_CONTROLS = { "closeBtn", "gearBtn", "magBtn", "sortBtn", "ownerSelector" }
+
+-- PURE: what a click on the dual-purpose magnifier means (ITEM 7b).
+--   "find"   — right-click: the cross-character Find window
+--   "search" — anything else: this window's inline search box
+function Frame.SearchClickAction(button)
+    if button == "RightButton" then return "find" end
+    return "search"
+end
+
 Frame.ICONBTN     = 22   -- title-row control button (Nexus dashboard parity)
 Frame.ICON_INSET  = 2    -- glyph inset inside the button => 18x18 drawn
 Frame.ICON_SPACE  = 8    -- gap between adjacent controls, and from the window edge
@@ -889,7 +922,10 @@ function Frame.Ensure()
     local function makeIconButton(spec)
         local b = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
         b:SetSize(Frame.ICONBTN, Frame.ICONBTN)
-        b:RegisterForClicks("LeftButtonUp")
+        -- spec.clicks lets a control opt into extra mouse buttons (ITEM 7: the magnifier
+        -- takes a right-click as well). Default stays left-only, as every other glyph.
+        if spec.clicks then b:RegisterForClicks(unpack(spec.clicks))
+        else b:RegisterForClicks("LeftButtonUp") end
         local hot = spec.hot or "accent"
         local inset = Frame.ICON_INSET
         local face = b:CreateTexture(nil, "ARTWORK")
@@ -910,6 +946,7 @@ function Frame.Ensure()
                 _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
                 _G.GameTooltip:SetText(spec.tooltip, UI.Color("text"))
                 if spec.tooltip2 then _G.GameTooltip:AddLine(spec.tooltip2, UI.Color("muted")) end
+                if spec.tooltip3 then _G.GameTooltip:AddLine(spec.tooltip3, UI.Color("muted")) end
                 _G.GameTooltip:Show()
             end
         end)
@@ -924,7 +961,20 @@ function Frame.Ensure()
 
     -- Right cluster, laid RIGHT→LEFT from the window edge. Visual order matches the
     -- Nexus dashboard's top-right pair — ... gear then ✕ — with the bag controls
-    -- continuing leftward: owner · find · sort · search · layout · gear · ✕.
+    -- continuing leftward. FIVE controls, left to right:
+    --
+    --     owner · sort · search · gear · ✕
+    --
+    -- ── HEADER CONSOLIDATION (display round, ITEM 7) ─────────────────────────────
+    -- (a) The LAYOUT (combined/split) toggle button added in the last polish round is
+    --     GONE — the owner rejected it. Right-clicking the TITLE still toggles layout
+    --     (that binding predates the button and is unchanged, and the gear's tooltip
+    --     still documents it), so no behaviour was lost, only a glyph.
+    -- (b) The separate ≡ FIND button is GONE too. The magnifier is now dual-purpose:
+    --       left-click  = inline search of THIS window (unchanged behaviour)
+    --       right-click = open the cross-character Find window
+    --     Its tooltip documents both clicks; the /bags find slash command and the
+    --     keybinding are untouched entry points.
     local SPACE = Frame.ICON_SPACE
 
     -- Close: the only control that hovers `danger` (destructive affordance). No tooltip —
@@ -954,20 +1004,25 @@ function Frame.Ensure()
     gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -SPACE, 0)
     win.gearBtn = gearBtn
 
-    -- Layout toggle: combined <-> split. Right-clicking the title bar has always done
-    -- this and still does, but that was undiscoverable — this is the visible control.
-    local layoutBtn = makeIconButton({ icon = "icon-layout",
-        tooltip = "Bag layout", tooltip2 = "Switch between one combined grid and one group per bag",
-        onClick = function() Frame.SetLayout(Frame.Layout() == "split" and "combined" or "split") end,
-    })
-    layoutBtn:SetPoint("RIGHT", gearBtn, "LEFT", -SPACE, 0)
-    win.layoutBtn = layoutBtn
-
+    -- SEARCH — the dual-purpose magnifier (ITEM 7b). Left-click opens the inline search
+    -- box for THIS window; right-click opens the cross-character Find window. One glyph,
+    -- two scopes of the same verb, which is why the ≡ Find button beside it is gone.
     local magBtn = makeIconButton({ icon = "icon-search",
-        tooltip = "Search these bags", tooltip2 = "Filter the grid as you type",
-        onClick = function() Frame.ToggleSearch() end,
+        clicks = { "LeftButtonUp", "RightButtonUp" },
+        tooltip  = "Search",
+        tooltip2 = "Left-click: filter these bags as you type",
+        tooltip3 = "Right-click: find an item across all your characters",
+        onClick = function(_, button)
+            if Frame.SearchClickAction(button) == "find" then
+                if ns.Find and ns.Find.Toggle then
+                    ns.Find.Toggle(win.searchBox and win.searchBox:GetText())
+                end
+            else
+                Frame.ToggleSearch()
+            end
+        end,
     })
-    magBtn:SetPoint("RIGHT", layoutBtn, "LEFT", -SPACE, 0)
+    magBtn:SetPoint("RIGHT", gearBtn, "LEFT", -SPACE, 0)
     win.magBtn = magBtn
 
     local sortBtn = makeIconButton({ icon = "icon-sort",
@@ -976,13 +1031,6 @@ function Frame.Ensure()
     })
     sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -SPACE, 0)
     win.sortBtn = sortBtn
-
-    local findBtn = makeIconButton({ icon = "icon-find",
-        tooltip = "Find an item", tooltip2 = "Search across all your characters",
-        onClick = function() if ns.Find and ns.Find.Toggle then ns.Find.Toggle(win.searchBox and win.searchBox:GetText()) end end,
-    })
-    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
-    win.findBtn = findBtn
 
     -- Owner selector (W3): compact flyout trigger in the icon cluster. Selecting an
     -- alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
@@ -1001,7 +1049,7 @@ function Frame.Ensure()
         })
         if sel then
             sel:ClearAllPoints()
-            sel:SetPoint("RIGHT", findBtn, "LEFT", -SPACE, 0)
+            sel:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
             sel:SetSize(Frame.ICONBTN, Frame.ICONBTN)
             if sel._name and sel._name.Hide then sel._name:Hide() end
             if sel._pip  and sel._pip.Hide  then sel._pip:Hide()  end
@@ -1035,12 +1083,13 @@ function Frame.Ensure()
     -- toolbar). Hidden until the magnifier opens it; grows leftward from the cluster.
     -- Anchored between the TITLE and the control strip, not floated at a fixed width.
     -- It used to be a fixed 150px growing leftward from the magnifier, which now would
-    -- both cover the new glyphs and — with the strip six controls wide — run into the
+    -- both cover the new glyphs and — with the strip several controls wide — run into the
     -- character name. Two-point anchoring lets the box take exactly the space that is
-    -- actually free, at any window width or character-name length.
+    -- actually free, at any window width or character-name length. (ITEM 7 shrank the
+    -- strip from seven controls to five, so the box gets two glyphs' worth more room.)
     local searchWrap = UI.FlatFrame(titleBar, "inset", "controlBorder")
     searchWrap:SetHeight(18)
-    searchWrap:SetPoint("RIGHT", win.ownerSelector or findBtn, "LEFT", -SPACE, 0)
+    searchWrap:SetPoint("RIGHT", win.ownerSelector or sortBtn, "LEFT", -SPACE, 0)
     searchWrap:SetPoint("LEFT", title, "RIGHT", 10, 0)
     searchWrap:Hide()
     local search = _G.CreateFrame("EditBox", nil, searchWrap)
@@ -1350,6 +1399,18 @@ function Frame.RebuildStrip()
             icon:SetTexCoord(t, 1 - t, t, 1 - t)
             icon:Hide()
             b._icon = icon
+            -- ACTIVE-BAG GLOW (ITEM 5) — the 1.x checked-texture halo, see the constants
+            -- block at the top of this file. OVERLAY sub-level -2 puts it above the bag
+            -- icon (ARTWORK) but under the number / count / underline / "+" (OVERLAY 0),
+            -- so the additive wash lights the icon without washing out its label.
+            local glow = b:CreateTexture(nil, "OVERLAY", nil, -2)
+            glow:SetTexture(Frame.STRIP_GLOW_TEXTURE)
+            glow:SetBlendMode("ADD")
+            glow:SetPoint("TOPLEFT", b, "TOPLEFT", -2, 2)
+            glow:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 2, -2)
+            glow:SetAlpha(Frame.STRIP_GLOW_ALPHA)
+            glow:Hide()
+            b._glow = glow
             local fs = b:CreateFontString(nil, "OVERLAY")
             fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)   -- ARIALN micro-label (§3)
             fs:SetPoint("CENTER", b, "CENTER", 0, 0)
@@ -1385,6 +1446,12 @@ function Frame.RebuildStrip()
                 b._fs:SetTextColor(UI.Color(on and "text" or "faint"))
                 b._underline:SetColorTexture(UI.Color("bronze"))
                 b._underline:SetShown(on)
+                -- ITEM 5: the active-bag halo follows the exact same `on` state as the
+                -- underline (1.x's SetChecked condition: owned AND not hidden).
+                if b._glow then
+                    b._glow:SetAlpha(Frame.STRIP_GLOW_ALPHA)
+                    b._glow:SetShown(on)
+                end
                 b._plus:SetTextColor(UI.Color("bronze"))
                 b._count:SetTextColor(UI.Color("muted"))
             end
@@ -1528,12 +1595,12 @@ function Frame.DebugToolbar()
     end
     P("[title-row] control geometry (left/right in screen px; overlaps => crowding):")
     -- Listed right-to-left, i.e. the order they are anchored from the window edge.
+    -- ITEM 7: five controls. The layout toggle and the separate Find button are retired;
+    -- layout stays on the title right-click and Find moved onto the magnifier's right-click.
     d("closeBtn", win.closeBtn)
     d("gearBtn", win.gearBtn)
-    d("layoutBtn", win.layoutBtn)
     d("magBtn(search)", win.magBtn)
     d("sortBtn", win.sortBtn)
-    d("findBtn", win.findBtn)
     d("ownerSelector", win.ownerSelector)
     d("searchWrap", win.searchWrap)
     d("slotCount", win.slotCount)
@@ -2476,6 +2543,40 @@ local function testParityAnatomy(fails)
     ck(Frame.TOOLBAR_H == nil, "the modern toolbar band metric is gone (controls relocated)")
 end
 
+-- ITEM 7 (display round): the consolidated header strip — FIVE controls, the layout
+-- toggle and the separate Find button retired, and the magnifier made dual-purpose.
+local function testHeaderStripRoster(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local roster = Frame.TITLE_CONTROLS
+    ck(type(roster) == "table", "the title-row roster is declared as data")
+    ck(#roster == 5, "five title-row controls, got " .. #roster)
+    local set = {}
+    for i, name in ipairs(roster) do set[name] = i end
+    -- Right-to-left anchoring order: ✕ at the edge, then gear, search, sort, owner.
+    ck(set.closeBtn == 1, "close anchors at the window edge")
+    ck(set.gearBtn == 2, "gear sits beside the close (Nexus top-right pair)")
+    ck(set.magBtn == 3, "search is the third control in")
+    ck(set.sortBtn == 4, "sort is the fourth")
+    ck(set.ownerSelector == 5, "the owner selector is leftmost")
+    -- The two RETIRED controls must never come back silently.
+    ck(set.layoutBtn == nil, "the layout toggle button is retired (title right-click still toggles)")
+    ck(set.findBtn == nil, "the separate Find button is retired (right-click the magnifier)")
+
+    -- The magnifier's two scopes.
+    ck(Frame.SearchClickAction("LeftButton")  == "search", "left-click = inline search")
+    ck(Frame.SearchClickAction("RightButton") == "find",   "right-click = the Find window")
+    ck(Frame.SearchClickAction(nil)           == "search", "no button arg -> inline search")
+    ck(Frame.SearchClickAction("MiddleButton") == "search", "any other button -> inline search")
+
+    -- ITEM 5: the active-bag glow ships as a CONSTANT (no new SavedVariables key), at
+    -- 1.x's texture and slightly under 1.x's full-alpha intensity.
+    ck(Frame.STRIP_GLOW_TEXTURE == "Interface\\Buttons\\CheckButtonHilight",
+        "active-bag glow uses the 1.x checked-hilight texture")
+    ck(Frame.STRIP_GLOW_ALPHA > 0 and Frame.STRIP_GLOW_ALPHA < 1,
+        "glow alpha is dimmer than 1.x's full-strength draw")
+    ck(Frame.STRIP_GLOW_ALPHA == 0.75, "glow alpha is the agreed 0.75 constant")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "1.0 anatomy",         fn = testParityAnatomy },
@@ -2496,6 +2597,7 @@ function Frame.RunSelfTests(verbose)
         { name = "effective mode",       fn = testEffectiveMode },
         { name = "strip slots",          fn = testStripSlots },
         { name = "strip button state",   fn = testStripButtonState },
+        { name = "header strip roster",  fn = testHeaderStripRoster },
         { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
     }
     local allPass = true

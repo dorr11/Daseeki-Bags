@@ -84,14 +84,15 @@ Features._OwnersView = ownersView   -- exposed for the self-tests / debugging
 ----------------------------------------------------------------------
 
 -- Count `itemID` within a single owner. Full owners (per-slot containers) return
--- an exact split { carried, bank, total, exact=true }; summary owners (no
--- containers, only an aggregate itemCounts map) return { total, exact=false }.
+-- an exact split { bags, bank, equip, carried, total, exact=true } (carried =
+-- bags + equip, retained for callers that only want the on-hand rollup); summary
+-- owners (no containers, only an aggregate itemCounts map) return { total, exact=false }.
 -- Returns nil when the owner holds none of the item.
 function Features.CountItemInOwner(owner, itemID)
     if type(owner) ~= "table" or not itemID then return nil end
     local containers = owner.containers
     if type(containers) == "table" and next(containers) ~= nil then
-        local carried, bank = 0, 0
+        local bags, bank, equip = 0, 0, 0
         for cid, c in pairs(containers) do
             local isBank = Store.IsBankContainer(cid)
             local slots = c and c.slots
@@ -99,19 +100,20 @@ function Features.CountItemInOwner(owner, itemID)
                 for _, slot in pairs(slots) do
                     if slot.id == itemID then
                         local n = slot.count or 1
-                        if isBank then bank = bank + n else carried = carried + n end
+                        if isBank then bank = bank + n else bags = bags + n end
                     end
                 end
             end
         end
         if type(owner.equip) == "table" then
             for _, e in pairs(owner.equip) do
-                if e.id == itemID then carried = carried + (e.count or 1) end  -- equipped => "on hand"
+                if e.id == itemID then equip = equip + (e.count or 1) end  -- equipped => "on hand"
             end
         end
-        local total = carried + bank
+        local total = bags + bank + equip
         if total == 0 then return nil end
-        return { carried = carried, bank = bank, total = total, exact = true }
+        return { bags = bags, bank = bank, equip = equip,
+                 carried = bags + equip, total = total, exact = true }
     end
     -- summary owner: aggregate only (bank/carried unknowable)
     local agg = owner.itemCounts and owner.itemCounts[itemID]
@@ -121,9 +123,19 @@ function Features.CountItemInOwner(owner, itemID)
     return nil
 end
 
+-- PURE: 1.x's `meshRemote` partition expressed on 2.0's schema, identical to
+-- Owner.IsOtherAccount (ui_owner.lua) — a "summary" owner only ever arrived through
+-- the cross-account mesh / the Nexus bridge, and carries aggregate counts with no
+-- browsable slots. Kept local to features.lua so the pure model has no load-order
+-- dependency on ui_owner; the two definitions are asserted equal by the self-tests.
+function Features.IsOtherAccountOwner(owner)
+    return (type(owner) == "table" and owner.source == "summary") and true or false
+end
+
 -- Build ordered display lines for an itemID across `owners` (map [key]=owner,
 -- Store.data.owners shape). `viewerKey` sorts the viewer's own char first.
--- Returns an array of { key, name, class, account, carried, bank, total, exact, isSelf }.
+-- Returns an array of { key, name, class, race, sex, faction, account, source,
+--   bags, bank, equip, carried, total, exact, isSelf, isOther }.
 function Features.BuildCountLines(owners, itemID, viewerKey)
     local lines = {}
     if type(owners) ~= "table" then return lines end
@@ -132,9 +144,12 @@ function Features.BuildCountLines(owners, itemID, viewerKey)
         if c then
             lines[#lines + 1] = {
                 key = key, name = owner.name or key, class = owner.class,
-                account = owner.account or "",
+                race = owner.race, sex = owner.sex, faction = owner.faction,
+                account = owner.account or "", source = owner.source or "summary",
+                bags = c.bags, equip = c.equip,
                 carried = c.carried, bank = c.bank, total = c.total, exact = c.exact,
                 isSelf = (viewerKey ~= nil and key == viewerKey),
+                isOther = Features.IsOtherAccountOwner(owner),
             }
         end
     end
@@ -168,11 +183,81 @@ function Features.SumCountLines(lines)
 end
 
 ----------------------------------------------------------------------
+-- PURE: the 1.x TOOLTIP ANATOMY (core/features/itemTooltips.lua:117-196)
+--
+-- The flat "one line per character + an All characters footer" block the 2.0 beta
+-- shipped is replaced by the 1.x shape the owner asked for, verified line-by-line
+-- against the 1.x tree (behavior only; no code copied):
+--
+--   Total: 887                     <- 1.x :176-178, emitted ONLY when >1 holder row
+--   [icon] Poonyx    785=770|Tbags|t +15|Tbank|t    <- same-account rows, class colored,
+--   [icon] Puucons    18|Tbags|t                        with LOCATION BADGE glyphs
+--                                  <- 1.x :185, blank separator
+--   [A] Other Accounts             <- 1.x :186, account glyph + LIGHTGRAY label
+--   [icon] Zug        84           <- cross-account rows: COUNT ONLY. A summary owner
+--                                     carries an aggregate itemCounts number with no
+--                                     slot data, so a location badge would be a lie.
+--
+-- The "All characters" footer is GONE — the Total header is the same number, and 1.x
+-- never had a footer (owner's explicit instruction).
+--
+-- Row kinds: "total" | "char" | "spacer" | "section".
+----------------------------------------------------------------------
+
+local OTHER_ACCOUNTS_LABEL = "Other Accounts"
+
+-- PURE: the ordered LOCATION parts for one holder line, in 1.x's Format() argument
+-- order (equipped, bags, bank — itemTooltips.lua:155-156, minus the vault/mail slots
+-- Classic Era has no store for). Zero-count locations are dropped, exactly as 1.x's
+-- Format skips `count > 0`. A summary line (exact == false) has NO parts at all: its
+-- number is an aggregate with no provenance.
+-- Returns an array of { loc = "equip"|"bags"|"bank", count = n }.
+function Features.LocationParts(line)
+    local parts = {}
+    if type(line) ~= "table" or line.exact ~= true then return parts end
+    if (line.equip or 0) > 0 then parts[#parts + 1] = { loc = "equip", count = line.equip } end
+    if (line.bags  or 0) > 0 then parts[#parts + 1] = { loc = "bags",  count = line.bags  } end
+    if (line.bank  or 0) > 0 then parts[#parts + 1] = { loc = "bank",  count = line.bank  } end
+    return parts
+end
+
+-- PURE: partition + frame the built lines into the ordered tooltip row model above.
+-- `lines` is Features.BuildCountLines output (already sorted self-first / total desc).
+-- Returns an array of rows plus the grand total as a second value.
+function Features.BuildTooltipRows(lines)
+    local mine, other, total = {}, {}, 0
+    for _, ln in ipairs(lines or {}) do
+        total = total + (ln.total or 0)
+        if ln.isOther then other[#other + 1] = ln else mine[#mine + 1] = ln end
+    end
+
+    local rows = {}
+    -- 1.x :176 — the Total header appears only when there is more than ONE holder row.
+    -- With a single holder its number is already on that row, so 1.x suppresses it.
+    if (#mine + #other) > 1 then
+        rows[#rows + 1] = { kind = "total", total = total }
+    end
+    for _, ln in ipairs(mine) do
+        rows[#rows + 1] = { kind = "char", line = ln, badges = true }
+    end
+    if #other > 0 then
+        -- 1.x :185 — the blank separator, then the dimmed section header.
+        rows[#rows + 1] = { kind = "spacer" }
+        rows[#rows + 1] = { kind = "section", label = OTHER_ACCOUNTS_LABEL }
+        for _, ln in ipairs(other) do
+            -- badges = false: remote data is aggregate; there is no location to badge.
+            rows[#rows + 1] = { kind = "char", line = ln, badges = false }
+        end
+    end
+    return rows, total
+end
+
+----------------------------------------------------------------------
 -- Live tooltip hook (guarded)
 ----------------------------------------------------------------------
 
 local function classColor(class)
-    local c = class and _G.RAID_CLASS_COLORS and _G.RAID_CLASS_COLORS[class]
+    local c = class and ((_G.CUSTOM_CLASS_COLORS or _G.RAID_CLASS_COLORS or {})[class])
     if c then return c.r, c.g, c.b end
     return 0.925, 0.890, 0.816   -- cream fallback (#ECE3D0)
 end
@@ -182,6 +267,93 @@ local function creamRGB()
     if UI and UI.Color then return UI.Color("text") end
     return 0.925, 0.890, 0.816
 end
+
+----------------------------------------------------------------------
+-- 1.x row presentation (itemTooltips.lua:12-14, :53-55, :214-232)
+--
+-- LOCATION BADGES. 1.x prints "<count>|T<texture>:12:12:6:0|t" per location and joins
+-- them with " +", prefixed by the class-colored grand total and an "=" when there is
+-- more than one: `785|cff...=|r770|Tbags|t +15|Tbank|t`. One location renders bare.
+--   equip -> the salvage-yard glyph 1.x ships in art/ (its EQUIP_ICON)
+--   bags  -> the frame icon for the inventory window (1.x frameIcon('inventory'))
+--   bank  -> the frame icon for the bank window      (1.x frameIcon('bank'))
+-- 2.0's equivalents: the backpack button art the bag strip already uses, and the
+-- mobile-banking art shipped in this addon's own art/ folder. ADDON is the FOLDER
+-- name at runtime, so the path is correct in both the 1.x-slot and the beta install.
+----------------------------------------------------------------------
+local ART = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\"
+local BADGE_TEXTURE = {
+    equip = ART .. "garrison_building_salvageyard",
+    bags  = "Interface\\Buttons\\Button-Backpack-Up",
+    bank  = ART .. "achievement-guildperk-mobilebanking",
+}
+local BADGE_SIZE = 12
+
+-- "|cffRRGGBB" for r,g,b in 0..1 (the class hex 1.x wraps the row numbers in).
+local function hex(r, g, b)
+    return string.format("|cff%02x%02x%02x", math.floor(r * 255 + 0.5),
+        math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5))
+end
+
+-- LIGHTGRAY wrap for the "=..." badge run and the section header (1.x LIGHTGRAY_FONT_COLOR).
+local function gray(text)
+    local col = _G.LIGHTGRAY_FONT_COLOR
+    if col and col.WrapTextInColorCode then return col:WrapTextInColorCode(text) end
+    return "|cffbbbbbb" .. tostring(text) .. "|r"
+end
+
+-- The account glyph for the "Other Accounts" header — same resolution ui_owner uses for
+-- the money tooltip (retail atlas when present, Battle.net WoW icon on Era).
+local ACCOUNT_ATLAS    = "questlog-questtypeicon-account"
+local ACCOUNT_FALLBACK = "|TInterface/FriendsFrame/Battlenet-WoWicon:12:12|t"
+local accountGlyphCache
+local function accountGlyph()
+    if accountGlyphCache then return accountGlyphCache end
+    local info = _G.C_Texture and _G.C_Texture.GetAtlasInfo
+                 and _G.C_Texture.GetAtlasInfo(ACCOUNT_ATLAS)
+    if info and _G.CreateAtlasMarkup then
+        accountGlyphCache = _G.CreateAtlasMarkup(ACCOUNT_ATLAS, 0, 0, 0, 0)
+    else
+        accountGlyphCache = ACCOUNT_FALLBACK
+    end
+    return accountGlyphCache
+end
+
+-- The 12px character portrait 1.x puts at the head of every row (GetDisplayName). The
+-- race-sheet/faction-banner markup already lives in ui_owner (the money tooltip uses the
+-- identical glyph); resolved at CALL time so features.lua keeps no load-order dependency.
+local function ownerIcon(line)
+    if ns.Owner and ns.Owner.IconMarkup then
+        return ns.Owner.IconMarkup(line.race, line.sex, line.faction, 16)
+    end
+    return ""
+end
+
+-- LEFT column: "[portrait] Name". RIGHT column: the class-colored count, with the
+-- location-badge run appended when the holder is a full (per-slot) owner.
+local function rowStrings(line, withBadges)
+    local icon = ownerIcon(line)
+    local left = (icon ~= "" and (icon .. " ") or "") .. tostring(line.name or "?")
+    local h = hex(classColor(line.class))
+    local parts = withBadges and Features.LocationParts(line) or {}
+    local right
+    if #parts == 0 then
+        right = h .. tostring(line.total or 0) .. "|r"
+    else
+        local badges = {}
+        for i, p in ipairs(parts) do
+            badges[i] = string.format("%d|T%s:%d:%d:6:0|t", p.count,
+                BADGE_TEXTURE[p.loc], BADGE_SIZE, BADGE_SIZE)
+        end
+        if #badges == 1 then
+            right = h .. badges[1] .. "|r"
+        else
+            right = h .. tostring(line.total or 0) .. "|r" .. gray("=" .. table.concat(badges, " +"))
+        end
+    end
+    return left, right
+end
+Features._rowStrings = rowStrings   -- exposed for debugging
 
 -- Append the count block to a tooltip that has just been populated for an item.
 local function appendCounts(tt)
@@ -202,16 +374,27 @@ local function appendCounts(tt)
     if #lines == 0 then return end
     tt.__dbCountsShown = true
 
+    local rows = Features.BuildTooltipRows(lines)
     if tt.AddLine then tt:AddLine(" ") end
-    for _, ln in ipairs(lines) do
-        local lname, rval = Features.FormatCountLine(ln)
-        local nr, ng, nb = classColor(ln.class)
-        local vr, vg, vb = creamRGB()
-        if tt.AddDoubleLine then tt:AddDoubleLine(lname, rval, nr, ng, nb, vr, vg, vb) end
-    end
-    if #lines > 1 and tt.AddDoubleLine then
-        local vr, vg, vb = creamRGB()
-        tt:AddDoubleLine("All characters", tostring(Features.SumCountLines(lines)), vr, vg, vb, vr, vg, vb)
+    for _, row in ipairs(rows) do
+        if row.kind == "total" then
+            -- 1.x :177 — "Total: <white N>", the header the old "All characters" footer
+            -- has been replaced by.
+            if tt.AddLine then
+                tt:AddLine(string.format("%s: |cffffffff%d|r", _G.TOTAL or "Total", row.total))
+            end
+        elseif row.kind == "char" then
+            local left, right = rowStrings(row.line, row.badges)
+            local nr, ng, nb = classColor(row.line.class)
+            local vr, vg, vb = creamRGB()
+            -- The right column carries its own color escapes (class hex + the gray badge
+            -- run); the color args are the fallback for a client that strips them.
+            if tt.AddDoubleLine then tt:AddDoubleLine(left, right, nr, ng, nb, vr, vg, vb) end
+        elseif row.kind == "spacer" then
+            if tt.AddLine then tt:AddLine(" ") end
+        elseif row.kind == "section" then
+            if tt.AddLine then tt:AddLine(accountGlyph() .. " " .. gray(row.label)) end
+        end
     end
     if tt.Show then tt:Show() end   -- re-fit to the added rows
 end
@@ -424,6 +607,7 @@ local function testCountLines(fails)
     local ca = Features.CountItemInOwner(A, 100)
     ck(ca.carried == 40 and ca.bank == 12 and ca.total == 52 and ca.exact == true,
         "full owner exact split: 40 carried / 12 bank / 52 total")
+    ck(ca.bags == 40 and ca.equip == 0, "carried decomposes into bags(40) + equip(0)")
     local cb = Features.CountItemInOwner(B, 100)
     ck(cb.total == 7 and cb.exact == false and cb.bank == nil, "summary owner: aggregate only")
     ck(Features.CountItemInOwner(A, 999) == nil, "item the owner lacks -> nil")
@@ -441,6 +625,87 @@ local function testCountLines(fails)
     local E = { name = "Eq", containers = { [0] = { slots = {} } }, equip = { [1] = { id = 200, count = 1 } } }
     local ce = Features.CountItemInOwner(E, 200)
     ck(ce and ce.carried == 1 and ce.total == 1, "equipped item counts on-hand")
+    ck(ce and ce.equip == 1 and ce.bags == 0, "equipped is its own location bucket")
+end
+
+-- ITEM 1 (display round): the 1.x TOOLTIP ANATOMY — Total header, same-account rows
+-- with location badges, a dimmed Other Accounts section for summary owners (counts
+-- only), and NO "All characters" footer.
+local function testTooltipAnatomy(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function kinds(rows)
+        local out = {}
+        for i, r in ipairs(rows) do out[i] = r.kind end
+        return table.concat(out, ",")
+    end
+
+    -- Two same-account (full) holders + one cross-account (summary) holder.
+    local owners = {
+        ["Poonyx-R"] = { name = "Poonyx", class = "MAGE", source = "full", account = "acctA",
+            containers = {
+                [0]  = { slots = { [1] = { id = 100, count = 400 }, [2] = { id = 100, count = 370 } } },
+                [-1] = { slots = { [1] = { id = 100, count = 15 } } },
+            },
+            equip = {} },
+        ["Puucons-R"] = { name = "Puucons", class = "PRIEST", source = "full", account = "acctA",
+            containers = { [0] = { slots = { [1] = { id = 100, count = 18 } } } }, equip = {} },
+        ["Zug-R"] = { name = "Zug", class = "WARRIOR", source = "summary", account = "",
+            containers = {}, itemCounts = { [100] = 84 } },
+    }
+
+    local lines = Features.BuildCountLines(owners, 100, "Poonyx-R")
+    ck(#lines == 3, "three holders, got " .. #lines)
+    local rows, total = Features.BuildTooltipRows(lines)
+    ck(total == 785 + 18 + 84, "grand total sums both groups, got " .. tostring(total))
+    ck(kinds(rows) == "total,char,char,spacer,section,char",
+        "1.x anatomy order, got: " .. kinds(rows))
+    ck(rows[1].kind == "total" and rows[1].total == 887, "Total header carries the grand total")
+    ck(rows[2].line.name == "Poonyx" and rows[2].badges == true, "same-account row keeps badges")
+    ck(rows[5].label == "Other Accounts", "dimmed section header label")
+    ck(rows[6].line.name == "Zug" and rows[6].badges == false,
+        "cross-account row is counts-only (no location badges)")
+    -- No footer row of any kind survives the model.
+    for _, r in ipairs(rows) do ck(r.kind ~= "footer", "no All-characters footer row") end
+
+    -- LOCATION PARTS: 1.x order equip, bags, bank; zero buckets dropped.
+    local p = Features.LocationParts(lines[1])
+    ck(#p == 2 and p[1].loc == "bags" and p[1].count == 770
+        and p[2].loc == "bank" and p[2].count == 15, "Poonyx parts: 770 bags + 15 bank")
+    local puucons, zug
+    for _, ln in ipairs(lines) do
+        if ln.name == "Puucons" then puucons = ln elseif ln.name == "Zug" then zug = ln end
+    end
+    local single = Features.LocationParts(puucons)
+    ck(#single == 1 and single[1].loc == "bags" and single[1].count == 18, "one location -> one part")
+    -- A summary line has NO parts at all: its number has no provenance.
+    ck(zug and zug.isOther == true and zug.exact == false, "summary holder flagged isOther")
+    ck(#Features.LocationParts(zug) == 0, "summary line yields no location parts")
+    -- equip sorts FIRST (1.x Format argument order)
+    local eq = Features.LocationParts({ exact = true, equip = 1, bags = 2, bank = 3 })
+    ck(eq[1].loc == "equip" and eq[2].loc == "bags" and eq[3].loc == "bank", "equip, bags, bank order")
+
+    -- SINGLE holder: 1.x suppresses the Total header (the row already shows the number).
+    local one = Features.BuildCountLines({ ["Solo-R"] = owners["Puucons-R"] }, 100, "Solo-R")
+    local oneRows = Features.BuildTooltipRows(one)
+    ck(kinds(oneRows) == "char", "single holder -> just the row (1.x gate: >1)")
+
+    -- NO same-account holders, only cross-account: no leading spacer collapse problems.
+    local remoteOnly = Features.BuildCountLines({ ["Zug-R"] = owners["Zug-R"],
+                                                  ["Zug2-R"] = owners["Zug-R"] }, 100, nil)
+    local rr = Features.BuildTooltipRows(remoteOnly)
+    ck(kinds(rr) == "total,spacer,section,char,char", "remote-only keeps the section frame")
+
+    -- The partition predicate matches ui_owner's money-tooltip one exactly (one rule,
+    -- two surfaces — a divergence here would split the tooltip from the gold panel).
+    if ns.Owner and ns.Owner.IsOtherAccount then
+        for _, o in pairs(owners) do
+            ck(Features.IsOtherAccountOwner(o) == ns.Owner.IsOtherAccount(o),
+                "partition agrees with Owner.IsOtherAccount for " .. tostring(o.name))
+        end
+    end
+
+    ck(#Features.BuildTooltipRows({}) == 0, "no lines -> no rows")
 end
 
 local function testDisplayMatrix(fails)
@@ -550,6 +815,16 @@ local function testNexusCountSourcing(fails)
         "a Nexus owner reports its aggregate, with no carried/bank split")
     ck(Features.SumCountLines(lines) == 12, "grand total 5 (local) + 7 (Nexus)")
     ck(Store.data.owners["Remote-R"] == nil, "nothing was written into the Bags store")
+    -- ITEM 1: a bridge-sourced owner renders UNDER "Other Accounts", counts only.
+    local rows, total = Features.BuildTooltipRows(lines)
+    ck(total == 12, "bridged tooltip total is 12")
+    local sawSection, remoteRow = false, nil
+    for _, r in ipairs(rows) do
+        if r.kind == "section" then sawSection = true end
+        if r.kind == "char" and r.line.name == "Remote" then remoteRow = r end
+    end
+    ck(sawSection, "the bridge produces an Other Accounts section")
+    ck(remoteRow and remoteRow.badges == false, "the Nexus row carries no location badges")
 
     -- appendCounts must stay a safe no-op headless with the bridge active.
     ck(pcall(Features._appendCounts, {}), "appendCounts is inert on a tooltip-less table")
@@ -561,6 +836,7 @@ end
 function Features.RunSelfTests(verbose)
     local suites = {
         { name = "count lines",       fn = testCountLines },
+        { name = "tooltip anatomy",   fn = testTooltipAnatomy },
         { name = "display matrix",    fn = testDisplayMatrix },
         { name = "defaults additive", fn = testDefaultsAdditive },
         { name = "name extraction",   fn = testNameExtraction },

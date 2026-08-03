@@ -1,22 +1,28 @@
 -- Daseeki Bags 2.0 — borders.lua
 -- LAYER 1 of the two-layer item dress: QUALITY as quiet identity (Field Ledger).
 --
--- The quality edge is INFORMATION the player wants (rarity-at-a-glance) but rendered
--- as tinted ink, never neon (BRAND_SPEC §5 attention-inversion; a bag of greens must
--- read calm). Reconciliation, per the B/C design:
---   * Floor raised to RARE+ (quality >= 3). Uncommon (2) and below get NO edge — a
---     full bag of whites/greens stays quiet. (Was uncommon+ 2px full-sat: the beta's
---     "very bright" culprit.)
---   * The edge is a 1px PIXEL-SNAPPED texture outline — SetSnapToPixelGrid(true) +
---     SetTexelSnappingBias(0), NOT a BackdropTemplate edgeSize (a 1px edgeSize half-
---     samples at fractional scale -> a fuzzy grey rim; snapped textures stay crisp at
---     720p). Epic+ (quality >= 4) gets a 2px snapped edge — the rare exception the eye
---     should catch, which is attention-aligned by construction.
---   * Color is desaturated ~15% toward parchment (retain ~85% chroma) so it reads as
---     tinted ink, not an LED — while staying hue-distinguishable at 1px (blue/purple/
---     orange remain separable; see the hue-table self-test).
+-- The quality cue is INFORMATION the player wants (rarity-at-a-glance).
 --
--- SECURE / TAINT (C rule 1): the edge is a non-secure Frame child of the button with
+-- ── DISPLAY ROUND, ITEM 8 — the cue is a 1.x GLOW, not a hard outline ─────────────
+-- The beta drew a thin hard quality-colored SQUARE OUTLINE around each cell. 1.x draws
+-- a soft additive halo that washes over the icon edge, and the owner asked for that
+-- look back. The frame layer below is therefore ONE centered additive
+-- UI-ActionButton-Border texture at 1.x's 67/37 proportion and 1.x's glowAlpha (0.5) —
+-- see the GLOW GEOMETRY block for the parameter-by-parameter derivation.
+--
+-- What did NOT change: the per-quality COLORS (full saturation), the configurable
+-- min-quality floor (db.qualityBorderMin, default Uncommon+), the on/off toggle
+-- (db.qualityBorders), and the precedence chain quest gold > unusable red > rarity.
+-- The quest-bang and marker art in ui_items are untouched — this file only ever drew
+-- the rarity cue.
+--
+-- Historical note (the outline era, kept because its reasoning still governs the
+-- SHARED snapped-outline factory at the bottom of this file, which the item grid's
+-- per-cell WELL border still uses): a 1px edgeSize on a BackdropTemplate half-samples
+-- at fractional scale into a fuzzy grey rim, so snapped WHITE8X8 textures with
+-- SetSnapToPixelGrid(true) + SetTexelSnappingBias(0) are what stay crisp at 720p.
+--
+-- SECURE / TAINT (C rule 1): the glow is a non-secure Frame child of the button with
 -- texture children only. Attach() (structure) runs at button CREATION (out of combat,
 -- gated by ui_items' combat-deferred layout) — the dress is BAKED at creation, never
 -- restyled-in-combat structurally. Apply() (recolor / show / hide / resize the edge
@@ -24,9 +30,10 @@
 -- protected op (SetParent/SetPoint/Show/Hide/SetID/SetAttribute/SetSize/SetFrameLevel)
 -- is ever called on the secure button itself at runtime.
 --
--- Split into a PURE decision layer (ShouldShow / QualityRGB / TierPx / Desaturate /
--- Enabled — headless-testable) and a thin FRAME layer (Attach / Apply / SetAlpha —
--- in-game only, guarded on _G.CreateFrame). Fresh code — no lines copied from 1.x.
+-- Split into a PURE decision layer (ShouldShow / QualityRGB / GlowSize / TierPx /
+-- Desaturate / Enabled — headless-testable) and a thin FRAME layer (Attach / Apply /
+-- SetAlpha — in-game only, guarded on _G.CreateFrame). Fresh code — no lines copied
+-- from 1.x; the glow PARAMETERS are behavior facts read off the 1.x tree.
 --
 -- Toggle: Store.db.qualityBorders (defaults ON when unset).
 
@@ -124,8 +131,47 @@ function Borders.ShouldShow(quality, enabled, minQuality)
     return quality >= (minQuality or DEFAULT_MIN_QUALITY)
 end
 
+----------------------------------------------------------------------
+-- 1.x GLOW GEOMETRY (display round, ITEM 8)
+--
+-- 2.0 drew the quality cue as a thin HARD square outline. 1.x draws a soft colored
+-- GLOW that washes over the icon edge, and that is the look the owner wants back.
+-- The 1.x mechanism, read off core/classes/item.lua (behavior facts, no code copied):
+--
+--   b.IconGlow = b:CreateTexture(nil, 'OVERLAY', nil, -1)   -- :54
+--   b.IconGlow:SetTexture('Interface/Buttons/UI-ActionButton-Border')  -- :55
+--   b.IconGlow:SetBlendMode('ADD')                          -- :56
+--   b.IconGlow:SetPoint('CENTER')                           -- :57 (centered, NOT allpoints)
+--   b.IconGlow:SetSize(67, 67)                              -- :58 on a 37px ItemButton
+--   ...
+--   self.IconGlow:SetVertexColor(r, g, b, Addon.sets.glowAlpha)   -- :208
+--
+-- and glowAlpha DEFAULTS TO 0.5 (core/api/settings.lua:34). So: an additive
+-- UI-ActionButton-Border halo, drawn at ~1.81x the cell, tinted per-quality at half
+-- alpha. The 67/37 ratio is what makes it bleed past the icon instead of rimming it.
+--
+-- 2.0 ships the same three parameters as CONSTANTS (a look decision, not a setting —
+-- no new SavedVariables key). The per-quality COLORS and the min-quality floor are
+-- unchanged: the precedence chain is still quest gold > unusable red > rarity, and
+-- Borders.MinQuality() still gates which rarities glow at all.
+----------------------------------------------------------------------
+Borders.GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"
+Borders.GLOW_SCALE   = 67 / 37   -- 1.x: a 67px halo on its 37px ItemButton
+Borders.GLOW_ALPHA   = 0.5       -- 1.x sets.glowAlpha default
+
+-- PURE: the halo's side length for a cell of `buttonSize`, so the wash bleeds past the
+-- icon by the same proportion 1.x does at any cell size the density slider produces.
+function Borders.GlowSize(buttonSize)
+    local s = tonumber(buttonSize) or 0
+    if s <= 0 then return 0 end
+    return s * Borders.GLOW_SCALE
+end
+
 -- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, uncommon/rare = 1. Only
--- meaningful when ShouldShow is true. (The frame layer multiplies by one physical pixel.)
+-- meaningful when ShouldShow is true. RETAINED as a pure tier descriptor (and used by
+-- the shared snapped-outline factory below), but it no longer drives the QUALITY cue:
+-- since ITEM 8 that is a uniform-intensity glow, exactly as 1.x, which applies one
+-- glowAlpha to every rarity and lets the COLOR carry the distinction.
 function Borders.TierPx(quality)
     if quality == nil then return 0 end
     if quality >= EPIC_QUALITY then return 2 end
@@ -205,66 +251,46 @@ local function ensureSnapDriver()
     end)
 end
 
--- Position the four edge textures as a 1px/2px snapped outline of thickness b._pxTier.
-local function layoutEdges(b)
-    if not b._edges then return end
-    local unit = onePixel(b) * (b._pxTier or 1)
-    local e = b._edges
-    e.top:ClearAllPoints()
-    e.top:SetPoint("TOPLEFT", b, "TOPLEFT", 0, 0)
-    e.top:SetPoint("TOPRIGHT", b, "TOPRIGHT", 0, 0)
-    e.top:SetHeight(unit)
-    e.bottom:ClearAllPoints()
-    e.bottom:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, 0)
-    e.bottom:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 0)
-    e.bottom:SetHeight(unit)
-    e.left:ClearAllPoints()
-    e.left:SetPoint("TOPLEFT", b, "TOPLEFT", 0, -unit)
-    e.left:SetPoint("BOTTOMLEFT", b, "BOTTOMLEFT", 0, unit)
-    e.left:SetWidth(unit)
-    e.right:ClearAllPoints()
-    e.right:SetPoint("TOPRIGHT", b, "TOPRIGHT", 0, -unit)
-    e.right:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, unit)
-    e.right:SetWidth(unit)
+-- Size the halo to the button it belongs to, at 1.x's 67/37 proportion. The cell size
+-- follows the density slider, so this is read from the button rather than hardcoded.
+local function layoutGlow(b)
+    local glow = b._glow
+    if not glow then return end
+    local host = b._host
+    local w = (host and host.GetWidth and host:GetWidth()) or 0
+    local side = Borders.GlowSize(w)
+    if side <= 0 then return end
+    glow:SetSize(side, side)
 end
 
-local function forEachEdge(b, fn)
-    if not b._edges then return end
-    fn(b._edges.top); fn(b._edges.bottom); fn(b._edges.left); fn(b._edges.right)
-end
-
--- Attach the quality-edge structure to a button ONCE, at creation. Idempotent: returns
--- the existing edge container on repeat calls. The container is a non-secure Frame child
--- holding four snapped WHITE8X8 edge textures (created here, never re-created at runtime).
+-- Attach the quality-GLOW structure to a button ONCE, at creation. Idempotent: returns
+-- the existing container on repeat calls. The container is a non-secure Frame child
+-- holding ONE additive halo texture (created here, never re-created at runtime).
 function Borders.Attach(button)
     if not button then return nil end
     if button._dsBagsBorder then return button._dsBagsBorder end
     if not _G.CreateFrame then return nil end
     local b = _G.CreateFrame("Frame", nil, button)
-    -- Frame a hair OUTSIDE the icon so the edge rims the slot without clipping the art.
-    b:SetPoint("TOPLEFT", button, "TOPLEFT", -1, 1)
-    b:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 1, -1)
+    -- The container spans the button; the halo is CENTERED in it and deliberately larger
+    -- than the cell (1.x's 67-on-37), so the wash bleeds over the icon edge on all sides.
+    b:SetPoint("TOPLEFT", button, "TOPLEFT", 0, 0)
+    b:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 0, 0)
     if b.SetFrameLevel then b:SetFrameLevel((button:GetFrameLevel() or 1) + 1) end
+    b._host = button
 
-    local function newEdge()
-        local t = b:CreateTexture(nil, "OVERLAY")
-        t:SetTexture(WHITE)
-        if t.SetSnapToPixelGrid then t:SetSnapToPixelGrid(true) end   -- crisp 1px at 720p
-        if t.SetTexelSnappingBias then t:SetTexelSnappingBias(0) end
-        t:Hide()
-        return t
-    end
-    b._edges = { top = newEdge(), bottom = newEdge(), left = newEdge(), right = newEdge() }
-    b._pxTier = 1
-    b._dsRelayout = function(self)
-        -- Only re-lay a currently-shown edge (thickness follows scale); hidden edges are
-        -- re-laid on their next Apply. Cheap and self-limiting.
-        if self:IsShown() then layoutEdges(self) end
-    end
-    -- Re-lay on show so the physical thickness is computed at the realized effective
-    -- scale (paint runs before the button's first Show; effective scale is only reliable
-    -- once shown). Own-frame OnShow — never touches the secure button.
-    b:SetScript("OnShow", function(self) layoutEdges(self) end)
+    local glow = b:CreateTexture(nil, "OVERLAY", nil, -1)   -- 1.x item.lua:54 layer
+    glow:SetTexture(Borders.GLOW_TEXTURE)
+    glow:SetBlendMode("ADD")
+    glow:SetPoint("CENTER", b, "CENTER", 0, 0)
+    glow:Hide()
+    b._glow = glow
+    layoutGlow(b)
+
+    b._dsRelayout = function(self) layoutGlow(self) end
+    -- Re-size on show: the cell size is only reliable once the button has been laid out,
+    -- and the density slider can change it under a pooled button. Own-frame OnShow —
+    -- never touches the secure button.
+    b:SetScript("OnShow", function(self) layoutGlow(self) end)
 
     b:Hide()
     button._dsBagsBorder = b
@@ -273,73 +299,61 @@ function Borders.Attach(button)
     return b
 end
 
--- Color (or hide) a button's edge. Precedence is 1.x's UpdateBorder chain, top down:
+-- Paint the halo one color and show it. Alpha is 1.x's uniform glowAlpha for every
+-- branch — quest, unusable and rarity all glow at the same strength, and the COLOR is
+-- what distinguishes them (1.x item.lua:208 passes one sets.glowAlpha for all four).
+local function showGlow(b, r, g, bl)
+    local glow = b._glow
+    if not glow then return end
+    layoutGlow(b)
+    if glow.SetVertexColor then glow:SetVertexColor(r, g, bl, Borders.GLOW_ALPHA) end
+    glow:Show()
+    -- Idempotent re-show: a prior search-dim may have parked the container at 0.25
+    -- alpha (Borders.SetAlpha). Reset to full here so Apply is self-contained and a
+    -- re-shown glow never inherits a stale dim, regardless of paint call order. The
+    -- dim cascade re-applies afterward from _applyDress if the slot is still dimmed.
+    if b.SetAlpha then b:SetAlpha(1) end
+    b:Show()
+end
+
+-- Color (or hide) a button's quality glow. Precedence is 1.x's UpdateBorder chain, top down:
 --   quest (gold)  >  unusable (red)  >  quality (rarity)
--- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the border half of
+-- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the glow half of
 -- 1.x's quest treatment, the bang glyph being reserved for quest STARTERS (ui_items draws
--- that). `unusable` (1.x glowUnusable) draws a RED border. Otherwise a FULL-SATURATION
--- quality edge is drawn when the quality clears the configurable floor. Honors the store
--- toggle live. Recolor/resize/show/hide of the edge textures only — safe on every repaint,
+-- that). `unusable` (1.x glowUnusable) draws a RED glow. Otherwise a FULL-SATURATION
+-- rarity glow is drawn when the quality clears the configurable floor. Honors the store
+-- toggle live. Recolor/resize/show/hide of one texture only — safe on every repaint,
 -- even in combat.
 function Borders.Apply(button, quality, unusable, quest)
     local b = Borders.Attach(button)
     if not b then return end
     local enabled = Borders.Enabled()
 
-    -- QUEST gold border — 1.x's FIRST branch, so it wins over both unusable and rarity.
+    -- QUEST gold — 1.x's FIRST branch, so it wins over both unusable and rarity.
     if enabled and quest then
-        local qr, qg, qb = Borders.QuestRGB()
-        b._pxTier = 2
-        layoutEdges(b)
-        forEachEdge(b, function(t)
-            if t.SetVertexColor then t:SetVertexColor(qr, qg, qb, 1) end
-            t:Show()
-        end)
-        if b.SetAlpha then b:SetAlpha(1) end
-        b:Show()
-        return
+        return showGlow(b, Borders.QuestRGB())
     end
 
-    -- UNUSABLE red border — the "can't use" cue, overriding rarity on that cell. A prominent
-    -- 2px so it reads at a glance. Gated by the same Item-borders toggle as the quality edge.
+    -- UNUSABLE red — the "can't use" cue, overriding rarity on that cell. Gated by the
+    -- same Item-borders toggle as the rarity glow.
     if enabled and unusable then
-        local ur, ug, ub = Borders.UnusableRGB()
-        b._pxTier = 2
-        layoutEdges(b)
-        forEachEdge(b, function(t)
-            if t.SetVertexColor then t:SetVertexColor(ur, ug, ub, 1) end
-            t:Show()
-        end)
-        if b.SetAlpha then b:SetAlpha(1) end
-        b:Show()
-        return
+        return showGlow(b, Borders.UnusableRGB())
     end
 
     if not Borders.ShouldShow(quality, enabled, Borders.MinQuality()) then
         b:Hide()
         return
     end
-    -- FULL SATURATION (1.x glowQuality / CII): true rarity color, no parchment pull —
-    -- the desaturated edges read grey on the near-black ground.
+    -- FULL SATURATION (1.x glowQuality): true rarity color, no parchment pull — the
+    -- desaturated tints read grey on the near-black ground.
     local r, g, bl = Borders.QualityRGB(quality, liveProvider)
     if not r then b:Hide(); return end
-    b._pxTier = Borders.TierPx(quality)
-    layoutEdges(b)
-    forEachEdge(b, function(t)
-        if t.SetVertexColor then t:SetVertexColor(r, g, bl, 1) end
-        t:Show()
-    end)
-    -- Idempotent re-show: a prior search-dim may have parked the container at 0.25
-    -- alpha (Borders.SetAlpha). Reset to full here so Apply is self-contained and a
-    -- re-shown edge never inherits a stale dim, regardless of paint call order. The
-    -- dim cascade re-applies afterward from _applyDress if the slot is still dimmed.
-    if b.SetAlpha then b:SetAlpha(1) end
-    b:Show()
+    showGlow(b, r, g, bl)
 end
 
--- Dim-cascade support (search-dim): scale the whole edge's alpha so a dimmed slot's
--- quality rim recedes with its icon instead of floating at full strength. A hidden edge
--- stays hidden (SetAlpha on a hidden frame is inert); this never force-shows an edge.
+-- Dim-cascade support (search-dim): scale the whole container's alpha so a dimmed slot's
+-- quality glow recedes with its icon instead of floating at full strength. A hidden glow
+-- stays hidden (SetAlpha on a hidden frame is inert); this never force-shows one.
 function Borders.SetAlpha(button, alpha)
     local b = button and button._dsBagsBorder
     if b and b.SetAlpha then b:SetAlpha(alpha or 1) end
@@ -590,9 +604,35 @@ local function testMinQualityConfig(fails)
     ck(r and r > g and r > b, "unusable red is red-dominant")
 end
 
+-- ITEM 8 (display round): the 1.x GLOW parameters. These three constants are the whole
+-- contract a sibling window (the Armory character panel) needs to reproduce the identical
+-- treatment, so they are gated here rather than left as loose literals in the frame layer.
+local function testGlowGeometry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Borders.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border",
+        "1.x glow texture (item.lua:55)")
+    ck(math.abs(Borders.GLOW_SCALE - 67 / 37) < 1e-9, "1.x glow proportion 67px halo on a 37px cell")
+    ck(Borders.GLOW_ALPHA == 0.5, "1.x sets.glowAlpha default (settings.lua:34)")
+    -- The halo is strictly LARGER than the cell — that overhang is what makes it read as
+    -- a wash over the icon edge rather than as a rim around it.
+    ck(Borders.GLOW_SCALE > 1, "the halo overhangs the cell")
+    ck(Borders.GlowSize(37) == 37 * (67 / 37), "37px cell -> the 1.x 67px halo")
+    ck(math.abs(Borders.GlowSize(37) - 67) < 1e-9, "…which is literally 67")
+    -- Scales with the density slider's cell size, so the look holds at any cell.
+    ck(Borders.GlowSize(48) > Borders.GlowSize(37), "a bigger cell gets a bigger halo")
+    ck(Borders.GlowSize(0) == 0, "degenerate cell -> no halo")
+    ck(Borders.GlowSize(-5) == 0, "negative cell -> no halo")
+    ck(Borders.GlowSize(nil) == 0, "nil cell -> no halo")
+    -- UNIFORM intensity across the precedence chain: 1.x applies ONE glowAlpha to quest
+    -- gold, unusable red and every rarity, and lets the COLOR carry the distinction.
+    -- (The per-tier thickness below is retained for the shared outline factory only.)
+    ck(Borders.TierPx(2) ~= Borders.TierPx(4), "TierPx still describes the rarity tiers")
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
+        { name = "glow geometry (1.x)",  fn = testGlowGeometry },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "min-quality + unusable", fn = testMinQualityConfig },

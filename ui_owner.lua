@@ -139,6 +139,74 @@ function Owner.BuildOwnerList(owners, selfKey, selfAccount, now, favorites)
 end
 
 ----------------------------------------------------------------------
+-- PURE: the SELECTOR MENU LAYOUT  (display round, ITEM 6)
+--
+-- The beta drew the flyout rows by chaining anchors off each other — badge anchored to
+-- the name's RIGHT, freshness anchored to the delete button's LEFT, and the NAME itself
+-- with no width at all. With a long character name (or a long "Updated 12d ago") the
+-- chain simply ran the columns THROUGH each other: name, FULL/SUMMARY tag, age, the
+-- remove ✕ and the star all drew on top of one another.
+--
+-- The fix is real COLUMNS: fixed x-offsets and fixed widths, computed once per populate
+-- from the widest name actually in the list, with the menu widening to fit. The name
+-- column is clamped so one absurd name cannot push the age column off the menu; a name
+-- past the clamp ellipsizes (SetWordWrap(false) on a width-constrained fontstring).
+--
+--   [8][pip 6][6][ NAME (class color, clamped) ][8][ TAG ][8][ AGE ][8][✕][2][★][8]
+--
+-- Metadata (tag + age) drops to the small/micro font in muted ink so a ~30-row menu
+-- reads as one scannable column of NAMES with quiet annotations, not five competing
+-- text runs. Rows past MENU_MAX_H scroll (the frame layer parents them to a ScrollFrame).
+----------------------------------------------------------------------
+
+Owner.MENU = {
+    PAD_L    = 8,    -- left inset to the seal pip
+    PIP      = 6,
+    PIP_GAP  = 6,
+    NAME_MIN = 90,   -- the name column never collapses below this
+    NAME_MAX = 190,  -- …nor grows past it (a long name ellipsizes instead)
+    COL_GAP  = 8,
+    BADGE_W  = 58,   -- fits "SUMMARY" at the micro-label size
+    AGE_W    = 104,  -- fits "Updated 12d ago" at the small size
+    CTRL_W   = 16,   -- the ✕ and the ★
+    CTRL_GAP = 2,
+    PAD_R    = 8,
+    ROW_H    = 22,
+    ROW_GAP  = 2,
+}
+Owner.MENU_MAX_H = 420   -- ~17 rows before the list starts scrolling
+
+-- PURE: the column geometry for a menu whose widest name measures `nameWidth` px.
+-- Returns { nameW, x = { pip, name, badge, age }, width } — every x is an offset from
+-- the row's LEFT edge, and `width` is the menu width those columns require.
+function Owner.MenuLayout(nameWidth)
+    local M = Owner.MENU
+    local nameW = tonumber(nameWidth) or 0
+    if nameW < M.NAME_MIN then nameW = M.NAME_MIN end
+    if nameW > M.NAME_MAX then nameW = M.NAME_MAX end
+    local x = {}
+    x.pip   = M.PAD_L
+    x.name  = x.pip + M.PIP + M.PIP_GAP
+    x.badge = x.name + nameW + M.COL_GAP
+    x.age   = x.badge + M.BADGE_W + M.COL_GAP
+    local width = x.age + M.AGE_W + M.COL_GAP
+                + M.CTRL_W + M.CTRL_GAP + M.CTRL_W + M.PAD_R
+    return { nameW = nameW, x = x, width = width,
+             badgeW = M.BADGE_W, ageW = M.AGE_W, ctrlW = M.CTRL_W }
+end
+
+-- PURE: the menu's content height for `rowCount` rows, and whether it must scroll.
+-- Returns height, needsScroll, scrollRange.
+function Owner.MenuHeight(rowCount)
+    local M = Owner.MENU
+    local n = rowCount or 0
+    if n < 0 then n = 0 end
+    local content = n * (M.ROW_H + M.ROW_GAP) + M.ROW_GAP
+    if content <= Owner.MENU_MAX_H then return content, false, 0 end
+    return Owner.MENU_MAX_H, true, content - Owner.MENU_MAX_H
+end
+
+----------------------------------------------------------------------
 -- PURE: the MONEY TOOLTIP model  (1.x core/classes/playerMoney.lua parity)
 --
 -- 1.x anatomy, verified line-by-line against playerMoney.lua:88-151:
@@ -524,6 +592,25 @@ function Owner.CreateSelector(parent, opts)
         if UI.PaintLedgerGround then UI.PaintLedgerGround(popup) end
         popup._rows = {}
 
+        -- ITEM 6: a ~30-owner menu is taller than most screens, so the rows live in a
+        -- ScrollFrame (which also clips them to the panel, so no row can draw over the
+        -- backdrop edge). The scroll range is set per populate from Owner.MenuHeight.
+        local scroll = _G.CreateFrame("ScrollFrame", nil, popup)
+        scroll:SetPoint("TOPLEFT", popup, "TOPLEFT", 2, -2)
+        scroll:SetPoint("BOTTOMRIGHT", popup, "BOTTOMRIGHT", -2, 2)
+        local content = _G.CreateFrame("Frame", nil, scroll)
+        content:SetSize(1, 1)
+        scroll:SetScrollChild(content)
+        scroll:EnableMouseWheel(true)
+        scroll:SetScript("OnMouseWheel", function(self, delta)
+            local range = self._range or 0
+            if range <= 0 then return end
+            local v = (self:GetVerticalScroll() or 0) - delta * (Owner.MENU.ROW_H + Owner.MENU.ROW_GAP)
+            if v < 0 then v = 0 elseif v > range then v = range end
+            self:SetVerticalScroll(v)
+        end)
+        popup._scroll, popup._content = scroll, content
+
         closer = _G.CreateFrame("Button", nil, _G.UIParent)
         closer:SetFrameStrata("FULLSCREEN_DIALOG")
         closer:SetAllPoints(_G.UIParent)
@@ -532,32 +619,52 @@ function Owner.CreateSelector(parent, opts)
         popup:SetScript("OnHide", function() closer:Hide() end)
     end
 
-    -- Pool one register row.
+    -- Pool one register row. Every column is anchored to the row's LEFT at a fixed
+    -- offset with a fixed width (ITEM 6) — the old anchor CHAIN is what let the columns
+    -- pile onto each other. Offsets/widths come from Owner.MenuLayout at populate time.
     local function acquireRow(i)
         local row = popup._rows[i]
         if row then return row end
-        row = _G.CreateFrame("Button", nil, popup)
-        row:SetHeight(24)
+        row = _G.CreateFrame("Button", nil, popup._content)
+        row:SetHeight(Owner.MENU.ROW_H)
         local rh = row:CreateTexture(nil, "BACKGROUND")
         rh:SetAllPoints(); rh:Hide()
         UI.Skin(rh, function(self) self:SetColorTexture(UI.Color("brand", 0.20)) end)
         row._hl = rh
+        -- A quieter standing wash marks the row currently being VIEWED, so "(viewing)"
+        -- no longer has to eat the name column to say so.
+        local cur = row:CreateTexture(nil, "BACKGROUND")
+        cur:SetAllPoints(); cur:Hide()
+        UI.Skin(cur, function(self) self:SetColorTexture(UI.Color("brand", 0.10)) end)
+        row._cur = cur
+
         row._pip = row:CreateTexture(nil, "OVERLAY")
-        row._pip:SetSize(6, 6)
-        row._pip:SetPoint("LEFT", row, "LEFT", 8, 0)
+        row._pip:SetSize(Owner.MENU.PIP, Owner.MENU.PIP)
+
+        -- NAME — class-colored, width-clamped, ellipsizing. The one loud thing in a row.
         row._name = row:CreateFontString(nil, "OVERLAY")
         row._name:SetFontObject(UI.fonts.body)
-        row._name:SetPoint("LEFT", row._pip, "RIGHT", 6, 0)
+        row._name:SetJustifyH("LEFT")
+        row._name:SetWordWrap(false)
+
+        -- TAG (FULL / SUMMARY) and AGE — metadata, so both drop to the micro-label face
+        -- in muted ink. They are annotations on the name, not competing headlines.
         row._badge = row:CreateFontString(nil, "OVERLAY")
         row._badge:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
-        row._badge:SetPoint("LEFT", row._name, "RIGHT", 6, 0)
+        row._badge:SetJustifyH("LEFT")
+        row._badge:SetWordWrap(false)
+
+        row._fresh = row:CreateFontString(nil, "OVERLAY")
+        row._fresh:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+        row._fresh:SetJustifyH("RIGHT")
+        row._fresh:SetWordWrap(false)
 
         -- Favorite STAR (far right): ★ lit when favorite, ☆ idle otherwise. Toggles the
         -- favorite and re-populates so the row re-sorts to the top. Non-self only (self is
         -- always first); hidden on the self row.
         row._star = _G.CreateFrame("Button", nil, row)
-        row._star:SetSize(16, 16)
-        row._star:SetPoint("RIGHT", row, "RIGHT", -6, 0)
+        row._star:SetSize(Owner.MENU.CTRL_W, Owner.MENU.CTRL_W)
+        row._star:SetPoint("RIGHT", row, "RIGHT", -Owner.MENU.PAD_R, 0)
         row._starFS = row._star:CreateFontString(nil, "OVERLAY")
         row._starFS:SetFontObject(UI.fonts.body)
         row._starFS:SetPoint("CENTER", row._star, "CENTER", 0, 0)
@@ -565,8 +672,8 @@ function Owner.CreateSelector(parent, opts)
         -- DELETE ✕ (left of the star), non-self only. Opens a plain confirm before removing the
         -- cached owner (never the live self — guarded downstream). Danger-tinted on hover.
         row._del = _G.CreateFrame("Button", nil, row)
-        row._del:SetSize(16, 16)
-        row._del:SetPoint("RIGHT", row._star, "LEFT", -2, 0)
+        row._del:SetSize(Owner.MENU.CTRL_W, Owner.MENU.CTRL_W)
+        row._del:SetPoint("RIGHT", row._star, "LEFT", -Owner.MENU.CTRL_GAP, 0)
         row._delFS = row._del:CreateFontString(nil, "OVERLAY")
         row._delFS:SetFontObject(UI.fonts.body)
         row._delFS:SetPoint("CENTER", row._del, "CENTER", 0, 0)
@@ -574,33 +681,70 @@ function Owner.CreateSelector(parent, opts)
         row._del:SetScript("OnEnter", function() if row._delFS then row._delFS:SetTextColor(UI.Color("danger")) end end)
         row._del:SetScript("OnLeave", function() if row._delFS then row._delFS:SetTextColor(UI.Color("muted")) end end)
 
-        row._fresh = row:CreateFontString(nil, "OVERLAY")
-        row._fresh:SetFontObject(UI.fonts.small)
-        row._fresh:SetPoint("RIGHT", row._del, "LEFT", -6, 0)
         row:SetScript("OnEnter", function(self) self._hl:Show() end)
         row:SetScript("OnLeave", function(self) self._hl:Hide() end)
         popup._rows[i] = row
         return row
     end
 
+    -- Lay a row's columns out for the computed geometry (ITEM 6).
+    local function placeRow(row, L)
+        local M = Owner.MENU
+        row._pip:ClearAllPoints()
+        row._pip:SetPoint("LEFT", row, "LEFT", L.x.pip, 0)
+        row._name:ClearAllPoints()
+        row._name:SetPoint("LEFT", row, "LEFT", L.x.name, 0)
+        row._name:SetWidth(L.nameW)
+        row._badge:ClearAllPoints()
+        row._badge:SetPoint("LEFT", row, "LEFT", L.x.badge, 0)
+        row._badge:SetWidth(L.badgeW)
+        row._fresh:ClearAllPoints()
+        row._fresh:SetPoint("LEFT", row, "LEFT", L.x.age, 0)
+        row._fresh:SetWidth(L.ageW)
+        row._star:ClearAllPoints()
+        row._star:SetPoint("RIGHT", row, "RIGHT", -M.PAD_R, 0)
+        row._del:ClearAllPoints()
+        row._del:SetPoint("RIGHT", row._star, "LEFT", -M.CTRL_GAP, 0)
+    end
+
     local function populate()
         local list = Owner.LiveList()
-        local rowW = math.max(220, width + 90)
-        local y = 4
-        local shown = 0
         local curKey = viewedKey()
+        local M = Owner.MENU
+
+        -- PASS 1 — fill the text and MEASURE the widest name, so the menu widens to fit
+        -- its content instead of guessing a width and letting the columns collide.
+        local widest = 0
         for i, d in ipairs(list) do
             local row = acquireRow(i)
-            row:SetWidth(rowW - 6)
-            row:ClearAllPoints()
-            row:SetPoint("TOPLEFT", popup, "TOPLEFT", 3, -y)
-            row._pip:SetColorTexture(UI.Color(d.isSelf and "brand" or "idle"))
-            row._name:SetText(d.name .. (d.key == curKey and "  (viewing)" or ""))
+            row._name:SetWidth(0)                 -- unconstrained while measuring
+            row._name:SetText(d.name or d.key)
             row._name:SetTextColor(classRGB(d.class))
             row._badge:SetText(Owner.SourceBadge(d.source):upper())
             row._badge:SetTextColor(UI.Color(d.source == "full" and "bronze" or "faint"))
             row._fresh:SetText(Owner.FreshnessLabel(d.ageSeconds, d.isSelf))
             row._fresh:SetTextColor(UI.Color(d.isSelf and "ok" or "muted"))
+            local w = (row._name.GetStringWidth and row._name:GetStringWidth()) or 0
+            if w > widest then widest = w end
+        end
+
+        local L = Owner.MenuLayout(widest + 2)          -- +2 so the clamp isn't hit by a hair
+        local rowW = math.max(L.width, width + 40)      -- never narrower than the face button
+
+        -- PASS 2 — place the columns and stack the rows.
+        local y = M.ROW_GAP
+        local shown = 0
+        for i, d in ipairs(list) do
+            local row = popup._rows[i]
+            placeRow(row, L)
+            row:SetWidth(rowW - 4)
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", popup._content, "TOPLEFT", 0, -y)
+            -- Seal pip: brand = the row you are VIEWING, ok = your live self when it is
+            -- not the viewed row, idle = every other cached owner.
+            local tone = (d.key == curKey) and "brand" or (d.isSelf and "ok" or "idle")
+            row._pip:SetColorTexture(UI.Color(tone))
+            row._cur:SetShown(d.key == curKey)
             row:SetScript("OnClick", function()
                 popup:Hide()
                 if opts.onSelect then opts.onSelect(d.key) end
@@ -629,11 +773,16 @@ function Owner.CreateSelector(parent, opts)
             end
 
             row:Show()
-            y = y + 26
+            y = y + M.ROW_H + M.ROW_GAP
             shown = i
         end
         for i = shown + 1, #popup._rows do popup._rows[i]:Hide() end
-        popup:SetSize(rowW, math.max(1, y) + 2)
+
+        local panelH, _, range = Owner.MenuHeight(#list)
+        popup._content:SetSize(rowW - 4, math.max(1, y))
+        popup._scroll._range = range
+        popup._scroll:SetVerticalScroll(0)
+        popup:SetSize(rowW, panelH + 4)
     end
 
     btn:SetScript("OnClick", function(self)
@@ -943,6 +1092,52 @@ local function testOwnerListOrdering(fails)
 end
 
 -- RemoveOwner safety (audit 5.5): the live self is NEVER removable; a cached alt is.
+-- ITEM 6 (display round): the selector menu's COLUMN geometry. The defect was every
+-- column drawing on top of the others; the regression lock is that the columns never
+-- overlap at ANY name width, and that the menu widens to fit its content.
+local function testMenuLayout(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local M = Owner.MENU
+
+    -- No two columns overlap, at any measured name width (including absurd ones).
+    for _, w in ipairs({ 0, 10, M.NAME_MIN, 120, M.NAME_MAX, 400, 4000 }) do
+        local L = Owner.MenuLayout(w)
+        ck(L.x.pip + M.PIP <= L.x.name, "w=" .. w .. ": pip clears the name column")
+        ck(L.x.name + L.nameW <= L.x.badge, "w=" .. w .. ": name clears the tag column")
+        ck(L.x.badge + L.badgeW <= L.x.age, "w=" .. w .. ": tag clears the age column")
+        ck(L.x.age + L.ageW + M.COL_GAP + 2 * M.CTRL_W + M.CTRL_GAP + M.PAD_R <= L.width,
+            "w=" .. w .. ": age clears the ✕/★ controls inside the menu width")
+    end
+
+    -- The name column CLAMPS both ways: it never collapses, and one absurd name cannot
+    -- push the age column off the menu (it ellipsizes instead).
+    ck(Owner.MenuLayout(0).nameW == M.NAME_MIN, "empty name -> the minimum column")
+    ck(Owner.MenuLayout(nil).nameW == M.NAME_MIN, "nil name width -> the minimum column")
+    ck(Owner.MenuLayout(4000).nameW == M.NAME_MAX, "an absurd name clamps to the maximum")
+    ck(Owner.MenuLayout(M.NAME_MIN + 20).nameW == M.NAME_MIN + 20, "in-band widths pass through")
+
+    -- The MENU WIDENS to fit content (the owner's "widen the menu" ask), monotonically.
+    ck(Owner.MenuLayout(M.NAME_MAX).width > Owner.MenuLayout(M.NAME_MIN).width,
+        "a longer name widens the menu")
+    ck(Owner.MenuLayout(4000).width == Owner.MenuLayout(M.NAME_MAX).width,
+        "…but only up to the clamp")
+
+    -- ~30 rows must stay scannable: they scroll rather than running off the screen.
+    local h30, scroll30, range30 = Owner.MenuHeight(30)
+    ck(h30 == Owner.MENU_MAX_H, "a 30-row menu clamps to the max panel height")
+    ck(scroll30 == true, "…and scrolls")
+    ck(range30 == 30 * (M.ROW_H + M.ROW_GAP) + M.ROW_GAP - Owner.MENU_MAX_H,
+        "scroll range is the overshoot")
+    local h5, scroll5, range5 = Owner.MenuHeight(5)
+    ck(h5 == 5 * (M.ROW_H + M.ROW_GAP) + M.ROW_GAP, "a short menu sizes to its rows")
+    ck(scroll5 == false and range5 == 0, "a short menu does not scroll")
+    local h0 = Owner.MenuHeight(0)
+    ck(h0 == M.ROW_GAP, "an empty menu collapses to its padding")
+    ck(Owner.MenuHeight(-3) == M.ROW_GAP, "a negative count is treated as empty")
+    -- The clamp must admit a useful number of rows before scrolling kicks in.
+    ck(Owner.MENU_MAX_H >= 10 * (M.ROW_H + M.ROW_GAP), "at least 10 rows are visible at once")
+end
+
 local function testRemoveOwnerSafety(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     -- pure guard
@@ -1314,6 +1509,7 @@ function Owner.RunSelfTests(verbose)
         { name = "freshness + badge",   fn = testFreshnessAndBadge },
         { name = "has bank data",       fn = testHasBankData },
         { name = "owner-list ordering", fn = testOwnerListOrdering },
+        { name = "menu column layout",  fn = testMenuLayout },
         { name = "remove-owner safety", fn = testRemoveOwnerSafety },
         { name = "favorites sort",      fn = testFavoritesSort },
         { name = "money: partition",    fn = testMoneyPartition },
