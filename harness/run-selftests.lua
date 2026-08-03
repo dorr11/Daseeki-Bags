@@ -119,6 +119,24 @@ local BINDINGS_FILE = "Bindings.xml"
 -- differ); a .toc that exists MUST NOT list Bindings.xml.
 local TOC_CANDIDATES = { "Daseeki-Bags2.toc", "v2.toc", "Daseeki-Bags.toc" }
 
+-- Release-gate C.9 ("no Bindings.xml action name is changed or removed"): the exact
+-- roster this addon must declare. FIVE names are legitimate as of the cutover work:
+-- the three 2.0 actions, plus the two LEGACY 1.x action names re-declared so a key the
+-- owner bound under 1.x keeps working after the 1.x folder is uninstalled
+-- (ROLLOUT_CONTINUITY_AUDIT AT-RISK-4). Both legacy bodies call the 2.0 handlers.
+-- A missing name here is a hard FAIL: that is a user losing a keybinding.
+local EXPECTED_BINDINGS = {
+    "DASEEKIBAGS2_TOGGLE", "DASEEKIBAGS2_BANK_TOGGLE", "DASEEKIBAGS2_FIND",
+    "DASEEKIBAGS_TOGGLE", "DASEEKIBAGS_BANK_TOGGLE",
+}
+-- The subset that exists purely for cutover continuity, and is therefore EXPECTED to
+-- also be declared by the installed 1.x folder for as long as both are installed.
+local LEGACY_BINDINGS = { DASEEKIBAGS_TOGGLE = true, DASEEKIBAGS_BANK_TOGGLE = true }
+-- Our own installed folder names. WoW loads the .toc whose name matches the FOLDER, so
+-- the repo ships one .toc per install identity: the 1.x/cutover folder and the
+-- side-by-side beta folder. Anything else declaring our names is a third party.
+local OUR_FOLDERS = { ["Daseeki-Bags"] = true, ["Daseeki-Bags2"] = true }
+
 local function readFile(path)
     local fh = io.open(path, "r")
     if not fh then return nil end
@@ -166,6 +184,35 @@ else
     else
         realprint(string.format("  [ok] %d binding name(s), all unique: %s",
             #ourBindingOrder, table.concat(ourBindingOrder, ", ")))
+    end
+
+    -- Roster check (release-gate C.9). Missing = FAIL (a bound key would be orphaned);
+    -- extra = note only, so adding an action does not block the build.
+    local missing = {}
+    local expectedSet = {}
+    for _, name in ipairs(EXPECTED_BINDINGS) do
+        expectedSet[name] = true
+        if not OUR_BINDINGS[name] then missing[#missing + 1] = name end
+    end
+    for _, name in ipairs(missing) do
+        bindFails = bindFails + 1
+        realprint("  [FAIL] action name \"" .. name .. "\" is no longer declared in " ..
+                  BINDINGS_FILE)
+        if LEGACY_BINDINGS[name] then
+            realprint("         It is a LEGACY 1.x name kept for cutover continuity: dropping it")
+            realprint("         orphans every key the owner bound before 2.0. Keep it for at")
+            realprint("         least 2 releases after cutover (audit AT-RISK-4).")
+        end
+    end
+    for _, name in ipairs(ourBindingOrder) do
+        if not expectedSet[name] then
+            realprint("  [note] new action \"" .. name .. "\" is not in EXPECTED_BINDINGS")
+            realprint("         (not a failure; add it to the roster so a later loss is caught)")
+        end
+    end
+    if #missing == 0 then
+        realprint(string.format("  [ok] all %d expected action name(s) present (%d legacy-continuity)",
+            #EXPECTED_BINDINGS, 2))
     end
 end
 
@@ -219,35 +266,81 @@ do
             ph:close()
         end
     end
-    local hits = {}
+    -- Per-NAME folder map, because the two kinds of overlap are no longer the same
+    -- thing. Since the cutover work, this file deliberately re-declares the two LEGACY
+    -- 1.x action names so a key bound under 1.x survives the cutover (AT-RISK-4). While
+    -- 1.x is still installed, those two names ARE declared by two folders -- both ours.
+    -- That overlap is expected, self-resolving (it ends when 1.x is uninstalled), and
+    -- must not read as the install-topology defect the probe was written to catch.
+    local hits = {}                 -- ordered { folder=, names={} }
+    local foldersByName = {}        -- name -> { folder, ... }
     for _, folder in ipairs(siblings) do
         local src = readFile(addonsDir .. "/" .. folder .. "/" .. BINDINGS_FILE)
         if src then
             local shared = {}
             for name in src:gmatch('<Binding%s[^>]-name%s*=%s*"([^"]+)"') do
-                if OUR_BINDINGS[name] then shared[#shared + 1] = name end
+                if OUR_BINDINGS[name] then
+                    shared[#shared + 1] = name
+                    local list = foldersByName[name] or {}
+                    list[#list + 1] = folder
+                    foldersByName[name] = list
+                end
             end
             if #shared > 0 then
                 hits[#hits + 1] = { folder = folder, names = shared }
             end
         end
     end
-    if #hits > 1 then
+
+    -- Classify every name declared by more than one folder.
+    local expected, genuine = {}, {}
+    for name, folders in pairs(foldersByName) do
+        if #folders > 1 then
+            local allOurs = true
+            for _, f in ipairs(folders) do
+                if not OUR_FOLDERS[f] then allOurs = false end
+            end
+            local entry = { name = name, folders = folders }
+            if LEGACY_BINDINGS[name] and allOurs then
+                expected[#expected + 1] = entry
+            else
+                genuine[#genuine + 1] = entry
+            end
+        end
+    end
+
+    if #genuine > 0 then
         realprint("  [WARN] LIVE BINDING-NAME COLLISION in " .. addonsDir)
-        for _, h in ipairs(hits) do
-            realprint("         " .. h.folder .. "/" .. BINDINGS_FILE ..
-                      "  ->  " .. table.concat(h.names, ", "))
+        for _, e in ipairs(genuine) do
+            realprint("         " .. e.name .. "  <-  " .. table.concat(e.folders, ", "))
         end
         realprint("         The client registers the first folder's names, then warns")
         realprint('         "Binding <NAME> was attempted to be loaded more than once"')
         realprint("         naming the SECOND folder as Source. Only one installed folder")
         realprint("         may ship these names -- this is install topology, not repo content.")
-    elseif #hits == 1 then
-        realprint("  [ok] live install: " .. hits[1].folder .. " is the only folder declaring our names")
-    elseif addonsDir then
-        realprint("  [ok] live install scanned, no folder declares our names (addon not installed)")
-    else
-        realprint("  [skip] no Era install visible (set DASEEKI_ERA_ADDONS to enable the probe)")
+        realprint("         (A duplicated checkout junctioned in as a second addon folder is")
+        realprint("         the usual cause; a genuinely third-party addon claiming our")
+        realprint("         names would need one of us renamed.)")
+    end
+    if #expected > 0 then
+        realprint("  [ok] expected legacy-continuity overlap (not a defect):")
+        for _, e in ipairs(expected) do
+            realprint("         " .. e.name .. "  <-  " .. table.concat(e.folders, ", "))
+        end
+        realprint("         2.0 re-declares the 1.x action names on purpose so keys bound")
+        realprint("         under 1.x keep working after cutover. The client logs its")
+        realprint("         load-more-than-once line for these two while BOTH folders are")
+        realprint("         installed, and stops once 1.x is removed. Do not 'fix' it by")
+        realprint("         renaming: that is what orphans the owner's keys.")
+    end
+    if #genuine == 0 and #expected == 0 then
+        if #hits == 1 then
+            realprint("  [ok] live install: " .. hits[1].folder .. " is the only folder declaring our names")
+        elseif addonsDir then
+            realprint("  [ok] live install scanned, no folder declares our names (addon not installed)")
+        else
+            realprint("  [skip] no Era install visible (set DASEEKI_ERA_ADDONS to enable the probe)")
+        end
     end
 end
 
@@ -256,6 +349,104 @@ if bindFails > 0 then
     os.exit(1)
 end
 realprint("=== bindings gate: PASS ===")
+realprint("")
+
+----------------------------------------------------------------------
+-- 0c) TOC IDENTITY GATE  (added 2026-08-02 with the cutover continuity work)
+--
+-- Two release-gate properties that live in the .toc, where no self-test can see them:
+--
+--  1. SAVEDVARIABLES (gate A.1; audit AT-RISK-1). The client rewrites this addon's SV
+--     file at every logout from the DECLARED names only, so a global dropped from that
+--     line is deleted at the next logout, silently. Both 2.0 tocs must declare all FIVE
+--     globals: the 2.0 pair plus the three 1.x globals kept as the cutover rollback net
+--     (2.0 reads them read-only and never writes them). This gate is the regression
+--     guard for the single most destructive defect in the rollout audit.
+--
+--  2. VERSION (gate C.12; audit NW-8, which found the shipped toc reading 1.1.4 while
+--     the released tag was v1.1.5). The 2.0 tocs must agree with each other and with
+--     core.lua's ns.VERSION.
+----------------------------------------------------------------------
+local REQUIRED_SV_2X = {
+    "DaseekiBags2DB", "DaseekiBags2Data",
+    "DaseekiBagsAccount", "DaseekiBagsSets", "DaseekiBagsMesh",
+}
+local TOCS_2X = { "Daseeki-Bags2.toc", "v2.toc" }
+
+local function tocDirective(src, key)
+    for line in src:gmatch("[^\r\n]+") do
+        local v = line:match("^%s*##%s*" .. key .. "%s*:%s*(.-)%s*$")
+        if v then return v end
+    end
+    return nil
+end
+
+realprint("=== toc identity gate :: SavedVariables declaration + ## Version ===")
+local idFails = 0
+
+for _, toc in ipairs(TOCS_2X) do
+    local src = readFile(P(toc))
+    if not src then
+        realprint("  [skip] " .. toc .. " absent on this branch")
+    else
+        local decl = tocDirective(src, "SavedVariables") or ""
+        local declared = {}
+        for name in decl:gmatch("[^,%s]+") do declared[name] = true end
+        local missingSV = {}
+        for _, name in ipairs(REQUIRED_SV_2X) do
+            if not declared[name] then missingSV[#missingSV + 1] = name end
+        end
+        if #missingSV > 0 then
+            idFails = idFails + 1
+            realprint("  [FAIL] " .. toc .. " does not declare: " .. table.concat(missingSV, ", "))
+            realprint("         An undeclared global is NOT written back at logout -- it is")
+            realprint("         erased. The three 1.x globals must stay declared for at least")
+            realprint("         2 releases after cutover (rollback net + migration retry).")
+        else
+            realprint("  [ok] " .. toc .. " declares all " .. #REQUIRED_SV_2X .. " globals")
+        end
+    end
+end
+
+do
+    local versions, order = {}, {}
+    for _, toc in ipairs(TOCS_2X) do
+        local src = readFile(P(toc))
+        if src then
+            local v = tocDirective(src, "Version")
+            versions[toc] = v
+            order[#order + 1] = toc
+            if not v then
+                idFails = idFails + 1
+                realprint("  [FAIL] " .. toc .. " has no ## Version line")
+            end
+        end
+    end
+    local coreSrc = readFile(P("core.lua"))
+    local coreVersion = coreSrc and coreSrc:match('ns%.VERSION%s*=%s*"([^"]+)"')
+    if not coreVersion then
+        idFails = idFails + 1
+        realprint("  [FAIL] cannot read ns.VERSION from core.lua")
+    else
+        for _, toc in ipairs(order) do
+            if versions[toc] and versions[toc] ~= coreVersion then
+                idFails = idFails + 1
+                realprint(string.format("  [FAIL] %s ## Version %s does not match core.lua ns.VERSION %s",
+                    toc, versions[toc], coreVersion))
+            end
+        end
+        if idFails == 0 then
+            realprint("  [ok] ## Version " .. coreVersion .. " consistent across the 2.0 tocs and core.lua")
+            realprint("       (release-gate C.12 also requires this to match the tag at release time)")
+        end
+    end
+end
+
+if idFails > 0 then
+    realprint(string.format("=== toc identity gate: FAIL (%d problem(s)) ===", idFails))
+    os.exit(1)
+end
+realprint("=== toc identity gate: PASS ===")
 realprint("")
 
 ----------------------------------------------------------------------
@@ -353,6 +544,7 @@ end
 -- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
 -- attach borders at paint), then ui_frame last (it consumes ns.Items).
 local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua",
+                    "migrate_settings.lua",
                     "borders.lua", "ui_items.lua", "ui_frame.lua",
                     "ui_owner.lua", "ui_bank.lua",
                     "search.lua", "rules2.lua", "sort.lua", "ui_find.lua", "options.lua", "features.lua" }
@@ -429,7 +621,7 @@ end
 -- which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
-    "borders", "capture", "core", "features", "migrate", "options",
+    "borders", "capture", "core", "features", "migrate", "migrate_settings", "options",
     "rules2", "search", "sort", "store",
     "ui_bank", "ui_find", "ui_frame", "ui_items", "ui_owner",
 }

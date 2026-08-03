@@ -7,23 +7,44 @@
 ## OptionalDeps: Daseeki-Core
 ## Interface: 11507, 11508, 11509
 ## Version: 2.0.0
-## SavedVariables: DaseekiBags2DB, DaseekiBags2Data
+## SavedVariables: DaseekiBags2DB, DaseekiBags2Data, DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
 ##
 ## Daseeki-Bags 2.0 — clean rewrite. This v2.toc documents the intended 2.0
 ## load order for the fresh flat tree; it is NOT wired into the live addon yet
 ## (the shipping Daseeki-Bags.toc still loads the 1.x tree). Cutover in a later
 ## wave replaces Daseeki-Bags.toc with this file and deletes the 1.x sources.
 ##
-## New SavedVariables (additive; coexist with the 1.x globals
-## DaseekiBagsAccount / DaseekiBagsSets / DaseekiBagsMesh, which 2.0 reads
-## READ-ONLY once at first load via migrate.lua and never writes):
-##   DaseekiBags2DB   — settings (schema-versioned)
-##   DaseekiBags2Data — inventory cache DB (owners graph; per-container identity)
+## SAVEDVARIABLES CONTRACT (ROLLOUT_CONTINUITY_AUDIT AT-RISK-1 — the cutover's
+## most destructive defect, and the reason all FIVE globals are declared here):
+## the client rewrites this addon's SavedVariables file at every logout from the
+## DECLARED names only. Any global not listed above is simply not written back —
+## so the moment a 2.0 toc that declares only the 2.0 pair replaces the 1.x toc,
+## the three 1.x globals are erased at the first logout, silently and for good.
+## Migration would get exactly ONE attempt and rollback would be impossible.
+##
+## 2.0 therefore DECLARES the 1.x trio while never writing it: migrate.lua and
+## migrate_settings.lua read it READ-ONLY. Declaring it keeps it on disk as a
+## rollback net, so a partial or failed import can re-run on a later login and
+## the owner can downgrade to 1.x with data intact.
+##
+## KEEP ALL FIVE DECLARED FOR AT LEAST 2 RELEASES AFTER CUTOVER. Dropping a 1.x
+## name from this line deletes that data at the very next logout.
+##   DaseekiBags2DB     — 2.0 settings (schema-versioned)
+##   DaseekiBags2Data   — 2.0 inventory cache DB (owners graph; per-container identity)
+##   DaseekiBagsAccount — 1.x full per-character bag data   (read-only source)
+##   DaseekiBagsSets    — 1.x settings + custom rules       (read-only source)
+##   DaseekiBagsMesh    — 1.x cross-account summaries       (read-only source)
 ##
 core.lua
 store.lua
 capture.lua
 migrate.lua
+# migrate_settings.lua: the 1.x SETTINGS + custom-rules pass (audit NW-1), run at
+# the same migration moment as migrate.lua's owner pass (migrate.Migrate calls it).
+# Separate file because it converts DaseekiBagsSets, a different source with a
+# different marker, and it consumes the search grammar at CALL time (not load time),
+# so its position here is free.
+migrate_settings.lua
 # --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
 borders.lua
 ui_items.lua

@@ -22,6 +22,20 @@
 --
 -- Idempotency: a marker (data.migratedFrom1x) guards the whole pass so a later
 -- user edit in 2.0 (e.g. deleting an owner) is never re-clobbered by a re-run.
+--
+-- MARKER DISCIPLINE (ROLLOUT_CONTINUITY_AUDIT AT-RISK-1c; house pattern taken from
+-- Daseeki-Conduit's migrate.lua, where an absent source returns BEFORE the marker is
+-- written). The marker is set ONLY when the pass actually converted at least one
+-- owner. A run against an absent or empty 1.x source leaves it UNSET, so the import
+-- still happens when the source turns up later — the addon installed before the WTF
+-- file was copied over, a second machine, 1.x re-enabled after being disabled for a
+-- session. A marker written on an empty run is a permanently sticky "already done"
+-- that can never be cleared from the UI, which is exactly the defect the audit found
+-- in the Nexus Bags-import and Inventory-module one-shots.
+--
+-- SELF-HEAL: a DB that already carries a sticky marker from the pre-fix build (or any
+-- other route to marker-set-but-nothing-imported) is repaired at startup — see
+-- Migrate.SelfHeal, which re-runs the import forcibly and says so loudly.
 
 local ADDON, ns = ...
 
@@ -227,7 +241,101 @@ function Migrate.Run(data, oldAccount, oldMesh, opts)
         end
     end
 
+    -- Marker discipline (AT-RISK-1c): set ONLY on a non-empty result. Zero owners
+    -- means there was nothing to read (no source, empty source, or a source shaped
+    -- so unexpectedly that nothing converted) — leaving the marker unset keeps the
+    -- door open for the real source to arrive on a later login.
+    if counts.owners == 0 then
+        counts.markerSet = false
+        return counts
+    end
+
     data.migratedFrom1x = true
+    counts.markerSet = true
+    return counts
+end
+
+----------------------------------------------------------------------
+-- Source census: how many 1.x character records the source globals actually hold.
+-- READ-ONLY. Used by the self-heal to tell "nothing to import" (a legitimately
+-- empty source; leave everything alone) apart from "something to import but the
+-- marker says we already did" (the sticky-marker anomaly).
+----------------------------------------------------------------------
+
+function Migrate.CountSourceChars(oldAccount, oldMesh)
+    local n = 0
+    for _, src in ipairs({ oldAccount, oldMesh }) do
+        if type(src) == "table" then
+            for _, chars in pairs(src) do
+                if type(chars) == "table" then
+                    for _, rec in pairs(chars) do
+                        if type(rec) == "table" then n = n + 1 end
+                    end
+                end
+            end
+        end
+    end
+    return n
+end
+
+----------------------------------------------------------------------
+-- Startup self-heal (ROLLOUT_CONTINUITY_AUDIT AT-RISK-1c).
+--
+-- The anomaly: the marker says the 1.x import is done, the store holds ZERO owners,
+-- and the 1.x source is sitting right there with real characters in it. That is a
+-- migration that never happened but can never retry — the user's alts, banks and
+-- cross-account gold are simply missing, with nothing on screen to explain it.
+--
+-- Detect it and force the import through, loudly (a silent repair of missing data is
+-- indistinguishable from the bug for anyone comparing the window against 1.x).
+--
+-- Bounded: each attempt is counted, and after MAX_SELFHEAL_ATTEMPTS the pass stops
+-- trying, so a pathological source can never turn into a chat-spam loop on every
+-- login. A successful heal converts owners, which makes the trigger condition false
+-- forever after anyway.
+--
+--   data       : the 2.0 cache DB
+--   oldAccount / oldMesh : the 1.x globals (never written)
+--   opts       : { selfAccount=<id>, quiet=<bool> }
+-- Returns the forced-run counts, or nil when nothing needed healing.
+----------------------------------------------------------------------
+
+Migrate.MAX_SELFHEAL_ATTEMPTS = 3
+
+function Migrate.SelfHeal(data, oldAccount, oldMesh, opts)
+    opts = opts or {}
+    if type(data) ~= "table" then return nil end
+    if not data.migratedFrom1x then return nil end          -- normal path owns this
+    if type(data.owners) == "table" and next(data.owners) ~= nil then return nil end
+
+    local available = Migrate.CountSourceChars(oldAccount, oldMesh)
+    if available == 0 then return nil end   -- nothing to import; marker is honest
+
+    local attempts = tonumber(data.selfHealAttempts) or 0
+    if attempts >= Migrate.MAX_SELFHEAL_ATTEMPTS then return nil end
+    data.selfHealAttempts = attempts + 1
+
+    if not opts.quiet and ns and ns.Print then
+        ns:Print(("1.x import repair: the saved data holds %d character record(s) but " ..
+                  "none were imported, while the one-time import was already marked done. " ..
+                  "Re-importing now."):format(available))
+    end
+
+    local counts = Migrate.Run(data, oldAccount, oldMesh,
+                               { selfAccount = opts.selfAccount or data.selfAccount or "",
+                                 force = true })
+    counts.selfHealed = true
+    counts.sourceChars = available
+
+    if not opts.quiet and ns and ns.Print then
+        if counts.owners > 0 then
+            ns:Print(("1.x import repair complete: %d character(s) restored (%d with full bag " ..
+                      "contents, %d cross-account summaries)."):format(counts.owners, counts.full, counts.summary))
+        else
+            ns:Print("1.x import repair found no convertible characters; the saved 1.x data " ..
+                     "is present but not in a shape this version can read. Nothing was changed.")
+        end
+    end
     return counts
 end
 
@@ -238,8 +346,23 @@ end
 
 function Migrate.Migrate()
     if not Store.data then return { skipped = true } end
-    return Migrate.Run(Store.data, _G.DaseekiBagsAccount, _G.DaseekiBagsMesh,
-                       { selfAccount = Store.data.selfAccount or "" })
+    local opts = { selfAccount = Store.data.selfAccount or "" }
+    local counts = Migrate.Run(Store.data, _G.DaseekiBagsAccount, _G.DaseekiBagsMesh, opts)
+
+    -- A skipped run means the marker was already set. That is normal on every login
+    -- after the first — but it is also the sticky-marker anomaly's signature, so check.
+    if counts.skipped then
+        local healed = Migrate.SelfHeal(Store.data, _G.DaseekiBagsAccount, _G.DaseekiBagsMesh, opts)
+        if healed then counts = healed end
+    end
+
+    -- The SETTINGS + custom-rules pass (audit NW-1) runs at this same migration
+    -- moment, against a different source global with its own marker. Optional by
+    -- design: if migrate_settings.lua is absent the owner data still converts.
+    if ns.MigrateSettings and ns.MigrateSettings.Migrate then
+        counts.settings = ns.MigrateSettings.Migrate()
+    end
+    return counts
 end
 
 ----------------------------------------------------------------------
@@ -349,11 +472,100 @@ local function testEndToEndAndIdempotency(fails)
     ck(acc["Whitemane"]["Puuchoco"][0].items[1] == "6948", "source item strings not mutated")
 end
 
+-- AT-RISK-1c: the marker must never be written by a run that imported nothing, and a
+-- source that only shows up later must still import.
+local function testEmptySourceLeavesMarkerUnset(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- 1) No source at all (the 1.x addon was never installed / SV never written).
+    local data = Store._defaultData()
+    local r = Migrate.Run(data, nil, nil, { selfAccount = "acctSELF" })
+    ck(r.skipped == false, "a run with no source still executes (it is not 'already done')")
+    ck(r.owners == 0, "no source converts no owners")
+    ck(r.markerSet == false, "marker reported as NOT set")
+    ck(data.migratedFrom1x == false, "marker left unset after an empty run")
+
+    -- 2) Present but empty tables (1.x installed, never logged a character).
+    local data2 = Store._defaultData()
+    Migrate.Run(data2, {}, {}, { selfAccount = "acctSELF" })
+    ck(data2.migratedFrom1x == false, "empty source tables leave the marker unset")
+
+    -- 3) Realms present but holding no character records.
+    local data3 = Store._defaultData()
+    Migrate.Run(data3, { ["Whitemane"] = {} }, nil, { selfAccount = "acctSELF" })
+    ck(data3.migratedFrom1x == false, "empty realm table leaves the marker unset")
+
+    -- 4) THE POINT OF THE RULE: the source appears on a later login and imports.
+    local r4 = Migrate.Run(data, sampleAccount(), sampleMesh(), { selfAccount = "acctSELF" })
+    ck(r4.skipped == false, "late-appearing source is not blocked by a marker")
+    ck(r4.owners == 2, "late-appearing source imports both owners")
+    ck(r4.markerSet == true and data.migratedFrom1x == true, "marker set once real data landed")
+
+    -- ...and only then does the guard engage.
+    ck(Migrate.Run(data, sampleAccount(), sampleMesh(), {}).skipped == true,
+        "marker now guards re-runs")
+end
+
+-- AT-RISK-1c self-heal: marker true + zero owners + a real source = repair it.
+local function testSelfHeal(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local quiet = { selfAccount = "acctSELF", quiet = true }
+
+    -- The anomaly: a DB carrying a sticky marker from the pre-fix build.
+    local data = Store._defaultData()
+    data.migratedFrom1x = true              -- "already imported"
+    ck(Migrate.Run(data, sampleAccount(), sampleMesh(), quiet).skipped == true,
+        "the normal path is blocked by the sticky marker (this is the bug)")
+    ck(next(data.owners) == nil, "and the store is still empty")
+
+    local healed = Migrate.SelfHeal(data, sampleAccount(), sampleMesh(), quiet)
+    ck(healed ~= nil, "self-heal fired")
+    ck(healed.selfHealed == true and healed.sourceChars == 3, "reports the heal + source census")
+    ck(healed.owners == 2, "self-heal imported both owners")
+    ck(data.owners["Puuchoco-Whitemane"].money == 39000, "full char restored with its money")
+    ck(data.owners["Shalk-Whitemane"].source == "summary", "summary char restored")
+    ck(data.selfHealAttempts == 1, "attempt counted")
+
+    -- Now healthy: the trigger condition is false, so it never fires again.
+    ck(Migrate.SelfHeal(data, sampleAccount(), sampleMesh(), quiet) == nil,
+        "no re-heal once owners exist")
+
+    -- Not an anomaly: marker set and the source is genuinely empty (the ordinary
+    -- state of a fresh 2.0 install that already ran once against nothing).
+    local clean = Store._defaultData()
+    clean.migratedFrom1x = true
+    ck(Migrate.SelfHeal(clean, nil, nil, quiet) == nil, "empty source is not an anomaly")
+    ck(clean.selfHealAttempts == nil, "and costs no attempt")
+
+    -- Not an anomaly: marker unset (the normal path owns that case).
+    local fresh = Store._defaultData()
+    ck(Migrate.SelfHeal(fresh, sampleAccount(), nil, quiet) == nil, "unset marker is not an anomaly")
+
+    -- Bounded: an unconvertible-but-present source cannot spam forever.
+    local weird = Store._defaultData()
+    weird.migratedFrom1x = true
+    local junk = { ["Whitemane"] = { ["Ghost"] = "not-a-table" } }
+    ck(Migrate.CountSourceChars(junk, nil) == 0, "non-table records are not counted as source")
+    -- A source that counts but converts to nothing: records are tables, but the whole
+    -- pass yields owners because ANY table converts -- so force the bound directly.
+    weird.selfHealAttempts = Migrate.MAX_SELFHEAL_ATTEMPTS
+    ck(Migrate.SelfHeal(weird, sampleAccount(), nil, quiet) == nil,
+        "attempts are bounded (no login-loop chat spam)")
+
+    -- The loud print path must not error (harness re-points ns.Print to its log).
+    local noisy = Store._defaultData()
+    noisy.migratedFrom1x = true
+    local okPrint = pcall(Migrate.SelfHeal, noisy, sampleAccount(), nil, { selfAccount = "x" })
+    ck(okPrint, "the loud repair notice prints without error")
+end
+
 function Migrate.RunSelfTests(verbose)
     local suites = {
         { name = "parse item ref",   fn = testParse },
         { name = "convert container", fn = testConvertContainer },
         { name = "end-to-end + idempotency", fn = testEndToEndAndIdempotency },
+        { name = "empty source leaves marker unset", fn = testEmptySourceLeavesMarkerUnset },
+        { name = "sticky-marker self-heal", fn = testSelfHeal },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

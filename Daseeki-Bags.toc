@@ -7,6 +7,10 @@
 ## SavedVariables: DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
 ## OptionalDeps: Daseeki-Core
 ## Interface: 11507, 11508, 11509
-## Version: 1.1.4
+## Version: 1.1.5
+## (audit NW-8 / release-gate C.12: this line read 1.1.4 while the shipped tag was
+## v1.1.5. The 1.x sources here are byte-identical to that tag, so 1.1.5 is the
+## truth. The same drift is still present on the main branch, which this branch
+## does not touch.)
 
 main.xml
