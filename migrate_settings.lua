@@ -594,6 +594,22 @@ function MigrateSettings.Migrate()
 
     local rep = MigrateSettings.Run(db, _G.DaseekiBagsSets, { name = name, realm = realm })
 
+    -- ── SORT LOCKS (locks.lua) ────────────────────────────────────────────────────
+    -- Runs HERE because its TARGET is this file's target — DaseekiBags2DB, the settings
+    -- global — even though its SOURCE is DaseekiBagsAccount (1.x kept locks in the bag
+    -- cache because 1.x had only one SavedVariable to keep them in; 2.0 files them as
+    -- the configuration they are). So it rides the settings pass, and the settings pass
+    -- is what the migration moment already calls.
+    --
+    -- ITS OWN MARKER, deliberately, NOT MigrateSettings.MARKER. The owner's live
+    -- DaseekiBags2DB already carries migratedSettingsFrom1x = true from an earlier beta
+    -- login, so a lock import folded under that flag could never run for him — the one
+    -- person whose 1.x file actually holds locks. Separate source shape, separate
+    -- marker, same three house rules (marker-guarded / non-empty gated / additive).
+    if ns.Locks and ns.Locks.Migrate then
+        rep.locks = ns.Locks.Migrate()
+    end
+
     if rep.ran and ns.Print then
         local carried = (rep.appliedCount or 0) + (rep.matchedCount or 0)
         if carried > 0 or rep.rules.imported > 0 then
@@ -939,6 +955,50 @@ local function testRuleImport(fails)
     ck(rep4.markerSet == true, "settings alone are enough to complete the pass")
 end
 
+-- THE CUTOVER CASE THAT ACTUALLY MATTERS FOR THE OWNER.
+--
+-- His live DaseekiBags2DB already carries migratedSettingsFrom1x = true from an earlier
+-- beta login, so the settings pass is marker-SKIPPED on every future login. If the sort
+-- locks rode that marker they would never import for him. This asserts the wiring the
+-- other way round: a skipped settings pass STILL runs the lock import, because the lock
+-- import owns its own marker.
+local function testLockImportWiring(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local Locks = ns.Locks
+    if not Locks then fails[#fails + 1] = "ns.Locks missing (load order changed?)"; return end
+
+    local Store = ns.Store
+    local savedDB, savedSets, savedAccount = Store.db, _G.DaseekiBagsSets, _G.DaseekiBagsAccount
+
+    local db = freshDB()
+    db[MigrateSettings.MARKER] = true          -- the owner's real state
+    Store.db = db
+    _G.DaseekiBagsSets = sampleSets()
+    _G.DaseekiBagsAccount = {
+        Whitemane = { Poonyx = { [4] = { size = 18, link = "14156",
+                                         locked = { [15] = true, [16] = true } } } },
+    }
+
+    local rep = MigrateSettings.Migrate()
+    ck(rep.skipped == true, "the settings pass itself is marker-skipped (owner's state)")
+    ck(type(rep.locks) == "table", "the settings pass still ran the lock import")
+    ck(rep.locks.imported == 2, "and it imported the 1.x locks (got "
+        .. tostring(rep.locks and rep.locks.imported) .. ")")
+    ck(db[Locks.MIGRATION_MARKER] == true, "the lock import set ITS OWN marker")
+    ck(db[Locks.DB_KEY] and Locks.RootIsLocked(db[Locks.DB_KEY]["Poonyx-Whitemane"], 4, 15),
+       "the locks landed in the settings DB under the character key")
+
+    -- ...and a second login does not re-import.
+    local rep2 = MigrateSettings.Migrate()
+    ck(rep2.locks.skipped == true, "second login skips the lock import")
+
+    -- READ-ONLY: the 1.x source is untouched by the pass.
+    ck(_G.DaseekiBagsAccount.Whitemane.Poonyx[4].locked[15] == true,
+       "the 1.x source still holds its own locks (read-only)")
+
+    Store.db, _G.DaseekiBagsSets, _G.DaseekiBagsAccount = savedDB, savedSets, savedAccount
+end
+
 function MigrateSettings.RunSelfTests(verbose)
     local suites = {
         { name = "config already matching 2.0", fn = testMatchingConfig },
@@ -949,6 +1009,7 @@ function MigrateSettings.RunSelfTests(verbose)
         { name = "non-empty gate + read-only",  fn = testGateAndReadOnly },
         { name = "1.x query conversion",        fn = testQueryConversion },
         { name = "custom rule import",          fn = testRuleImport },
+        { name = "sort-lock import wiring",     fn = testLockImportWiring },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

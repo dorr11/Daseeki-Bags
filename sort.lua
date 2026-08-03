@@ -163,16 +163,38 @@ function Sort.CompareStacksDesc(a, b)
 end
 
 ----------------------------------------------------------------------
+-- PURE: the two kinds of immovable cell
+--
+-- `locked`     — TRANSIENT. The client's own isLocked: an item is mid-flight on this
+--                slot and the server has not answered yet. Cleared by the prediction
+--                overlay once we know what the slot will hold (see overlayPredictions).
+-- `userLocked` — PERMANENT (until the owner says otherwise). A SORT LOCK the owner set
+--                in the lock config mode (locks.lua). It is a SEPARATE FIELD on purpose:
+--                the prediction overlay clears `locked` on slots WE moved, and a user
+--                lock must never be clearable by that path. Nothing in the executor
+--                writes userLocked.
+--
+-- Both make a cell a planner FIXED POINT: its item stays put and it is never chosen as a
+-- destination. That is 1.x's exact semantics (core/api/sorting.lua:111-114 omits a
+-- locked slot from the space list entirely, so it is neither source nor destination).
+----------------------------------------------------------------------
+
+function Sort.CellIsFixed(c)
+    if type(c) ~= "table" then return false end
+    return (c.locked or c.userLocked) and true or false
+end
+
+----------------------------------------------------------------------
 -- PURE: the planner
 --
 -- state = {
---   cells   = { { cid, slot, id|nil, count, quality, locked }, ... },  -- canonical order
+--   cells   = { { cid, slot, id|nil, count, quality, locked, userLocked }, ... },
 --   meta    = function(id) -> { classID, subClassID, name, quality, maxStack } | nil,
 --   canHold = function(cid, id) -> bool,   -- optional; default: everything fits
 -- }
 -- Returns { target = { [cellIndex] = { id, count } }, moves = { ... }, stats = {...} }.
--- Locked cells are fixed points: their items stay, and they are neither sources nor
--- destinations. Move ops:
+-- Locked cells (either kind — see Sort.CellIsFixed) are fixed points: their items stay,
+-- and they are neither sources nor destinations. Move ops:
 --   { op = "merge", from = {cid,slot}, to = {cid,slot} }   -- pour same-item stacks
 --   { op = "swap",  a = {cid,slot},    b = {cid,slot} }    -- exchange two cells
 ----------------------------------------------------------------------
@@ -185,10 +207,13 @@ function Sort.Plan(state)
 
     local moves = {}
 
-    -- free (unlocked) cell indices in canonical order
+    -- free (unlocked) cell indices in canonical order. A cell fixed by EITHER lock kind
+    -- is excluded here and therefore cannot appear in `moves` in any position: Phase I
+    -- only pours between free cells, the target map is only built over free cells, and
+    -- Phase II only swaps free cells. One exclusion, both directions.
     local free = {}
     for i, c in ipairs(cells) do
-        if not c.locked then free[#free + 1] = i end
+        if not Sort.CellIsFixed(c) then free[#free + 1] = i end
     end
 
     -- working simulation of free-cell contents
@@ -576,6 +601,16 @@ local function makeCanHoldFn(cache)
     end
 end
 
+-- Is this slot SORT-LOCKED by the owner? (locks.lua; per-character SavedVariables.)
+-- Resolved through ns at CALL time and fully guarded, so sort.lua keeps working with
+-- locks.lua absent — it simply sees no user locks.
+local function userLocked(cid, slot)
+    local L = ns.Locks
+    if not (L and L.IsLocked) then return false end
+    return L.IsLocked(cid, slot) and true or false
+end
+Sort._userLocked = userLocked   -- exposed so the harness can stub it
+
 -- Snapshot the given container ids into the planner's cell model (canonical order).
 local function snapshot(cids)
     local CC = _G.C_Container
@@ -594,12 +629,16 @@ local function snapshot(cids)
         local n = CC.GetContainerNumSlots(cid) or 0
         for slot = 1, n do
             local info = CC.GetContainerItemInfo(cid, slot)
+            -- A sort lock applies to the SLOT, not to whatever happens to be in it, so
+            -- an EMPTY locked slot is stamped too: the planner must never fill it.
+            local ul = Sort._userLocked(cid, slot)
             if info and info.itemID then
                 cells[#cells + 1] = { cid = cid, slot = slot, id = info.itemID,
                     count = info.stackCount or 1, quality = info.quality,
-                    locked = info.isLocked and true or false }
+                    locked = info.isLocked and true or false, userLocked = ul }
             else
-                cells[#cells + 1] = { cid = cid, slot = slot, id = nil, count = 0 }
+                cells[#cells + 1] = { cid = cid, slot = slot, id = nil, count = 0,
+                    userLocked = ul }
             end
         end
     end
@@ -867,9 +906,13 @@ local function issueWave1(plan, cells, now)
         local slots = Sort.MoveSlots(m)
         -- Defensive re-check against LIVE locks: the planner already excludes locked
         -- cells, this only catches a lock that appeared between snapshot and issue.
+        -- The USER-lock arm covers the owner locking a slot from the config mode while
+        -- a sort is mid-flight: the planner will drop it on the next tick anyway, and
+        -- this makes the very next move respect it too.
         local blocked = false
         for _, r in ipairs(slots) do
-            if Sort._pred[refKey(r)] or slotLocked(r.cid, r.slot) then blocked = true; break end
+            if Sort._pred[refKey(r)] or slotLocked(r.cid, r.slot)
+               or Sort._userLocked(r.cid, r.slot) then blocked = true; break end
         end
         if not blocked then
             if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
@@ -990,6 +1033,13 @@ function Sort.Run(cids, opts)
         if ns.Print then ns:Print("open the bank to sort bank containers.") end
         return false
     end
+
+    -- A sort and the LOCK CONFIG MODE are mutually exclusive surfaces: the mode
+    -- suspends normal item interaction, and watching the grid churn while every click
+    -- toggles a lock is nobody's idea of configuration. Starting a sort closes it (the
+    -- locks themselves are persisted and keep applying — only the editing mode ends).
+    -- Guarded: locks.lua is optional to sort.lua.
+    if ns.Locks and ns.Locks.Exit then ns.Locks.Exit("sorting") end
 
     local cells = snapshot(cids)
     if not cells then return false end
@@ -1118,11 +1168,17 @@ local function metaFn(id) return META[id] end
 local function maxOf(id) local m = META[id]; return (m and m.maxStack) or 1 end
 
 local function bagCells(cid, slots, contents)
-    -- contents = { [slot] = { id, count, locked } }
+    -- contents = { [slot] = { id, count, locked, userLocked } }
+    --   locked     = the client's transient in-flight lock
+    --   userLocked = the owner's persistent SORT LOCK (locks.lua)
+    -- An entry with no id models an EMPTY cell, which is meaningful for userLocked:
+    -- an empty locked slot must never be filled.
     local cells = {}
     for slot = 1, slots do
         local e = contents[slot]
-        if e then cells[#cells + 1] = { cid = cid, slot = slot, id = e.id, count = e.count or 1, locked = e.locked }
+        if e then cells[#cells + 1] = { cid = cid, slot = slot, id = e.id,
+                                        count = e.count or (e.id and 1 or 0),
+                                        locked = e.locked, userLocked = e.userLocked }
         else cells[#cells + 1] = { cid = cid, slot = slot, id = nil, count = 0 } end
     end
     return cells
@@ -1218,6 +1274,168 @@ local function testPlanIdempotentAndLocked(fails)
     end
     -- The locked apple is absent from the target map (slot 2 not a free cell).
     ck(lp.target[2] == nil, "locked cell not a placement target")
+end
+
+----------------------------------------------------------------------
+-- SORT LOCKS (locks.lua) — the planner half of the owner's right-click feature.
+--
+-- A user lock has to hold in BOTH directions, and they are genuinely different
+-- failure modes:
+--   SOURCE      a locked slot's item must never move OUT of it.
+--   DESTINATION a locked slot must never be chosen to receive anything — including
+--               an EMPTY locked slot, which carries no item to protect and is exactly
+--               the case a "skip cells that hold something locked" bug would miss.
+-- Both are asserted below, plus the mutation gate underneath, which proves these
+-- assertions actually FAIL when the lock logic is broken.
+----------------------------------------------------------------------
+
+-- The lock assertion body, factored out so the mutation gate can re-run the SAME
+-- assertions against a deliberately broken Sort.CellIsFixed. Returns a fails list.
+local function userLockAssertions()
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function touches(m, cid, slot)
+        local function hit(r) return r and r.cid == cid and r.slot == slot end
+        if m.op == "swap" then return hit(m.a) or hit(m.b) end
+        return hit(m.from) or hit(m.to)
+    end
+
+    ---------------------------------------------------------------- source direction
+    -- An OCCUPIED user-locked slot holding an item that badly wants to move (an apple,
+    -- which 1.x order sends to the bottom, sitting in slot 1 above gear).
+    local occupied = bagCells(0, 6, {
+        [1] = { id = 100, count = 5, userLocked = true },   -- LOCKED consumable up front
+        [2] = { id = 200 },                                 -- sword
+        [3] = { id = 201 },                                 -- cloak
+        [4] = { id = 100, count = 7 },                      -- a loose apple to merge with
+    })
+    local p1 = Sort.Plan({ cells = occupied, meta = metaFn })
+    for _, m in ipairs(p1.moves) do
+        ck(not touches(m, 0, 1), "no move touches the user-locked source slot 1")
+    end
+    ck(p1.target[1] == nil, "user-locked occupied cell is not a placement target")
+    -- and prove it by APPLYING the plan: the locked stack is bit-identical afterwards.
+    local applied = bagCells(0, 6, {
+        [1] = { id = 100, count = 5, userLocked = true },
+        [2] = { id = 200 }, [3] = { id = 201 }, [4] = { id = 100, count = 7 },
+    })
+    applyMoves(applied, p1.moves, maxOf)
+    ck(applied[1].id == 100 and applied[1].count == 5,
+       "the user-locked apple stack survives the plan unchanged (not even merged into)")
+    -- The loose apple is still in the bag: locking never destroys or strands items.
+    local apples = 0
+    for _, c in ipairs(applied) do if c.id == 100 then apples = apples + c.count end end
+    ck(apples == 12, "every apple is still accounted for (5 locked + 7 free)")
+
+    ---------------------------------------------------------------- destination direction
+    -- An EMPTY user-locked slot in the middle of a bag the planner wants to compact.
+    -- Nothing may land in it, and the sort must still complete around it.
+    local empties = bagCells(0, 6, {
+        [1] = { id = 300, count = 4 },
+        [2] = { userLocked = true },          -- LOCKED and EMPTY: must stay empty
+        [3] = { id = 300, count = 5 },
+        [4] = { id = 200 },
+        [5] = { id = 100, count = 3 },
+    })
+    local p2 = Sort.Plan({ cells = empties, meta = metaFn })
+    for _, m in ipairs(p2.moves) do
+        ck(not touches(m, 0, 2), "no move targets the empty user-locked slot 2")
+    end
+    ck(p2.target[2] == nil, "empty user-locked cell is not a placement target")
+    local applied2 = bagCells(0, 6, {
+        [1] = { id = 300, count = 4 }, [2] = { userLocked = true },
+        [3] = { id = 300, count = 5 }, [4] = { id = 200 }, [5] = { id = 100, count = 3 },
+    })
+    applyMoves(applied2, p2.moves, maxOf)
+    ck(applied2[2].id == nil, "the empty locked slot is still empty after the sort")
+    -- ...and the free cells DID sort (the lock must not paralyse the whole bag).
+    local seq = {}
+    for _, c in ipairs(applied2) do if c.id then seq[#seq + 1] = c.id end end
+    ck(#seq == 3, "three occupied cells remain (cloth merged to one stack)")
+    ck(seq[1] == 300 and seq[2] == 200 and seq[3] == 100,
+       "free cells still land in 1.x order around the lock (cloth, sword, apple)")
+
+    ---------------------------------------------------------------- both kinds coexist
+    -- A transient client lock and a user lock on the same bag are both fixed points,
+    -- and neither is confused for the other.
+    local mixed = bagCells(0, 5, {
+        [1] = { id = 100, count = 4, locked = true },       -- in-flight (client)
+        [2] = { id = 101, count = 4, userLocked = true },   -- owner's sort lock
+        [3] = { id = 200 },
+    })
+    local p3 = Sort.Plan({ cells = mixed, meta = metaFn })
+    for _, m in ipairs(p3.moves) do
+        ck(not touches(m, 0, 1), "in-flight slot 1 still a fixed point")
+        ck(not touches(m, 0, 2), "user-locked slot 2 still a fixed point")
+    end
+    ck(p3.stats.free == 3, "free-cell count excludes BOTH locked cells (5 - 2)")
+
+    ---------------------------------------------------------------- idempotence
+    -- Re-planning a bag that is already sorted-around-its-locks yields zero moves, so
+    -- the executor converges instead of churning against the locks forever.
+    local settled = bagCells(0, 6, {
+        [1] = { id = 100, count = 5, userLocked = true },
+        [2] = { id = 100, count = 7 }, [3] = { id = 200 },
+    })
+    local p4 = Sort.Plan({ cells = settled, meta = metaFn })
+    local p4b = Sort.Plan({ cells = settled, meta = metaFn })
+    ck(#p4.moves > 0, "the unsorted-around-a-lock bag really does need moves")
+    ck(#p4.moves == #p4b.moves, "planning twice on the same state is stable")
+    applyMoves(settled, p4.moves, maxOf)
+    local p5 = Sort.Plan({ cells = settled, meta = metaFn })
+    ck(#p5.moves == 0, "the post-plan state is a fixed point (converges with locks)")
+    ck(settled[1].id == 100 and settled[1].count == 5, "and the lock held through it")
+
+    return fails
+end
+
+local function testPlanUserLocks(fails)
+    for _, f in ipairs(userLockAssertions()) do fails[#fails + 1] = f end
+end
+
+----------------------------------------------------------------------
+-- MUTATION GATE for the lock cases.
+--
+-- A lock test that passes against a BROKEN lock implementation is worse than no test:
+-- it is a green light over the exact defect it was written for. So each mutant below
+-- breaks Sort.CellIsFixed in one specific way, and the gate asserts the assertions
+-- above go RED. A mutant that survives (assertions still pass) is reported by name.
+----------------------------------------------------------------------
+local function testUserLockMutants(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local real = Sort.CellIsFixed
+    local mutants = {
+        { name = "ignores userLocked (only honours the client's in-flight lock)",
+          fn = function(c) return (type(c) == "table" and c.locked) and true or false end },
+        { name = "ignores locked (only honours the user lock)",
+          fn = function(c) return (type(c) == "table" and c.userLocked) and true or false end },
+        { name = "nothing is ever fixed",
+          fn = function() return false end },
+        { name = "everything is fixed",
+          fn = function() return true end },
+        { name = "locks only protect OCCUPIED cells (empty locked slot is fillable)",
+          fn = function(c)
+              if type(c) ~= "table" then return false end
+              if c.locked then return true end
+              return (c.userLocked and c.id ~= nil) and true or false
+          end },
+    }
+
+    for _, mut in ipairs(mutants) do
+        Sort.CellIsFixed = mut.fn
+        local ok, res = pcall(userLockAssertions)
+        Sort.CellIsFixed = real
+        -- A mutant is KILLED either by producing assertion failures or by erroring out.
+        local killed = (not ok) or (#res > 0)
+        ck(killed, "mutant SURVIVED the lock assertions: " .. mut.name)
+    end
+
+    ck(Sort.CellIsFixed == real, "the real predicate was restored after mutation")
+    -- Sanity: the unmutated predicate passes the same assertions it just killed
+    -- mutants with (guards against a gate that is red for everything).
+    ck(#userLockAssertions() == 0, "the real predicate passes the lock assertions")
 end
 
 local function testPlanFamilyAndMultiBag(fails)
@@ -2127,6 +2345,132 @@ end
 ----------------------------------------------------------------------
 -- Guard-rails: locked-slot fixed points, family constraints, abort-on-user-action.
 ----------------------------------------------------------------------
+----------------------------------------------------------------------
+-- EXECUTOR + SORT LOCKS: the whole feature end to end against the simulator.
+--
+-- The planner cases above prove the plan is clean; this proves the LIVE PATH is —
+-- snapshot stamps userLocked from ns.Locks, the executor never issues a move on a
+-- locked slot, and the combat gate is completely unaffected by locks being present
+-- (the owner's rule: the mode is UI-only config, the sort's combat behaviour does not
+-- change). ns.Locks is stubbed through Sort._userLocked so the case is deterministic
+-- and needs no SavedVariables.
+----------------------------------------------------------------------
+local function testExecutorUserLocks(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local rng = newRng(20260803)
+    local realUL = Sort._userLocked
+
+    local function withUserLocks(set, fn)
+        Sort._userLocked = function(cid, slot) return set[cid .. ":" .. slot] and true or false end
+        local ok, err = pcall(fn)
+        Sort._userLocked = realUL
+        if not ok then error(err, 0) end
+    end
+
+    ---------------------------------------------------------------- occupied lock holds
+    for trial = 1, 4 do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                                  latency = 0.12, seed = 700 + trial })
+        seedRandomBags(S, rng, 6, 5)
+        -- Lock the first OCCUPIED slot and the first EMPTY slot of bag 0.
+        local occSlot, emptySlot
+        for slot = 1, 16 do
+            local it = S:at(0, slot)
+            if it and not occSlot then occSlot = slot
+            elseif not it and not emptySlot then emptySlot = slot end
+        end
+        ck(occSlot ~= nil and emptySlot ~= nil, "found an occupied and an empty slot to lock")
+        local pinned = S:at(0, occSlot)
+        local before = S:totals()
+        local locks = { ["0:" .. occSlot] = true, ["0:" .. emptySlot] = true }
+
+        local tally
+        withUserLocks(locks, function()
+            tally = runSortInSim(S, { 0, 1 })
+        end)
+
+        -- CONVERGED, not stalled. issueWave1 also refuses to touch a locked slot, so a
+        -- planner that wrongly TARGETED one would still leave the slot alone — and the
+        -- run would grind to "stalled (slots stayed locked)". Requiring a clean
+        -- completion is what makes this case bite on the planner as well as the issuer.
+        local completed = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort complete", 1, true) then completed = true end
+        end
+        ck(completed, "the locked run CONVERGED (planner never targeted a locked slot)")
+
+        local now = S:at(0, occSlot)
+        ck(now ~= nil and now.id == pinned.id and now.count == pinned.count,
+           "sort-locked occupied slot 0:" .. tostring(occSlot) .. " is untouched")
+        ck(S:at(0, emptySlot) == nil,
+           "sort-locked EMPTY slot 0:" .. tostring(emptySlot) .. " was never filled")
+        ck(sameTotals(before, S:totals()), "locked run conserved every item")
+        ck(Sort._running == false, "locked run stopped")
+        ck(S.held == nil, "locked run left the cursor empty")
+    end
+
+    ---------------------------------------------------------------- combat gate unchanged
+    -- Same abort, same message, same clean cursor — locks present or not. And the
+    -- locked slot is still intact after the abort.
+    do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                                  latency = 0.15, seed = 7777 })
+        seedRandomBags(S, rng, 10, 8)
+        local occSlot
+        for slot = 1, 16 do if S:at(0, slot) then occSlot = slot; break end end
+        local pinned = S:at(0, occSlot)
+        local before = S:totals()
+
+        withUserLocks({ ["0:" .. occSlot] = true }, function()
+            S:install()
+            local tally
+            local ok, err = pcall(function()
+                tally = withFakeUI(function()
+                    Sort.Run({ 0, 1 })
+                    S.after(0.16, function() S.combat = true; S.fire("PLAYER_REGEN_DISABLED") end)
+                    S:pump(30)
+                end)
+            end)
+            if Sort._running then Sort._running = false end
+            S:restore()
+            if not ok then error(err, 0) end
+            local stopped = false
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort stopped: entered combat", 1, true) then stopped = true end
+            end
+            ck(stopped, "combat abort message is unchanged with locks present")
+        end)
+
+        ck(Sort._running == false, "combat aborted the locked sort")
+        ck(S.held == nil, "combat abort left the cursor empty")
+        local now = S:at(0, occSlot)
+        ck(now ~= nil and now.id == pinned.id and now.count == pinned.count,
+           "the locked slot survived the aborted run")
+        ck(sameTotals(before, S:totals()), "combat-aborted locked run conserved every item")
+    end
+
+    ---------------------------------------------------------------- refusing to start
+    do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 } }, seed = 8888 })
+        seedRandomBags(S, rng, 5, 4)
+        withUserLocks({ ["0:1"] = true }, function()
+            S:install()
+            S.combat = true
+            local started
+            local ok, err = pcall(function()
+                withFakeUI(function() started = Sort.Run({ 0 }) end)
+            end)
+            S.combat = false
+            if Sort._running then Sort._running = false end
+            S:restore()
+            if not ok then error(err, 0) end
+            ck(started == false, "Sort.Run still refuses to start in combat with locks set")
+        end)
+    end
+
+    ck(Sort._userLocked == realUL, "the real user-lock probe was restored")
+end
+
 local function testExecutorGuardRails(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local rng = newRng(20260731)
@@ -2289,6 +2633,8 @@ function Sort.RunSelfTests(verbose)
         { name = "plan: merge + group sort", fn = testPlanMergeAndSort },
         { name = "plan: 1.x order parity",   fn = testPlan1xOrder },
         { name = "plan: idempotent + locked", fn = testPlanIdempotentAndLocked },
+        { name = "plan: sort locks (both directions)", fn = testPlanUserLocks },
+        { name = "plan: sort-lock mutation gate", fn = testUserLockMutants },
         { name = "plan: family + multi-bag", fn = testPlanFamilyAndMultiBag },
         { name = "plan: direction inversion", fn = testPlanDirection },
         { name = "wave partition",          fn = testPartitionWaves },
@@ -2297,6 +2643,7 @@ function Sort.RunSelfTests(verbose)
         { name = "converge: lock failures",  fn = testExecutorLockFailures },
         { name = "converge: mid-sort change", fn = testExecutorMidSortChange },
         { name = "converge: guard-rails",    fn = testExecutorGuardRails },
+        { name = "converge: sort locks + combat", fn = testExecutorUserLocks },
         { name = "converge: report + quiet",  fn = testExecutorReporting },
     }
     local allPass = true

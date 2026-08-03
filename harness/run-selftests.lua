@@ -593,7 +593,7 @@ end
 -- safe (CreateFrame / SlashCmdList / geterrorhandler are all guarded).
 -- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
 -- attach borders at paint), then ui_frame last (it consumes ns.Items).
-local TOC_ORDER = { "core.lua", "store.lua", "nexus.lua", "capture.lua", "migrate.lua",
+local TOC_ORDER = { "core.lua", "store.lua", "locks.lua", "nexus.lua", "capture.lua", "migrate.lua",
                     "migrate_settings.lua",
                     "borders.lua", "ui_items.lua", "parity.lua", "ui_frame.lua",
                     "ui_owner.lua", "ui_bank.lua",
@@ -671,7 +671,7 @@ end
 -- which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
-    "borders", "capture", "cell-parity", "core", "features", "migrate", "migrate_settings", "nexus",
+    "borders", "capture", "cell-parity", "core", "features", "locks", "migrate", "migrate_settings", "nexus",
     "options", "rules2", "search", "sort", "store",
     "ui_bank", "ui_find", "ui_frame", "ui_items", "ui_owner",
 }
@@ -736,6 +736,24 @@ ns:RegisterSelfTest("fixture-migration", function(verbose)
     local r2 = ns.Migrate.Run(data, _G.DaseekiBagsAccount, _G.DaseekiBagsMesh,
                               { selfAccount = "acct-FIXTURE" })
     ck(r2.skipped == true, "second fixture run skipped")
+
+    -- SORT LOCKS, against the same committed fixture. Separate source field, separate
+    -- marker, separate target (the settings DB) — so it is asserted separately.
+    local db = { settingsVersion = 1 }
+    local lr = ns.Locks.MigrateFrom1x(db, _G.DaseekiBagsAccount)
+    ck(lr.ran == true, "fixture lock import ran")
+    ck(lr.imported == 2, "fixture imported 2 locked slots (got " .. tostring(lr.imported) .. ")")
+    ck(lr.characters == 1, "only Puuchoco carried locks (Itchey's table is empty)")
+    ck(db[ns.Locks.MIGRATION_MARKER] == true, "fixture lock import set its own marker")
+    local roots = db[ns.Locks.DB_KEY]
+    ck(type(roots) == "table" and roots["Itchey-Whitemane"] == nil,
+       "a character whose 1.x lock table is empty gets no root")
+    ck(ns.Locks.RootIsLocked(roots["Puuchoco-Whitemane"], 1, 13)
+       and ns.Locks.RootIsLocked(roots["Puuchoco-Whitemane"], 1, 14),
+       "Puuchoco's bag-1 locks landed on the right container and slots")
+    ck(ns.Locks.RootCount(roots["Puuchoco-Whitemane"]) == 2, "and nothing else did")
+    ck(ns.Locks.MigrateFrom1x(db, _G.DaseekiBagsAccount).skipped == true,
+       "second fixture lock import skipped by the marker")
 
     if verbose then
         ns:Print(string.format("  fixture: full=%d summary=%d owners=%d containers=%d slots=%d gold(copper)=%d",

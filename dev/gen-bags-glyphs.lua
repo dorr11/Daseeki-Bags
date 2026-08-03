@@ -10,6 +10,8 @@
 --   icon-layout.tga   — two vertical panes   (combined <-> split toggle)
 --   icon-owner.tga    — person bust          (owner selector)
 --   icon-raidprep.tga — stoppered flask      (Daseeki-Raid-Prep checklist toggle)
+--   icon-lock-slot.tga — prohibition sign    (a SORT-LOCKED item cell; see its block
+--                                             below — cell-scale, not strip-scale)
 --
 -- icon-gear.tga and icon-close.tga are NOT authored here: they are copied verbatim
 -- from Daseeki-Nexus/textures (our own assets, same 64x64 byte format), so the gear
@@ -187,6 +189,34 @@ local function glyphRaidPrep(x, y)
     return false
 end
 
+-- LOCK SLOT: the PROHIBITION SIGN — a ring with a diagonal bar through it. This is the
+-- mark a sort-locked cell wears in the lock config mode (locks.lua / ui_items.lua), and
+-- it is the one glyph in this file that is NOT a title-row control:
+--
+--   * it is drawn over a whole 37px ITEM CELL, not inside a 22px button, so it uses its
+--     own reach (26 + half-stroke = 30 of the 32 available) instead of the set's 20-24.
+--     At cell size the strip reach would read as a small dot in the middle of an icon.
+--   * it carries its own heavier stroke (8) for the same reason: it has to be legible
+--     ON TOP of a busy item icon, where the strip's 6 would disappear into the artwork.
+--
+-- Everything else is the house treatment: white on transparent, so the runtime tints it
+-- with a theme token (`danger` — the same red 1.x's own overlay reads as).
+--
+-- CLEAN-ROOM: a circle and a line. 1.x used a Blizzard file id for its overlay; this is
+-- generated from the geometry right here, like every other glyph in this file.
+local K_R      = 26      -- ring radius (cell-scale, not strip-scale)
+local K_STROKE = 8
+local K_HALF   = K_STROKE / 2
+local function glyphLockSlot(x, y)
+    if inRingAt(x, y, 0, 0, K_R, K_HALF) then return true end
+    -- the bar: the 135 degree diameter (upper-left to lower-right), the orientation
+    -- every "no" sign uses.
+    local th = math.rad(135)
+    local bx, by = K_R * math.cos(th), K_R * math.sin(th)
+    if inSegment(x, y, bx, by, -bx, -by, K_HALF) then return true end
+    return false
+end
+
 ----------------------------------------------------------------------
 -- rasteriser
 ----------------------------------------------------------------------
@@ -227,3 +257,4 @@ writeTGA(dir .. "/icon-find.tga",   glyphFind)
 writeTGA(dir .. "/icon-layout.tga", glyphLayout)
 writeTGA(dir .. "/icon-owner.tga",  glyphOwner)
 writeTGA(dir .. "/icon-raidprep.tga", glyphRaidPrep)
+writeTGA(dir .. "/icon-lock-slot.tga", glyphLockSlot)

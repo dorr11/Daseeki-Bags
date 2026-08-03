@@ -37,6 +37,10 @@
 ##
 core.lua
 store.lua
+# locks.lua: SORT LOCKS — per-slot "never move this" marks + the LOCK CONFIG MODE the
+# owner enters by right-clicking the sort glyph (1.x parity). PURE; settings-side
+# storage nested in DaseekiBags2DB, so no new SavedVariable. See Daseeki-Bags2.toc.
+locks.lua
 # nexus.lua: the SOFT-REQUIRED Daseeki-Nexus Inventory bridge. Bags sources its SUMMARY
 # owners (the money tooltip's "Other Accounts" section and the cross-character tooltip
 # counts) from the Nexus owners graph when that module is present and populated, and

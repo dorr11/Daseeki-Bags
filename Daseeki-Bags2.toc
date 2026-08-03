@@ -37,6 +37,16 @@
 ##
 core.lua
 store.lua
+# locks.lua: SORT LOCKS — the per-slot "never move this" marks and the LOCK CONFIG MODE
+# the owner enters by RIGHT-CLICKING the sort glyph. 1.x carried this feature (sortButton
+# OnLocking -> item PostClick/UpdateIgnored -> sorting GetSpaces); 2.0 had lost it.
+# PURE: no WoW API at all, so the mode state machine and the 1.x lock import are fully
+# harness-driven. Loads right after store.lua because it is a SETTINGS surface — locks
+# nest inside the already-declared DaseekiBags2DB, so NO new SavedVariable is introduced
+# (identity gate satisfied). Every consumer (sort.lua, ui_items.lua, ui_frame.lua,
+# migrate_settings.lua) resolves ns.Locks at CALL time, so its position relative to
+# them is free.
+locks.lua
 # nexus.lua: the SOFT-REQUIRED Daseeki-Nexus Inventory bridge. Bags sources its SUMMARY
 # owners (the money tooltip's "Other Accounts" section and the cross-character tooltip
 # counts) from the Nexus owners graph when that module is present and populated, and

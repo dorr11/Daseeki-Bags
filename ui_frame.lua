@@ -161,6 +161,23 @@ function Frame.SearchClickAction(button)
     return "search"
 end
 
+-- PURE: what a click on the dual-purpose SORT glyph means (sort-locks round).
+--   "locks" — right-click: enter/leave the LOCK CONFIG MODE (locks.lua)
+--   "sort"  — anything else: run the sort
+--
+-- The owner's directive: "right clicking the 'sort' button should allow me to lock bag
+-- slots to prevent them from sorting." 1.x reached the same feature through a Blizzard
+-- context menu opened by that right-click; 2.0 makes the right-click ITSELF the gesture
+-- (no menu library in the rewrite, and one gesture is what he asked for).
+--
+-- Deliberately the same shape as SearchClickAction above, so the two dual-purpose
+-- glyphs in the title row obey one rule: LEFT does the verb, RIGHT opens the surface
+-- that configures/widens it.
+function Frame.SortClickAction(button)
+    if button == "RightButton" then return "locks" end
+    return "sort"
+end
+
 Frame.ICONBTN     = 22   -- title-row control button (Nexus dashboard parity)
 Frame.ICON_INSET  = 2    -- glyph inset inside the button => 18x18 drawn
 Frame.ICON_SPACE  = 8    -- gap between adjacent controls, and from the window edge
@@ -1211,9 +1228,21 @@ function Frame.Ensure()
     magBtn:SetPoint("RIGHT", gearBtn, "LEFT", -SPACE, 0)
     win.magBtn = magBtn
 
+    -- SORT — the second dual-purpose glyph (sort-locks round; Frame.SortClickAction).
+    -- Left-click sorts; RIGHT-click opens the lock config mode, which is the 1.x feature
+    -- the owner asked for back. Same left-does/right-configures rule as the magnifier.
     local sortBtn = makeIconButton({ icon = "icon-sort",
-        tooltip = "Sort bags", tooltip2 = "Merge stacks and arrange by type",
-        onClick = function() if ns.Sort and ns.Sort.Run then ns.Sort.Run(ns.Sort.CarriedBagIDs()) end end,
+        clicks = { "LeftButtonUp", "RightButtonUp" },
+        tooltip  = "Sort bags",
+        tooltip2 = "Left-click: merge stacks and arrange by type",
+        tooltip3 = "Right-click: lock slots so a sort never moves them",
+        onClick = function(_, button)
+            if Frame.SortClickAction(button) == "locks" then
+                Frame.ToggleLockMode()
+            elseif ns.Sort and ns.Sort.Run then
+                ns.Sort.Run(ns.Sort.CarriedBagIDs())
+            end
+        end,
     })
     sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -SPACE, 0)
     win.sortBtn = sortBtn
@@ -1417,7 +1446,14 @@ function Frame.Ensure()
     -- with them. In 1.x the companion hooked the frame itself to do this; 2.0 owns the
     -- surface, so 2.0 drives it. Scripts, not HookScripts — the window has none of its own.
     win:SetScript("OnShow", function() Frame.MaybeOpenRaidPrepWithBags() end)
-    win:SetScript("OnHide", function() Frame.CloseRaidPrepWithBags() end)
+    win:SetScript("OnHide", function()
+        Frame.CloseRaidPrepWithBags()
+        -- CLOSING THE WINDOW LEAVES THE LOCK MODE. One of the three exits the owner
+        -- asked for, and the safety one: the mode suspends normal item interaction, so
+        -- it must never be able to outlive the window that explains it.
+        Frame.SetLockMode(false)
+    end)
+
 
     Frame.RefreshFooter(win)
     Frame.window = win
@@ -2116,6 +2152,214 @@ function Frame.ToggleSearch(force)
     end
 end
 
+----------------------------------------------------------------------
+-- LOCK CONFIG MODE surface (locks.lua owns the state; this owns the dress)
+--
+-- 1.x announced the mode with a yellow Blizzard HelpTip (Sushi.HelpTip carrying
+-- L.ConfigurationMode). 2.0 says the same thing in the suite's own voice: a flat
+-- token-coloured CARD in the window's language, floated ABOVE the title bar.
+--
+-- Floated OUTSIDE the window frame on purpose. Frame.Rebuild computes the window's
+-- height from the strip + grid + footer; a banner parked INSIDE that stack would have
+-- to join the layout math, and a transient config notice must not be able to resize the
+-- owner's bag window (or, worse, reflow the very grid he is clicking on). Anchored to
+-- the window's top edge it inherits the window's movement, scale and strata and costs
+-- the layout nothing — which is also what 1.x's floating HelpTip did.
+--
+-- Clicking the card leaves the mode. The card's PRESENCE is the mode indicator, so
+-- "dismiss" and "finish" are deliberately the same action; there is no way to be in the
+-- mode with no notice on screen.
+----------------------------------------------------------------------
+
+Frame.LOCK_NOTICE_W   = 300
+Frame.LOCK_NOTICE_PAD = 8
+
+function Frame.EnsureLockNotice(win)
+    win = win or Frame.window
+    if not win or not _G.CreateFrame then return nil end
+    if win.lockNotice then return win.lockNotice end
+    UI = UI or _G.DaseekiUI
+    if not UI then return nil end
+
+    local L = ns.Locks
+    local PADN = Frame.LOCK_NOTICE_PAD
+
+    local card = UI.FlatFrame(win, "panel", "danger")
+    card:SetWidth(Frame.LOCK_NOTICE_W)
+    card:SetPoint("BOTTOMLEFT", win, "TOPLEFT", 0, Frame.VGAP)
+    card:EnableMouse(true)
+    card:Hide()
+
+    local glyph = card:CreateTexture(nil, "ARTWORK")
+    glyph:SetSize(18, 18)
+    glyph:SetPoint("TOPLEFT", card, "TOPLEFT", PADN, -PADN)
+    glyph:SetTexture(Frame.ART .. "icon-lock-slot")
+    UI.Skin(glyph, function(self) self:SetVertexColor(UI.Color("danger")) end)
+
+    local title = card:CreateFontString(nil, "OVERLAY")
+    title:SetFontObject(UI.fonts.body)
+    title:SetPoint("TOPLEFT", glyph, "TOPRIGHT", 6, -2)
+    title:SetPoint("RIGHT", card, "RIGHT", -PADN, 0)
+    title:SetJustifyH("LEFT")
+    title:SetText((L and L.NOTICE_TITLE) or "Sort lock configuration")
+    UI.Skin(title, function(self) self:SetTextColor(UI.Color("danger")) end)
+
+    local body = card:CreateFontString(nil, "OVERLAY")
+    body:SetFontObject(UI.fonts.small or UI.fonts.body)
+    body:SetPoint("TOPLEFT", card, "TOPLEFT", PADN, -(PADN + 22))
+    body:SetPoint("RIGHT", card, "RIGHT", -PADN, 0)
+    body:SetJustifyH("LEFT")
+    body:SetWordWrap(true)
+    body:SetText((L and L.NOTICE_BODY) or "Click item slots to lock them.")
+    UI.Skin(body, function(self) self:SetTextColor(UI.Color("text")) end)
+    card._body = body
+
+    local count = card:CreateFontString(nil, "OVERLAY")
+    count:SetFontObject(UI.fonts.small or UI.fonts.body)
+    count:SetPoint("TOPLEFT", body, "BOTTOMLEFT", 0, -4)
+    count:SetPoint("RIGHT", card, "RIGHT", -PADN, 0)
+    count:SetJustifyH("LEFT")
+    UI.Skin(count, function(self) self:SetTextColor(UI.Color("muted")) end)
+    card._count = count
+
+    -- Clicking the notice finishes, same as the right-click and Escape routes.
+    card:SetScript("OnMouseUp", function() Frame.SetLockMode(false) end)
+
+    -- ESCAPE. The window is a UISpecialFrame, so Escape would otherwise CLOSE it — a
+    -- surprising way to leave a config mode. While the mode is open the card takes
+    -- keyboard focus and consumes exactly one key (ESCAPE), propagating everything
+    -- else, so no keybinding is swallowed; the keyboard is released again on exit.
+    -- Both methods are existence-guarded: on a client without them Escape simply closes
+    -- the window, whose OnHide exits the mode anyway. Never a stuck mode either way.
+    if card.EnableKeyboard and card.SetPropagateKeyboardInput then
+        card:SetScript("OnKeyDown", function(self, key)
+            if key == "ESCAPE" then
+                self:SetPropagateKeyboardInput(false)
+                Frame.SetLockMode(false)
+            else
+                self:SetPropagateKeyboardInput(true)
+            end
+        end)
+    end
+
+    win.lockNotice = card
+    return card
+end
+
+-- Which windows can host the notice. BOTH bag windows, because the mode is enterable
+-- from either sort control and applies to every live cell the sort engine can touch —
+-- carried bags, the keyring and the bank alike. ui_bank owns its window; ui_frame owns
+-- the notice, so the two windows can never explain the mode differently.
+function Frame.LockNoticeHosts()
+    local hosts = {}
+    if Frame.window then hosts[#hosts + 1] = Frame.window end
+    if ns.Bank and ns.Bank.window then hosts[#hosts + 1] = ns.Bank.window end
+    return hosts
+end
+
+-- Re-typeset the notice from the live lock state (called on open and on every toggle).
+function Frame.RefreshLockNotice()
+    for _, win in ipairs(Frame.LockNoticeHosts()) do Frame._refreshLockNoticeOn(win) end
+end
+
+function Frame._refreshLockNoticeOn(win)
+    local card = win and win.lockNotice
+    if not card or not card._count then return end
+    local L = ns.Locks
+    local n = (L and L.Count and L.Count()) or 0
+    card._count:SetText(n == 1 and "1 slot locked on this character."
+                                or (n .. " slots locked on this character."))
+    -- Height follows the WRAPPED body text, so a longer string can never clip and the
+    -- card never carries dead space (Frame.LOCK_NOTICE_W is fixed; the text wraps into
+    -- however many lines it needs).
+    local TITLE_ROW = 22
+    local bodyH  = (card._body and card._body:GetStringHeight()) or 24
+    local countH = card._count:GetStringHeight() or 12
+    card:SetHeight(Frame.LOCK_NOTICE_PAD * 2 + TITLE_ROW + bodyH + 4 + countH)
+end
+
+-- Subscribe to ns.Locks exactly once, from the first transition rather than from a
+-- window build. Both windows can reach the mode (the inventory glyph and the bank's
+-- Sort button), and either can be the FIRST one built in a session — wiring the listener
+-- inside one of the two builders would leave the mode silent whenever the other one won
+-- the race. Registering here means the listener exists before any transition can happen,
+-- by construction, whichever route triggered it.
+function Frame.EnsureLockWiring()
+    if Frame._lockWired then return end
+    local L = ns.Locks
+    if not (L and L.OnChange) then return end
+    Frame._lockWired = true
+    L.OnChange(function(active, reason)
+        if reason == "locks" then
+            -- Only the SET changed (a slot was toggled): refresh, do not re-announce.
+            Frame.RefreshLockNotice()
+            if ns.Items and ns.Items.RefreshLockLayer then ns.Items.RefreshLockLayer() end
+            return
+        end
+        Frame.ApplyLockMode(active, reason)
+    end)
+end
+
+-- The single entry point for "enter/leave the mode". Every route — the sort glyph's
+-- right-click, the bank Sort button's right-click, Escape, clicking the notice, closing
+-- either window, a sort starting — lands here (or on ns.Locks.Exit directly), so
+-- restoring normal item interaction has exactly ONE implementation and cannot drift.
+function Frame.SetLockMode(on)
+    local L = ns.Locks
+    if not L then return false end
+    Frame.EnsureLockWiring()
+    if on then
+        -- Only meaningful over a visible, LIVE grid: the locks are this character's and
+        -- the sort engine only ever touches this character's containers. EITHER bag
+        -- window counts — the bank's own sort control opens the same mode.
+        local anyShown = Frame.IsShown() or (ns.Bank and ns.Bank.IsShown and ns.Bank.IsShown())
+        if not anyShown then return false end
+        return L.Enter("ui")
+    end
+    return L.Exit("ui")
+end
+
+function Frame.ToggleLockMode()
+    local L = ns.Locks
+    if not L then return false end
+    if L.IsActive() then return Frame.SetLockMode(false) end
+    return Frame.SetLockMode(true)
+end
+
+-- React to a state change from ANY route (the listener registered by
+-- Frame.EnsureLockWiring calls this; nothing else should).
+function Frame.ApplyLockMode(active, reason)
+    for _, win in ipairs(Frame.LockNoticeHosts()) do
+        local card = Frame.EnsureLockNotice(win)
+        if card then
+            if active then
+                Frame._refreshLockNoticeOn(win)
+                card:Show()
+                if card.EnableKeyboard then card:EnableKeyboard(true) end
+                if card.SetPropagateKeyboardInput then card:SetPropagateKeyboardInput(true) end
+            else
+                if card.EnableKeyboard then card:EnableKeyboard(false) end
+                card:Hide()
+            end
+        end
+    end
+    -- Raise/lower the per-cell marks + click catchers on EVERY live grid (inventory,
+    -- bank and keyring alike — ns.Items sweeps its own button registry).
+    if ns.Items and ns.Items.RefreshLockLayer then ns.Items.RefreshLockLayer() end
+    if reason ~= "locks" then
+        -- 1.x played the main-menu open/close pair on entering and leaving this exact
+        -- mode (SortButton:OnLocking); keeping it means the gesture SOUNDS the same too.
+        if _G.PlaySound and _G.SOUNDKIT then
+            _G.PlaySound(active and (_G.SOUNDKIT.IG_MAINMENU_OPEN or 850)
+                                 or (_G.SOUNDKIT.IG_MAINMENU_CLOSE or 851))
+        end
+        if ns.Print then
+            if active then ns:Print("lock configuration mode ON — click slots to lock them for sorting.")
+            else ns:Print("lock configuration mode off.") end
+        end
+    end
+end
+
 -- Live combined<->split switch (D3): persist + rebuild, no reload.
 function Frame.SetLayout(mode)
     if mode ~= "combined" and mode ~= "split" then return end
@@ -2802,6 +3046,27 @@ local function testHeaderStripRoster(fails)
     ck(Frame.SearchClickAction("RightButton") == "find",   "right-click = the Find window")
     ck(Frame.SearchClickAction(nil)           == "search", "no button arg -> inline search")
     ck(Frame.SearchClickAction("MiddleButton") == "search", "any other button -> inline search")
+
+    -- The SORT glyph's two scopes (sort-locks round) — the owner's directive, pinned as
+    -- data so a later polish round cannot quietly drop the right-click.
+    ck(Frame.SortClickAction("LeftButton")   == "sort",  "left-click = run the sort")
+    ck(Frame.SortClickAction("RightButton")  == "locks", "right-click = lock config mode")
+    ck(Frame.SortClickAction(nil)            == "sort",  "no button arg -> run the sort")
+    ck(Frame.SortClickAction("MiddleButton") == "sort",  "any other button -> run the sort")
+
+    -- The mode is only enterable over a VISIBLE grid — headless / window closed, the
+    -- right-click is inert rather than putting the addon into a mode with nothing on
+    -- screen to explain it or to leave it by.
+    local L = ns.Locks
+    if L then
+        local savedMode, savedListeners = L._mode, L._listeners
+        L._mode, L._listeners = false, {}
+        ck(Frame.SetLockMode(true) == false, "the mode refuses to open with no window shown")
+        ck(L.IsActive() == false, "...and the state really did not change")
+        ck(Frame._lockWired == true, "the state listener is wired on the first transition attempt")
+        ck(Frame.SetLockMode(false) == false, "closing an already-closed mode is a no-op")
+        L._mode, L._listeners = savedMode, savedListeners
+    end
 
     -- ITEM 5: the active-bag glow ships as a CONSTANT (no new SavedVariables key), at
     -- 1.x's texture and slightly under 1.x's full-alpha intensity.

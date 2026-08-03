@@ -452,10 +452,25 @@ function Bank.Ensure()
     win._stripCells = {}
 
     -- Sort button (bank cids; needsBank). Right-pinned in the strip row.
+    --
+    -- DUAL-PURPOSE, exactly like the inventory window's sort glyph (ui_frame's
+    -- Frame.SortClickAction is the ONE seam that decides which click means what, so the
+    -- two windows can never disagree): left-click sorts the bank, RIGHT-click opens the
+    -- lock config mode. Bank slots are lockable too — they are containers the sort
+    -- engine moves items in — so the affordance has to exist on the window the owner is
+    -- actually looking at when he is at the bank.
     local sortBtn = UI.MakeButton(strip, {
         text = "Sort", width = 52,
-        onClick = function() Bank.SortBank() end,
+        onClick = function(_, button)
+            if ns.Frame and ns.Frame.SortClickAction
+               and ns.Frame.SortClickAction(button) == "locks" then
+                if ns.Frame.ToggleLockMode then ns.Frame.ToggleLockMode() end
+                return
+            end
+            Bank.SortBank()
+        end,
     })
+    if sortBtn.RegisterForClicks then sortBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
     sortBtn:SetPoint("RIGHT", strip, "RIGHT", 0, 0)
     win.sortBtn = sortBtn
 
@@ -547,6 +562,15 @@ function Bank.Ensure()
 
     win._group = nil   -- pooled ns.Items group (built on first Rebuild)
     Bank.window = win
+
+    -- LOCK CONFIG MODE: closing this window leaves the mode, exactly as closing the
+    -- inventory window does. The mode suspends normal item interaction on every live
+    -- cell, so it must never survive the window that explains it. ui_frame owns both the
+    -- state transition and the notice card; this is only the exit trigger.
+    win:SetScript("OnHide", function()
+        if ns.Frame and ns.Frame.SetLockMode then ns.Frame.SetLockMode(false) end
+    end)
+
     Bank.ApplyScale()
 
     -- Anchor the bank window offset from the inventory window if that exists, else centered.

@@ -1087,6 +1087,127 @@ local function applyDressState(button)
     Items._applyDress(button, spec)
 end
 
+----------------------------------------------------------------------
+-- SORT-LOCK CONFIG LAYER  (locks.lua; entered by right-clicking the sort glyph)
+--
+-- Two addon-owned pieces per cell, both created LAZILY the first time the mode opens,
+-- so a session that never uses the feature pays nothing:
+--
+--   _dsLockMark   an OVERLAY texture on the whole cell — the prohibition sign
+--                 (art/icon-lock-slot.tga) tinted `danger`. Shown ONLY while the mode
+--                 is open, exactly like 1.x's IgnoredOverlay (item.lua:237-240): the
+--                 mark is a configuration affordance, not a permanent cell decoration.
+--
+--   _dsLockCatch  an INSECURE Button covering the cell at a higher frame level. While
+--                 it is shown it takes every mouse event, so the secure container
+--                 button underneath receives NOTHING — no pickup, no split, no use, no
+--                 drag, no tooltip. That is how "normal item interaction is suspended"
+--                 is implemented, and it is 1.x's own trick (its shared `Item.Dummy`,
+--                 item.lua:262-266) with the hover race removed: 1.x only raised the
+--                 dummy on OnEnter, so a click on a cell the cursor was ALREADY sitting
+--                 on went to the real slot. Ours is up for every visible cell the
+--                 instant the mode opens.
+--
+-- Restoring on exit is the same code path in reverse (hide both), so there is exactly
+-- one implementation of "put the window back" and it cannot drift between the
+-- right-click / Escape / window-close exits.
+--
+-- LIVE CELLS ONLY. Locks are per-character and only mean anything for containers the
+-- sort engine can actually touch, so a cached/offline owner's grid is never editable.
+----------------------------------------------------------------------
+
+Items.TEX_LOCK_SLOT = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\icon-lock-slot"
+
+-- Every button ever created, weak-keyed so a pooled-away button is collectable.
+-- Used only to sweep the lock layer on a mode transition.
+Items._buttons = Items._buttons or setmetatable({}, { __mode = "k" })
+
+local function lockDangerRGB()
+    local UI = _G.DaseekiUI
+    if UI and UI.Color then return UI.Color("danger") end
+    return 0.85, 0.15, 0.15
+end
+
+local function lockTooltip(button)
+    local GT = _G.GameTooltip
+    if not GT or not GT.SetOwner then return end
+    local L = ns.Locks
+    local locked = L and L.IsLocked(button._cid, button._slot)
+    GT:SetOwner(button, "ANCHOR_RIGHT")
+    if GT.ClearLines then GT:ClearLines() end
+    local r, g, b = 1, 1, 1
+    local UI = _G.DaseekiUI
+    if UI and UI.Color then r, g, b = UI.Color("text") end
+    GT:SetText(locked and "Locked for sorting" or "Not locked", r, g, b)
+    local mr, mg, mb = mutedRGB()
+    if GT.AddLine then
+        GT:AddLine(locked and "A sort will never move this slot."
+                           or "A sort may move whatever is here.", mr, mg, mb, true)
+        GT:AddLine(locked and "Click to unlock." or "Click to lock.", mr, mg, mb)
+    end
+    if GT.Show then GT:Show() end
+end
+
+local function ensureLockLayer(button)
+    if button._dsLockCatch or not _G.CreateFrame then return end
+
+    local mark = button:CreateTexture(nil, "OVERLAY", nil, 6)
+    mark:SetTexture(Items.TEX_LOCK_SLOT)
+    mark:SetAllPoints(button)
+    mark:SetVertexColor(lockDangerRGB())
+    mark:Hide()
+    button._dsLockMark = mark
+
+    local catch = _G.CreateFrame("Button", nil, button)
+    catch:SetAllPoints(button)
+    if catch.SetFrameLevel then catch:SetFrameLevel((button:GetFrameLevel() or 1) + 10) end
+    if catch.RegisterForClicks then catch:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
+    catch:SetScript("OnClick", function(self)
+        local b = self:GetParent()
+        local L = ns.Locks
+        if not (L and L.ToggleSlot and b._cid and b._slot) then return end
+        local nowLocked = L.ToggleSlot(b._cid, b._slot)
+        -- The canonical checkbox pair — this IS a checkbox, one per cell. (House
+        -- pattern: named SOUNDKIT constant with the FrameXML numeric id as the guard.)
+        if _G.PlaySound and _G.SOUNDKIT then
+            _G.PlaySound(nowLocked and (_G.SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON or 856)
+                                    or (_G.SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_OFF or 857))
+        end
+        lockTooltip(b)   -- the cursor has not moved; refresh the state line under it
+    end)
+    catch:SetScript("OnEnter", function(self) lockTooltip(self:GetParent()) end)
+    catch:SetScript("OnLeave", function() if _G.GameTooltip then _G.GameTooltip:Hide() end end)
+    catch:Hide()
+    button._dsLockCatch = catch
+end
+
+-- Apply the current lock-mode state to ONE button. Idempotent; safe on any button in
+-- any state, and creates nothing while the mode is closed.
+local function applyLockLayer(button)
+    local L = ns.Locks
+    local active = (L and L.IsActive and L.IsActive()) and button._live
+                   and button._cid ~= nil and button._slot ~= nil
+    if not active then
+        if button._dsLockMark then button._dsLockMark:Hide() end
+        if button._dsLockCatch then button._dsLockCatch:Hide() end
+        return
+    end
+    ensureLockLayer(button)
+    if not button._dsLockCatch then return end   -- headless
+    button._dsLockMark:SetVertexColor(lockDangerRGB())
+    button._dsLockMark:SetShown(L.IsLocked(button._cid, button._slot))
+    button._dsLockCatch:Show()
+end
+Items._applyLockLayer = applyLockLayer
+
+-- Sweep every live button. Called on a lock-mode transition and whenever the lock SET
+-- changes, so entering/leaving the mode is a single call from ui_frame.
+function Items.RefreshLockLayer()
+    for b in pairs(Items._buttons) do
+        if b.IsObjectType or b._live ~= nil then applyLockLayer(b) end
+    end
+end
+
 -- LIVE fact behind 1.x's glowPoor gate (item.lua:222 `not self.info.hasNoValue`): a poor
 -- item a vendor will not buy carries no coin. Only the live container API knows it; a
 -- cached/offline slot returns nil, which reads as "has value" â€” exactly what 1.x's cached
@@ -1561,6 +1682,9 @@ local function paintButton(button)
         -- carry a stale bang/gold tint from the item that used to sit here.
         button._questItem, button._questStarter = false, false
         applyDressState(button)   -- icon alpha/desat, hides markers + junk coin, cascades alpha
+        -- An EMPTY cell still carries its lock: the lock belongs to the SLOT, and an
+        -- empty locked slot is exactly the case the sort planner must refuse to fill.
+        applyLockLayer(button)
         return
     end
 
@@ -1610,6 +1734,10 @@ local function paintButton(button)
         button._pendingId = nil
     end
     applyDressState(button)
+    -- Re-assert the lock layer on every paint: a relayout recycles buttons across
+    -- (cid, slot) pairs, so the mark has to follow the SLOT, not the frame. With the
+    -- mode closed this is a two-field test and no allocation.
+    applyLockLayer(button)
 end
 
 local function showCachedTooltip(button)
@@ -1647,6 +1775,7 @@ function Items.CreateButton(parent, opts)
     local template = live and "ContainerFrameItemButtonTemplate" or "ItemButtonTemplate"
     local button = _G.CreateFrame("Button", nextButtonName(), parent, template)
     button._live = live
+    Items._buttons[button] = true   -- weak registry; only the lock-layer sweep reads it
     local cell = Items.ClampCell(opts.size)
     button:SetSize(cell, cell)
     button._dsRepaint = function(self) paintButton(self) end
@@ -1695,6 +1824,10 @@ function Items.CreateButton(parent, opts)
         if ns.Borders then ns.Borders.Apply(self, nil) end
         if self._dsNewDot then self._dsNewDot:Hide() end
         if self._dsQuestTab then self._dsQuestTab:Hide() end
+        -- A cleared button no longer stands for any slot, so its lock affordance must
+        -- go with it (the catcher especially: it must never outlive its (cid, slot)).
+        if self._dsLockMark then self._dsLockMark:Hide() end
+        if self._dsLockCatch then self._dsLockCatch:Hide() end
         self:Hide()
     end
     return button
@@ -2853,6 +2986,83 @@ local function testSlotSubstrate(fails)
         "a dimmed EMPTY cell composes both alphas")
 end
 
+-- SORT-LOCK CELL LAYER: the mark follows the LOCK, the catcher follows the MODE, and a
+-- cached (non-live) cell is never made editable. Driven with fake regions — the real
+-- ones are created by CreateFrame, which the headless harness deliberately does not
+-- stub, so the layer's DECISIONS are what is asserted here (the creation itself is a
+-- three-line CreateFrame body verified in-game).
+local function testLockLayer(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local L = ns.Locks
+    if not L then fails[#fails + 1] = "ns.Locks missing (load order changed?)"; return end
+
+    local function region()
+        local r = { shown = false }
+        function r:Show() self.shown = true end
+        function r:Hide() self.shown = false end
+        function r:SetShown(v) self.shown = v and true or false end
+        function r:IsShown() return self.shown end
+        function r:SetVertexColor() end
+        return r
+    end
+    local function fakeButton(live, cid, slot)
+        return { _live = live, _cid = cid, _slot = slot,
+                 _dsLockMark = region(), _dsLockCatch = region() }
+    end
+
+    -- Isolate the store + the mode.
+    local savedDB, savedSelf, savedMode = ns.Store.db, L._self, L._mode
+    ns.Store.db = {}
+    L.SetCharacter("Tester-TestRealm")
+    L._mode = false
+
+    local locked   = fakeButton(true, 0, 3)
+    local unlocked = fakeButton(true, 0, 4)
+    local cached   = fakeButton(false, 0, 5)
+    L.SetLocked(0, 3, true)
+
+    -- MODE OFF: nothing on screen, whatever the lock state says.
+    for _, b in ipairs({ locked, unlocked, cached }) do Items._applyLockLayer(b) end
+    ck(locked._dsLockMark.shown == false, "mode off: no mark even on a locked slot")
+    ck(locked._dsLockCatch.shown == false, "mode off: no click catcher (items stay interactive)")
+
+    -- MODE ON: catchers up everywhere LIVE; the mark only where the slot is locked.
+    L._mode = true
+    for _, b in ipairs({ locked, unlocked, cached }) do Items._applyLockLayer(b) end
+    ck(locked._dsLockMark.shown == true, "mode on: the locked slot wears the mark")
+    ck(locked._dsLockCatch.shown == true, "mode on: the locked slot takes clicks")
+    ck(unlocked._dsLockMark.shown == false, "mode on: an unlocked slot wears no mark")
+    ck(unlocked._dsLockCatch.shown == true, "mode on: an unlocked slot still takes clicks")
+    ck(cached._dsLockCatch.shown == false, "a CACHED (offline-owner) cell is never editable")
+    ck(cached._dsLockMark.shown == false, "a CACHED cell never wears the mark")
+
+    -- A slot toggled while the mode is open repaints to the new state.
+    L.SetLocked(0, 4, true)
+    Items._applyLockLayer(unlocked)
+    ck(unlocked._dsLockMark.shown == true, "locking a slot lights its mark")
+    L.SetLocked(0, 4, false)
+    Items._applyLockLayer(unlocked)
+    ck(unlocked._dsLockMark.shown == false, "unlocking a slot clears its mark")
+
+    -- A button with no slot identity (pooled/cleared) is inert, not crashy.
+    local orphan = fakeButton(true, nil, nil)
+    Items._applyLockLayer(orphan)
+    ck(orphan._dsLockCatch.shown == false, "a button with no (cid, slot) never takes clicks")
+
+    -- EXIT restores every cell in one pass — the "restore fully on exit" contract.
+    L._mode = false
+    Items._applyLockLayer(locked); Items._applyLockLayer(unlocked)
+    ck(locked._dsLockMark.shown == false and locked._dsLockCatch.shown == false,
+       "leaving the mode hides the mark AND releases the click catcher")
+    ck(unlocked._dsLockCatch.shown == false, "...on every cell, not just the locked ones")
+
+    -- The art is a real shipped path, not a colour fill (same rule as Items.MarkerArt).
+    ck(type(Items.TEX_LOCK_SLOT) == "string" and Items.TEX_LOCK_SLOT:find("icon%-lock%-slot"),
+       "the lock mark is the shipped prohibition-sign texture")
+
+    ns.Store.db, L._self, L._mode = savedDB, savedSelf, savedMode
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -2874,6 +3084,7 @@ function Items.RunSelfTests(verbose)
         { name = "click-identity matrix",  fn = testClickIdentityMatrix },
         { name = "set membership (Armory)", fn = testSetMembership },
         { name = "slot substrate (1.x profile)", fn = testSlotSubstrate },
+        { name = "sort-lock cell layer", fn = testLockLayer },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Right-click the sort button to lock bag slots, exactly like Bags 1.** This is the
+  feature that had not been carried over yet. Right-clicking the sort glyph puts the
+  window into a **lock configuration mode**: a notice appears above the window explaining
+  it, and while you are in it every slot click *locks or unlocks that slot* instead of
+  picking the item up. A locked slot wears a red prohibition sign, and the sort will never
+  move anything into it or out of it. Right-click the sort glyph again, press **Escape**,
+  click the notice, or just close the window to finish — normal clicking comes straight
+  back. The notice keeps a running count of how many slots you have locked.
+  - **It works at the bank too.** Right-clicking the bank window's Sort button opens the
+    same mode, and bank slots, bag slots and keyring slots are all lockable.
+  - **The locks you already have came with you.** Your Bags 1 locks were read out of the
+    old saved data and carried over automatically the first time this version loads —
+    Poonyx's four locked slots and Shalk's nine are already there. Nothing was taken from
+    the old file; it is only read.
+  - **Locks are per character**, exactly as they were in Bags 1, and they are remembered
+    between sessions. No new setting appeared in the options, and no other setting changed.
+  - **Sorting in combat behaves exactly as it did before.** Locking is a configuration
+    mode, not a sort, so none of the combat rules around sorting changed.
+
 - **The quality glow fades inward over the icon again, instead of reading as a hard
   border.** Side by side against Bags 1 the shape was right but the balance was not: a
   glowing slot in Bags 2 was mostly a crisp coloured rim, where Bags 1 washes colour over

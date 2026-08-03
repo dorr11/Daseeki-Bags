@@ -274,7 +274,12 @@ ns:RegisterEvent("PLAYER_LOGIN", function()
             -- false — self bags would render inert and the bag-slot strip never becomes
             -- manageable. Canonicalize through Store.MakeNameRealm(name, spaceStripped).
             local realm = ((GetRealmName() or ""):gsub("%s+", ""))
-            ns.Items.SetSelf(ns.Store.MakeNameRealm(UnitName("player"), realm))
+            local key = ns.Store.MakeNameRealm(UnitName("player"), realm)
+            ns.Items.SetSelf(key)
+            -- SORT LOCKS are per-character and keyed by the SAME canonical string, for
+            -- the same reason: a mismatch here would silently read an empty lock set on
+            -- any spaced-realm character and quietly sort slots the owner locked.
+            if ns.Locks and ns.Locks.SetCharacter then ns.Locks.SetCharacter(key) end
         end)
     end
     -- Player class token drives the item-usability (proficiency) desaturation.
