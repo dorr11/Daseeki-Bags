@@ -222,8 +222,20 @@ end
 --   Daseeki-Bags/core/classes/item.lua:56   :SetBlendMode('ADD')
 --   Daseeki-Bags/core/classes/item.lua:57   :SetPoint('CENTER')          -- NO (0,1) offset
 --   Daseeki-Bags/core/classes/item.lua:58   :SetSize(67, 67)             -- 67, not 68
---   Daseeki-Bags/core/api/settings.lua:34   glowAlpha = 0.5              -- 0.5, not 0.49
+--   Daseeki-Bags/core/api/settings.lua:34   glowAlpha = 0.5              -- the DEFAULT, superseded
+--   WTF/Account/309992577#1/SavedVariables/Daseeki-Bags.lua:3621  ["glowAlpha"] = 0.77
 --   Daseeki-Bags/core/classes/item.lua:208  IconGlow:SetVertexColor(r,g,b, Addon.sets.glowAlpha)
+--
+-- ALPHA IS AN OWNER-PROFILE ROW, NOT A DEFAULT ROW (this is the release-blocking fix).
+-- glowAlpha is the ONE glow parameter 1.x exposes as a slider, and the owner moved it years
+-- ago: his LIVE account-level value is 0.77 (account #1, his main; #2 and #3 are 0.87).
+-- Shipping 1.x's untouched default of 0.5 made the additive wash faint enough that the crisp
+-- IconBorder ring dominated the cell — his verdict side by side was "in bags 1 the glow sort
+-- of fades inward on the item slot, and bags 2 is just a hard border mostly". Nothing about
+-- the RING changed; the wash was simply 35% too weak to be the primary cue. 0.77 is the spec.
+-- This follows the precedent already set for slotBackground / slotAlpha / slotBorderColor in
+-- ui_items and parity.lua: where the owner deliberately moved a 1.x setting, HIS value is the
+-- 2.0 constant, not 1.x's shipped default.
 --
 -- and the 37 the ratios are taken against is the item button's own side length: 1.x never
 -- resizes the button, it leaves ContainerFrameItemButtonTemplate at its native 37 and
@@ -242,20 +254,17 @@ end
 -- density it reproduces the same halo PROPORTION, so every density reads like a scaled 1.x.
 --
 -- These ship as CONSTANTS, not settings — no new SavedVariables key. 1.x exposes glowAlpha
--- as a slider; we pin its default (0.5) as our one value.
+-- as a slider; we pin the OWNER'S OWN slider position (0.77) as our one value.
 --
--- SIBLING-CONTRACT DRIFT, DELIBERATE: Daseeki-Armory's borders.lua still carries the SPEC
--- numbers (68/37, 0.49, (0,1)). Armory serves the EQUIPPED-slot surface, where the spec's
--- every-quality rule (§3) also applies and where there is no 1.x Daseeki-Bags counterpart
--- to transcribe. The two files are no longer byte-identical and the Bags harness no longer
--- claims they are. If the owner wants the character window to match the bag grid, Armory
--- should be trued up to THIS block, not the other way round.
+-- SIBLING CONTRACT: Daseeki-Armory's borders.lua carries this same GLOW_ALPHA and is trued
+-- to this block. (It once carried the SPEC numbers; that drift is closed. Armory still owns
+-- the equipped-surface EVERY-QUALITY floor, which is a gating row, not a look row.)
 ----------------------------------------------------------------------
 Borders.GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"  -- 1.x item.lua:55
 Borders.GLOW_REF_BUTTON = 37        -- 1.x: the template item button, never resized
 Borders.GLOW_SCALE      = 67 / 37   -- 1.x item.lua:58  SetSize(67, 67)
 Borders.GLOW_SCALE_AMMO = 58 / 37   -- CII §2 Ammo exception; Bags has no ammo cell (dormant)
-Borders.GLOW_ALPHA      = 0.5       -- 1.x core/api/settings.lua:34  glowAlpha = 0.5
+Borders.GLOW_ALPHA      = 0.77      -- owner profile glowAlpha, account #1 (1.x default 0.5 superseded)
 Borders.GLOW_OFFSET_Y_SCALE = 0     -- 1.x item.lua:57  SetPoint('CENTER') — no offset
 Borders.GLOW_LAYER      = "OVERLAY" -- 1.x item.lua:54
 Borders.GLOW_SUBLEVEL   = -1        -- 1.x item.lua:54 — BELOW the button's other OVERLAY art
@@ -476,6 +485,34 @@ end
 -- unanchored coloured bloom spilling into the gutters — which is the "cluttered" half of
 -- the owner's report. ui_items calls SetItemButtonQuality (as 1.x does) so Blizzard sets
 -- the region's own art; we only override color + shown, so no texture path is guessed here.
+--
+-- RING-vs-WASH VERDICT (the "hard border" investigation - DO NOT dim this ring).
+--
+-- Q1: does 1.x render the IconBorder at FULL alpha, or does it alpha-scale it like the halo?
+--     FULL. 1.x applies glowAlpha to the HALO ONLY:
+--       Daseeki-Bags/core/classes/item.lua:208  IconGlow:SetVertexColor(r,g,b, sets.glowAlpha)
+--       Daseeki-Bags/core/classes/item.lua:210  IconBorder:SetVertexColor(r,g,b)   -- 3 args
+--       Daseeki-Bags/core/classes/item.lua:220  IconBorder:SetShown(r)             -- no SetAlpha
+--     A 3-arg SetVertexColor leaves vertex alpha at 1, and 1.x never calls SetAlpha on the
+--     region, so the template's own alpha (1) stands. Nothing in Daseeki-Bags/skin/ touches
+--     IconBorder either (grep-verified over the whole 1.x tree: its ONLY IconBorder lines are
+--     :210 and :220). 2.0 below is therefore AT PARITY, not brighter - same 3-arg vertex
+--     color, plus an explicit SetAlpha(1) that merely restates the region default.
+--     => the ring is LEFT EXACTLY AS IS. The imbalance was 100% on the wash side.
+--
+-- Q2: does the region even EXIST on Classic Era 1.15.9 - i.e. is 1.x's SetShown a silent
+--     no-op, making 1.x's on-screen cue the wash ALONE? No. It exists. Evidence:
+--       (a) 1.x drives sibling parentKeys of the SAME modern ItemButtonTemplate with NO nil
+--           guard on paths that run for every button: item.lua:48 BattlepayItemTexture:Hide(),
+--           :49 NewItemTexture:Hide() (Construct), :220 IconBorder:SetShown and :222
+--           JunkIcon:SetShown (unconditional, every UpdateBorder). On the OLD template those
+--           are nil and 1.x would throw "attempt to index field ... (a nil value)" on every
+--           cell, so the bags would not render at all. They render - the owner runs 1.x as
+--           his live bags on 1.15.9.
+--       (b) wow-api-catalog/1.15.9.68808/globals.txt:7538 - SetItemButtonQuality is present in
+--           the Era client's _G, and driving button.IconBorder is that helper's entire job.
+--     So 1.x and 2.0 both draw ring + wash. Defaulting our ring off would have DELETED half
+--     of 1.x's cue, not matched it.
 --
 -- SECURE / TAINT: SetVertexColor / SetShown on a CHILD region of the button. Not protected.
 function Borders.SetIconBorder(button, r, g, bl)
@@ -781,7 +818,8 @@ local function testGlowGeometry(fails)
         "1.x item.lua:55 glow texture")
     ck(Borders.GLOW_REF_BUTTON == 37, "1.x reference button is the template's own 37px")
     ck(near(Borders.GLOW_SCALE, 67 / 37), "1.x item.lua:58 SetSize(67,67) on a 37px button")
-    ck(Borders.GLOW_ALPHA == 0.5, "1.x settings.lua:34 glowAlpha = 0.5, uniform on every tint")
+    ck(Borders.GLOW_ALPHA == 0.77,
+        "owner profile glowAlpha 0.77 (WTF account #1), uniform on every tint")
     ck(Borders.GLOW_OFFSET_Y_SCALE == 0, "1.x item.lua:57 SetPoint('CENTER') — no offset")
     ck(Borders.GLOW_LAYER == "OVERLAY", "1.x item.lua:54 OVERLAY layer")
     ck(Borders.GLOW_SUBLEVEL == -1, "1.x item.lua:54 sublevel -1 (below the button's own overlay art)")
@@ -790,6 +828,12 @@ local function testGlowGeometry(fails)
     -- If any of them comes back, the glow is no longer the owner's target.
     ck(not near(Borders.GLOW_SCALE, 68 / 37), "NOT the spec's 68/37")
     ck(Borders.GLOW_ALPHA ~= 0.49, "NOT the spec's 0.49")
+    -- ...and the release-blocking regression lock: 1.x's UNTOUCHED slider DEFAULT is not the
+    -- owner's look. At 0.5 the wash is faint enough that the crisp IconBorder ring dominates
+    -- and the cell reads as "just a hard border". Superseded by his live value.
+    ck(Borders.GLOW_ALPHA ~= 0.5, "NOT 1.x's untouched default 0.5 (superseded by the profile)")
+    ck(Borders.GLOW_ALPHA > 0.5, "the wash is the PRIMARY cue, stronger than the 1.x default")
+    ck(Borders.GLOW_ALPHA < 1, "...and still a wash, not an opaque fill")
     ck(not near(Borders.GLOW_OFFSET_Y_SCALE, 1 / 37), "NOT the spec's (0,1) nudge")
     ck(Borders.GLOW_SUBLEVEL ~= nil, "NOT the spec's plain-OVERLAY (no sublevel)")
 
@@ -878,6 +922,15 @@ local function testIconBorderParity(fails)
     Borders.Apply(rare, 3)
     ck(rare.IconBorder.shown == true and rare.IconBorder.alpha == 1, "rarity -> IconBorder shown")
     ck(near(rare.IconBorder.r, FALLBACK[3][1]), "…tinted the rarity color, not Blizzard's own")
+    -- RING-vs-WASH LOCK. 1.x applies glowAlpha to the HALO only (item.lua:208); the ring is a
+    -- 3-arg SetVertexColor (item.lua:210) with no SetAlpha anywhere, so it renders at FULL
+    -- alpha. If a future round ever "balances" the cell by dimming the ring toward
+    -- GLOW_ALPHA, that is a divergence from 1.x, not a match to it — fail here first.
+    ck(rare.IconBorder.alpha == 1 and rare.IconBorder.alpha ~= Borders.GLOW_ALPHA,
+        "the ring is FULL alpha, never scaled by glowAlpha (1.x item.lua:210 vs :208)")
+    -- ...and it carries the tint UNDIMMED: same rgb as the halo, no intensity applied.
+    ck(near(rare.IconBorder.g, FALLBACK[3][2]) and near(rare.IconBorder.b, FALLBACK[3][3]),
+        "…full-saturation tint on the ring, identical to the halo's")
 
     local questCell = fakeCell()
     Borders.Apply(questCell, 1, false, true)                 -- quest gold beats the floor
@@ -941,6 +994,145 @@ local function testIconBorderParity(fails)
     Store.db = saved
 end
 
+-- HALO ANATOMY / LAYERING — the third half of the balance question.
+--
+-- The wash has to FADE INWARD over the icon edge. That is UI-ActionButton-Border's own inner
+-- falloff, and it only reads that way if the halo is (a) additive, (b) larger than the cell so
+-- its bright annulus lands ON the icon rather than around it, and (c) drawn OVER the ARTWORK
+-- icon with nothing opaque in between. Attach/showGlow are the frame layer, so they normally
+-- go untested headless (no _G.CreateFrame). This suite installs a RECORDING CreateFrame stub
+-- for the duration and asserts the built structure against 1.x's:
+--
+--   Daseeki-Bags/core/classes/item.lua:54-58  IconGlow = CreateTexture(nil,'OVERLAY',nil,-1)
+--                                             ADD blend, CENTER (no offset), 67 on a 37 button
+--
+-- LAYER ORDERING, stated plainly because it is the row that decides ring-vs-wash: 1.x's halo
+-- is a texture ON the button at OVERLAY(-1), i.e. UNDER the button's own OVERLAY(0) art —
+-- the IconBorder ring, the count numeral, the quest bang. 2.0 puts the halo on a child
+-- CONTAINER frame instead (it carries the search-dim cascade), and pins that container to the
+-- HOST BUTTON'S OWN frame level. Same level + OVERLAY(-1) reproduces 1.x's ordering: the
+-- renderer sorts by strata, then level, then layer, then sublevel, so at equal levels the
+-- halo's -1 still sorts under the button's 0. The level pin is therefore load-bearing and is
+-- asserted below — a container at level+1 would float the wash over the ring and the bang.
+local function testGlowAnatomy(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return a and b and math.abs(a - b) < 1e-6 end
+
+    local function newTexture(layer, sublevel)
+        local t = { layer = layer, sublevel = sublevel, shown = false, points = {} }
+        function t:SetTexture(p) self.texture = p end
+        function t:SetBlendMode(m) self.blend = m end
+        function t:SetSize(w, h) self.w, self.h = w, h end
+        function t:SetPoint(p, rel, rp, x, y)
+            self.points[#self.points + 1] = { p, rel, rp, x, y }
+            self.anchor, self.relTo, self.ox, self.oy = p, rel, x, y
+        end
+        function t:ClearAllPoints() self.points = {} end
+        function t:SetVertexColor(r, g, b, a) self.r, self.g, self.b, self.a = r, g, b, a end
+        function t:SetAlpha(a) self.alpha = a end
+        function t:Show() self.shown = true end
+        function t:Hide() self.shown = false end
+        return t
+    end
+
+    local function newFrame(_, _, parent)
+        local f = { parent = parent, level = 1, alpha = 1, shown = false, textures = {},
+                    scripts = {}, events = {} }
+        function f:SetPoint() end
+        function f:SetFrameLevel(l) self.level = l end
+        function f:GetFrameLevel() return self.level end
+        function f:SetAlpha(a) self.alpha = a end
+        function f:Show() self.shown = true end
+        function f:Hide() self.shown = false end
+        function f:SetScript(k, fn) self.scripts[k] = fn end
+        function f:RegisterEvent(e) self.events[e] = true end
+        function f:CreateTexture(_, layer, _, sublevel)
+            local t = newTexture(layer, sublevel)
+            self.textures[#self.textures + 1] = t
+            return t
+        end
+        return f
+    end
+
+    local savedCF, savedDb = _G.CreateFrame, Store.db
+    _G.CreateFrame = newFrame
+    Store.db = { qualityBorders = true }
+
+    local okRun, err = pcall(function()
+        -- A 37px host button: 1.x's own cell size, so the ratios must land on 1.x's literals.
+        local ib = { alpha = 0, shown = false }
+        function ib:SetVertexColor(r, g, b) self.r, self.g, self.b = r, g, b end
+        function ib:SetAlpha(a) self.alpha = a end
+        function ib:Show() self.shown = true end
+        function ib:Hide() self.shown = false end
+        local button = { IconBorder = ib, level = 7 }
+        function button:GetWidth() return 37 end
+        function button:GetFrameLevel() return self.level end
+
+        Borders.Apply(button, 3)                       -- a rare item: halo + ring
+        local c = button._dsBagsBorder
+        ck(c ~= nil, "Attach builds the halo container when CreateFrame exists")
+        if not c then return end
+
+        -- LAYER PIN: same frame level as the host button (see the block above).
+        ck(c:GetFrameLevel() == button:GetFrameLevel(),
+            "container sits at the HOST BUTTON'S own frame level, never above it")
+
+        -- Exactly ONE texture in the container: the halo. Nothing else may be drawn between
+        -- the ARTWORK icon and the wash — an extra opaque region here is what would flatten
+        -- the inward falloff into a rim.
+        ck(#c.textures == 1, "the container holds exactly one region: the halo")
+        local glow = c.textures[1]
+        ck(glow == c._glow, "…and it is the halo Attach cached")
+
+        -- 1.x item.lua:54-56 anatomy.
+        ck(glow.layer == Borders.GLOW_LAYER and glow.layer == "OVERLAY", "halo is OVERLAY")
+        ck(glow.sublevel == Borders.GLOW_SUBLEVEL and glow.sublevel == -1,
+            "…at sublevel -1, UNDER the button's own OVERLAY art (ring / count / bang)")
+        ck(glow.texture == Borders.GLOW_TEXTURE, "…the UI-ActionButton-Border art (1.x item.lua:55)")
+        ck(glow.blend == "ADD", "…additive, so it WASHES the icon instead of covering it")
+
+        -- 1.x item.lua:57-58 geometry, at 1.x's own 37px cell.
+        ck(near(glow.w, 67) and near(glow.h, 67), "37px cell -> 1.x's literal 67x67 halo")
+        ck(glow.w > 37, "the halo overhangs the cell, so its bright ring lands ON the icon")
+        ck(glow.anchor == "CENTER" and near(glow.oy or 0, 0), "CENTER anchor, no offset")
+
+        -- THE BALANCE ROW: the painted alpha is the owner's profile value, not 1.x's default.
+        ck(near(glow.a, Borders.GLOW_ALPHA), "the halo is painted at GLOW_ALPHA")
+        ck(near(glow.a, 0.77), "…which is the owner's 0.77, not 1.x's untouched 0.5")
+        ck(glow.shown == true and c.shown == true, "a rare cell's wash is shown")
+        ck(c.alpha == 1, "…at full container alpha (no stale search-dim carried in)")
+
+        -- ...and the RING under it is untouched by that alpha (1.x item.lua:210, 3-arg).
+        ck(ib.shown == true and ib.alpha == 1, "the ring stays FULL alpha beside a 0.77 wash")
+
+        -- Search-dim cascade still recedes the whole cue together, then restores on repaint.
+        Borders.SetAlpha(button, 0.3)
+        ck(near(c.alpha, 0.3), "search-dim recedes the halo container")
+        Borders.Apply(button, 4)
+        ck(c.alpha == 1, "…and the next paint clears the dim")
+
+        -- Below the floor: wash off AND ring off, one verdict.
+        Borders.Apply(button, 1)
+        ck(c.shown == false and ib.shown == false, "common -> no wash, no ring")
+
+        -- Density: a bigger cell scales the halo by the same 67/37 proportion.
+        function button:GetWidth() return 74 end
+        Borders.Apply(button, 4)
+        ck(near(c._glow.w, 134), "a doubled cell doubles the halo (proportion held)")
+
+        -- Attach is idempotent: a repaint never builds a second halo (C rule 1).
+        local before = #c.textures
+        Borders.Attach(button); Borders.Apply(button, 5)
+        ck(button._dsBagsBorder == c and #c.textures == before,
+            "Attach is idempotent — one halo per cell, baked at creation")
+    end)
+    ck(okRun, "glow anatomy stub run: " .. tostring(err))
+
+    _G.CreateFrame = savedCF
+    Store.db = savedDb
+end
+
 -- The glow decision is ONE decision: ResolveTint drives both the halo and the template
 -- IconBorder, and it must reproduce 1.x's UpdateBorder precedence exactly
 -- (item.lua:197-205 — quest > unusable > set > rarity).
@@ -988,6 +1180,7 @@ function Borders.RunSelfTests(verbose)
         { name = "spec colors + bag gate",  fn = testSpecColorsAndBagGate },
         { name = "resolve-tint precedence", fn = testResolveTintPrecedence },
         { name = "icon-border parity",      fn = testIconBorderParity },
+        { name = "glow anatomy (layering)", fn = testGlowAnatomy },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "min-quality + unusable", fn = testMinQualityConfig },

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **The quality glow fades inward over the icon again, instead of reading as a hard
+  border.** Side by side against Bags 1 the shape was right but the balance was not: a
+  glowing slot in Bags 2 was mostly a crisp coloured rim, where Bags 1 washes colour over
+  the edge of the icon and lets it fall away inward. The cause was one number. Bags 1 puts
+  the strength of that wash on a slider, and yours has been at **0.77** for years — Bags 2
+  had been shipping the slider's untouched factory value of 0.5. At 0.5 the soft wash is
+  faint enough that the crisp ring hugging the icon out-shouts it, which is exactly the
+  "just a hard border" you were seeing. Bags 2 now ships **your** value, so the wash is the
+  loud half of the cue and the ring is the quiet half, in the proportion you have been
+  looking at all along.
+  - **The ring itself was not touched, deliberately.** Bags 1 draws the same ring, at full
+    strength — it only ever applies the slider to the wash, never to the ring. The ring is
+    what pins the soft halo to its own slot; without it the colour reads as an unanchored
+    bloom drifting into the gaps. It stays exactly as it was.
+  - Nothing here is a new setting, and nothing you had configured changed.
+
 - **The bottom of the bag window is a proper footer now.** It used to be a money strip
   with a slot count floating near it; it is now one row with three zones — controls on
   the left, the free/total count in the middle, your gold on the right — and everything

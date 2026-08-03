@@ -61,7 +61,16 @@ Parity.ONE_X = {
     GLOW_LAYER    = "OVERLAY",  -- :54
     GLOW_SUBLEVEL = -1,      -- :54  CreateTexture(nil, 'OVERLAY', nil, -1)
     GLOW_OFFSET_Y = 0,       -- :57  SetPoint('CENTER') with no offset
-    GLOW_ALPHA    = 0.5,     -- core/api/settings.lua:34  glowAlpha = 0.5
+    -- ALPHA IS AN OWNER-PROFILE ROW, exactly like EMPTY_BACKGROUND / EMPTY_ALPHA /
+    -- SLOT_BORDER_COLOR below: glowAlpha is the one glow parameter 1.x exposes as a slider
+    -- (config/panels/slotOptions.lua:70) and the owner moved it off the default years ago.
+    --   core/api/settings.lua:34                              glowAlpha = 0.5   -- the DEFAULT
+    --   WTF .../309992577#1/SavedVariables/Daseeki-Bags.lua:3621  ["glowAlpha"] = 0.77  -- HIS
+    -- Accounts #2 and #3 read 0.87; #1 is his main and is the spec. Shipping the 0.5 default
+    -- is what made 2.0 read as "just a hard border": the wash was too faint to out-read the
+    -- IconBorder ring, which both versions draw at full alpha.
+    GLOW_ALPHA    = 0.77,    -- owner profile glowAlpha, account #1
+    GLOW_ALPHA_1X_DEFAULT = 0.5,  -- core/api/settings.lua:34, superseded by the profile
 
     -- Tint chain (core/classes/item.lua:197-205), top down
     TINT_ORDER    = { "quest", "unusable", "set", "quality" },
@@ -298,7 +307,11 @@ local function testGlowRow(fails)
 
     ck(B.GLOW_TEXTURE == X.GLOW_TEXTURE, "glow texture == 1.x item.lua:55")
     ck(approx(B.GlowSize(X.BUTTON_SIZE), X.GLOW_SIZE), "a 37px cell yields 1.x's literal 67px halo")
-    ck(B.GLOW_ALPHA == X.GLOW_ALPHA, "glow alpha == 1.x settings.lua:34 (0.5)")
+    ck(B.GLOW_ALPHA == X.GLOW_ALPHA, "glow alpha == owner profile glowAlpha, account #1 (0.77)")
+    ck(B.GLOW_ALPHA ~= X.GLOW_ALPHA_1X_DEFAULT,
+        "…and NOT 1.x's untouched settings.lua:34 default (0.5), which read as a hard border")
+    ck(X.GLOW_ALPHA > X.GLOW_ALPHA_1X_DEFAULT and X.GLOW_ALPHA < 1,
+        "…a stronger wash than the default, still short of opaque")
     ck(B.GlowOffsetY(X.BUTTON_SIZE) == X.GLOW_OFFSET_Y, "glow offset == 1.x item.lua:57 (none)")
     ck(B.GLOW_LAYER == X.GLOW_LAYER, "glow layer == 1.x item.lua:54 (OVERLAY)")
     ck(B.GLOW_SUBLEVEL == X.GLOW_SUBLEVEL, "glow sublevel == 1.x item.lua:54 (-1)")
