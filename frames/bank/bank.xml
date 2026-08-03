@@ -1,7 +1,0 @@
-<Ui>
-	<Script file="bankBag.lua"/>
-	<Script file="accountMoney.lua"/>
-	<Script file="depositButton.lua"/>
-
-	<Script file="bank.lua"/>
-</Ui>

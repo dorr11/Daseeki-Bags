@@ -1,6 +1,16 @@
+# package-as MUST stay Daseeki-Bags: the folder name is the addon's identity. It is what
+# names the SavedVariables file (WTF/.../SavedVariables/Daseeki-Bags.lua), what the client
+# matches the .toc against, and what makes the 2.0 cutover an in-place upgrade instead of a
+# second addon. Release-gate C.11. Do not "modernise" it to Daseeki-Bags2.
 package-as: Daseeki-Bags
 license-output: LICENSE
 ignore:
   - README.md
   - CHANGELOG.md
   - .github
+  # Developer tooling: never shipped to users. harness/ carries the self-test runner, its
+  # 1.x fixtures and a probe that walks the machine's AddOns folder; dev/ regenerates the
+  # icon art. Both were harmless while 2.0 only ever reached the game through a local
+  # junction; 2.0.0 is the first PACKAGED release of this tree, so they are excluded here.
+  - harness
+  - dev
