@@ -1049,6 +1049,13 @@ Items._installArtHooks = installArtHooks
 -- Set a cell's BACKING state: empty -> `inset` sunken well; filled -> `raised` card. The
 -- raised fill lifts a held item onto a subtle card (depth the flat beta lacked — the "dull"
 -- fix) while empties stay dead-calm recessed drop targets. Pure texture recolor.
+--
+-- COLOR ONLY — never touch the well's region ALPHA here. That channel belongs to
+-- borders.lua's WELL YIELD (Borders.SetWellAlpha): a glowing cell parks its well at 0 so
+-- the halo owns the cell edge, and this recolor runs AFTER Borders.Apply on every paint.
+-- SetColorTexture writes the TEXTURE color and SetAlpha the REGION alpha — independent
+-- multipliers — so the two are order-independent today. A SetAlpha(1) added here would
+-- silently resurrect the grey square under every halo.
 local function setWellState(button, filled)
     if not button._dsWell then return end
     button._dsWell:SetColorTexture(tokenRGB(filled and "raised" or "inset"))
@@ -1108,6 +1115,10 @@ local function ensureDress(button)
     well:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", -1, 1)
     well:SetColorTexture(tokenRGB("inset"))
     button._dsWell = well
+    -- The well's REGION ALPHA is borders.lua's channel (WELL YIELD): it drops to 0 while
+    -- this cell's quality halo is shown, so the soft glow owns the cell edge instead of
+    -- fighting a hard grey square, and returns to 1 the moment the halo hides. Nothing in
+    -- this file may SetAlpha the well — see setWellState's note.
 
     -- 1.0-PARITY (grey-border fix): NO universal neutral cell hairline. 1.x draws no ring on
     -- common/poor items or empties — the cell reads from its dark inset/raised WELL + the 2px
@@ -2112,6 +2123,23 @@ local function testCellBorderMatrix(fails)
     local ur = select(1, ns.Borders.UnusableRGB())
     local _, ug = ns.Borders.UnusableRGB()
     ck(g > ug and ur >= r - 1e-9, "quest gold separates from the unusable red by the green channel")
+
+    -- CROSS-CHECK against borders.lua's ResolveTint, which is the single decision the halo
+    -- AND the well yield both key off. "This cell carries a ring" and "this cell glows" must
+    -- be the same predicate, or a cell could suppress its well without glowing (or glow with
+    -- its grey well still up — the defect this lock exists to prevent).
+    for _, c in ipairs({
+        { nil, false, true, 2, false }, { 0, false, true, 2, false }, { 1, false, true, 2, false },
+        { 2, false, true, 2, false },   { 4, false, true, 2, false }, { 4, true,  true, 2, false },
+        { 1, false, true, 2, true },    { 4, true,  true, 2, true },  { 4, true,  false, 2, true },
+        { 2, false, true, 3, false },   { 3, false, true, 3, false },
+    }) do
+        local kind  = K(c[1], c[2], c[3], c[4], c[5])
+        local glows = ns.Borders.GlowShown(c[1], c[2], c[5], c[3], c[4])
+        ck((kind ~= "none") == glows,
+            "CellBorderKind agrees with Borders.GlowShown for q=" .. tostring(c[1])
+            .. " (kind=" .. kind .. ", glows=" .. tostring(glows) .. ")")
+    end
 end
 
 -- RUN SPLIT (1.0 keyring row-break). The defect: the keyring began at flat index

@@ -12,8 +12,17 @@
   You will not see this in bags — poor and common items are still deliberately unglowed
   there — but the color table now matches the character window, which *does* glow every
   quality.
+- **A glowing item's cell now belongs to the glow.** Every cell sits on a quiet grey
+  panel. On a glowing item that panel's hard square edge was still showing at full
+  strength through the soft halo, so the cell read as "grey box with a glow behind it"
+  instead of the clean lit slot you get in Bags 1. The panel now steps aside for exactly
+  as long as that item glows — any glow: rarity, quest gold, or the can't-use red — and
+  comes straight back when it stops (item moved out, replaced by something below your
+  minimum-quality setting, or the item borders turned off). Empty slots and ordinary
+  white/grey items keep their panel exactly as before.
 - No new settings, and nothing you had configured changed: the on/off toggle, the
   minimum-quality floor, and the quest-gold-over-red-over-rarity order are all as they were.
+  Search dimming is unchanged too — a dimmed glowing slot still recedes as one piece.
 
 ## 1.1.4
 - Fixed item/keyring changes not propagating when both accounts were already online when a session started — API-poll discovery now also sends the item manifest, not just gold.

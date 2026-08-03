@@ -163,6 +163,27 @@ function Borders.ShouldShow(quality, enabled, minQuality)
     return quality >= (minQuality or DEFAULT_MIN_QUALITY)
 end
 
+-- PURE: the WHOLE precedence chain in one place — 1.x's UpdateBorder branch order, top
+-- down: quest gold > unusable red > rarity (above the floor). Returns r,g,b for the tint
+-- the cell should glow, or nil when it should not glow at all. `provider` is injected
+-- exactly as for QualityRGB (live: the game's quality-color function).
+--
+-- This is the SINGLE glow decision. Apply() paints from it and the well-yield suppression
+-- keys off it, so "is this cell glowing?" has exactly one answer and the halo and the well
+-- can never disagree about a cell's state.
+function Borders.ResolveTint(quality, unusable, quest, enabled, minQuality, provider)
+    if not enabled then return nil end
+    if quest    then return Borders.QuestRGB() end          -- 1.x's FIRST branch
+    if unusable then return Borders.UnusableRGB() end       -- "can't use", over rarity
+    if not Borders.ShouldShow(quality, enabled, minQuality) then return nil end
+    return Borders.QualityRGB(quality, provider)            -- may still be nil (unknown quality)
+end
+
+-- PURE: the boolean form of ResolveTint — "does this cell's halo show?".
+function Borders.GlowShown(quality, unusable, quest, enabled, minQuality, provider)
+    return Borders.ResolveTint(quality, unusable, quest, enabled, minQuality, provider) ~= nil
+end
+
 ----------------------------------------------------------------------
 -- SUITE GLOW GEOMETRY — the CII_BEHAVIOR_SPEC §2 border anatomy
 --
@@ -221,6 +242,46 @@ function Borders.GlowOffsetY(buttonSize)
     local s = tonumber(buttonSize) or 0
     if s <= 0 then return 0 end
     return s * Borders.GLOW_OFFSET_Y_SCALE
+end
+
+----------------------------------------------------------------------
+-- WELL YIELD — the glowing cell's own edge art steps out of the halo's way
+--
+-- The per-slot dress (ui_items.ensureDress) paints a WELL texture on every cell: a solid
+-- `inset` rect when empty, recolored `raised` when filled, inset 1px inside the button.
+-- That rect IS the cell's visible edge in 2.0 — there is no separate hairline any more.
+-- Its boundary is HARD and full-strength, so under the soft additive halo a glowing cell
+-- read as "grey square with a glow behind it" instead of "the glow owns this cell"
+-- (owner report, side-by-side against 1.x).
+--
+-- 1.x has no such conflict by construction: Item:Construct does `normal:Hide()` on the
+-- button's NormalTexture outright, so a 1.x cell carries NO slot art of its own and the
+-- IconGlow is the only thing describing the cell edge. We match the PERCEIVED result
+-- rather than the mechanism — our well still exists (empty and non-glowing cells want
+-- it), it just yields to alpha 0 for exactly as long as that cell is glowing.
+--
+-- STATE-DRIVEN, single source of truth: the suppression is keyed off ResolveTint below —
+-- the same call that decides whether the halo shows at all — so the two can never drift.
+-- Any tint (quest gold, unusable red, rarity) suppresses; no tint restores. Restoration
+-- is automatic on every repaint that stops glowing: item removed (Apply(button, nil)),
+-- quality dropped below the floor, the min-quality slider raised, or the Item-borders
+-- toggle switched off (options.lua's regrid repaints).
+--
+-- CONSTANTS, not settings — no new SavedVariables key, exactly like the glow geometry.
+--
+-- SEARCH-DIM is untouched: the dim cascade (Items._applyDress -> Borders.SetAlpha) scales
+-- the GLOW CONTAINER's alpha and has never touched the well. Region alpha (SetAlpha) and
+-- texture color alpha (SetColorTexture) are independent multipliers, so ui_items'
+-- setWellState recolor after Apply cannot resurrect a suppressed well, and our SetAlpha
+-- cannot fight the recolor — the two are order-independent.
+----------------------------------------------------------------------
+Borders.WELL_GLOW_ALPHA = 0    -- glowing cell: the well yields entirely (1.x: normal:Hide())
+Borders.WELL_FULL_ALPHA = 1    -- everything else: the quiet inset/raised well, unchanged
+
+-- PURE: the well's region alpha for a cell whose glow is / is not shown.
+function Borders.WellAlpha(glowShown)
+    if glowShown then return Borders.WELL_GLOW_ALPHA end
+    return Borders.WELL_FULL_ALPHA
 end
 
 -- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, uncommon/rare = 1. Only
@@ -383,37 +444,43 @@ local function showGlow(b, r, g, bl)
     b:Show()
 end
 
--- Color (or hide) a button's quality glow. Precedence is 1.x's UpdateBorder chain, top down:
+-- FRAME (texture-op): park the cell's WELL at the yield alpha while its halo is shown,
+-- and restore it the moment the halo is not. Guard-free of the WoW API (it only ever
+-- calls SetAlpha on a texture region the dress already created), so the harness drives it
+-- headless with a fake button. A cell without our dress — or an empty cell, which never
+-- glows and therefore always lands on WELL_FULL_ALPHA — is left exactly as it was.
+--
+-- SECURE / TAINT: SetAlpha on a CHILD texture of the button. Not a protected op; safe in
+-- combat, same class as everything else Apply does.
+function Borders.SetWellAlpha(button, glowShown)
+    local well = button and button._dsWell
+    if not (well and well.SetAlpha) then return end
+    well:SetAlpha(Borders.WellAlpha(glowShown))
+end
+
+-- Color (or hide) a button's quality glow, and yield/restore that cell's well with it.
+-- Precedence is 1.x's UpdateBorder chain, top down:
 --   quest (gold)  >  unusable (red)  >  quality (rarity)
 -- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the glow half of
 -- 1.x's quest treatment, the bang glyph being reserved for quest STARTERS (ui_items draws
 -- that). `unusable` (1.x glowUnusable) draws a RED glow. Otherwise a FULL-SATURATION
 -- rarity glow is drawn when the quality clears the configurable floor. Honors the store
--- toggle live. Recolor/resize/show/hide of one texture only — safe on every repaint,
+-- toggle live. Recolor/resize/show/hide/alpha of textures only — safe on every repaint,
 -- even in combat.
+--
+-- The tint is resolved ONCE (Borders.ResolveTint) and both consumers read that one
+-- verdict: the halo is painted from it, and the well yields iff it is non-nil. The well
+-- op runs BEFORE the Attach guard on purpose — the yield must hold on any button carrying
+-- our dress, including a headless/harness button with no glow container.
 function Borders.Apply(button, quality, unusable, quest)
+    local r, g, bl = Borders.ResolveTint(
+        quality, unusable, quest, Borders.Enabled(), Borders.MinQuality(), liveProvider)
+
+    -- WELL YIELD: the glowing cell's own edge art steps aside so the halo owns the edge.
+    Borders.SetWellAlpha(button, r ~= nil)
+
     local b = Borders.Attach(button)
     if not b then return end
-    local enabled = Borders.Enabled()
-
-    -- QUEST gold — 1.x's FIRST branch, so it wins over both unusable and rarity.
-    if enabled and quest then
-        return showGlow(b, Borders.QuestRGB())
-    end
-
-    -- UNUSABLE red — the "can't use" cue, overriding rarity on that cell. Gated by the
-    -- same Item-borders toggle as the rarity glow.
-    if enabled and unusable then
-        return showGlow(b, Borders.UnusableRGB())
-    end
-
-    if not Borders.ShouldShow(quality, enabled, Borders.MinQuality()) then
-        b:Hide()
-        return
-    end
-    -- FULL SATURATION (1.x glowQuality): true rarity color, no parchment pull — the
-    -- desaturated tints read grey on the near-black ground.
-    local r, g, bl = Borders.QualityRGB(quality, liveProvider)
     if not r then b:Hide(); return end
     showGlow(b, r, g, bl)
 end
@@ -745,11 +812,133 @@ local function testSpecColorsAndBagGate(fails)
     ck(qg < 1, "…deliberately warmer than the spec's (1, 1, 0)")
 end
 
+-- WELL YIELD (owner defect: "the grey inset well border renders at full strength
+-- underneath/through the halo"). Drives the REAL Borders.Apply headless — there is no
+-- _G.CreateFrame in the harness, so Attach returns nil and Apply exercises exactly the
+-- pure decision + the well texture-op, which is the part under test. A fake button
+-- carrying only `_dsWell` records the alpha it was parked at.
+local function testWellYield(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function fakeCell()
+        local well = { alpha = 1 }
+        function well:SetAlpha(a) self.alpha = a end
+        return { _dsWell = well }
+    end
+
+    local saved = Store.db
+    Store.db = { qualityBorders = true }    -- toggle ON, default Uncommon+ floor
+
+    -- The constants themselves: the well yields to (near) nothing and restores to full.
+    ck(Borders.WELL_GLOW_ALPHA <= 0.05, "a glowing cell's well yields to ~0 alpha")
+    ck(Borders.WELL_FULL_ALPHA == 1, "a non-glowing cell's well is fully opaque")
+    ck(Borders.WellAlpha(true) == Borders.WELL_GLOW_ALPHA, "WellAlpha(shown) -> yield alpha")
+    ck(Borders.WellAlpha(false) == Borders.WELL_FULL_ALPHA, "WellAlpha(hidden) -> full alpha")
+    ck(Borders.WellAlpha(nil) == Borders.WELL_FULL_ALPHA, "WellAlpha(nil) -> full alpha")
+
+    -- GLOW SHOWN -> well suppressed, for EVERY tint in the precedence chain.
+    local rare = fakeCell()
+    Borders.Apply(rare, 3)                                   -- rarity blue
+    ck(rare._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "rarity glow suppresses the well")
+    local epic = fakeCell()
+    Borders.Apply(epic, 4)
+    ck(epic._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "epic glow suppresses the well")
+    local questCell = fakeCell()
+    Borders.Apply(questCell, 1, false, true)                 -- quest gold beats the floor
+    ck(questCell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "quest gold suppresses the well")
+    local unusableCell = fakeCell()
+    Borders.Apply(unusableCell, 1, true, false)              -- unusable red beats the floor
+    ck(unusableCell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "unusable red suppresses the well")
+
+    -- GLOW HIDDEN -> well restored, by every route that can stop a glow.
+    local common = fakeCell()
+    Borders.Apply(common, 1)
+    ck(common._dsWell.alpha == Borders.WELL_FULL_ALPHA, "below-floor common keeps its well")
+    local poor = fakeCell()
+    Borders.Apply(poor, 0)
+    ck(poor._dsWell.alpha == Borders.WELL_FULL_ALPHA, "poor keeps its well")
+
+    -- RESTORE PATH on the SAME cell: glow, then stop glowing (item removed / replaced by a
+    -- common / floor raised / toggle off). Each must hand the well back at full alpha.
+    local cell = fakeCell()
+    Borders.Apply(cell, 5)
+    ck(cell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "legendary suppresses")
+    Borders.Apply(cell, nil)                                  -- item removed -> empty slot
+    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "item removed -> well restored")
+    Borders.Apply(cell, 3)
+    ck(cell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "…re-suppressed on the next rare")
+    Store.db = { qualityBorders = true, qualityBorderMin = 4 }  -- floor raised past rare
+    Borders.Apply(cell, 3)
+    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "floor raised past it -> well restored")
+    Store.db = { qualityBorders = false }                       -- Item-borders toggled OFF
+    Borders.Apply(cell, 5)
+    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "toggle off -> well restored even on legendary")
+    Store.db = { qualityBorders = true }
+
+    -- EMPTY CELL: never glows, so its well is never touched off full — the owner's
+    -- "grey empty cells look correct as-is" is a hard invariant here.
+    -- (An empty slot is quality nil with no flags — paintButton's empty branch calls
+    -- Apply(button, nil). Repeated paints must never move it off full alpha.)
+    local empty = fakeCell()
+    for _ = 1, 3 do
+        Borders.Apply(empty, nil, false, false)
+        ck(empty._dsWell.alpha == Borders.WELL_FULL_ALPHA, "empty cell's well is untouched")
+    end
+
+    -- No dress (a foreign / not-yet-dressed button) must not error.
+    local ok = pcall(Borders.Apply, {}, 4)
+    ck(ok, "a button without a well survives Apply")
+    ck(pcall(Borders.SetWellAlpha, nil, true), "SetWellAlpha(nil) is inert")
+
+    Store.db = saved
+end
+
+-- The glow decision is ONE decision: ResolveTint drives both the halo and the well yield,
+-- and it must reproduce 1.x's UpdateBorder precedence exactly (quest > unusable > rarity).
+local function testResolveTintPrecedence(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return math.abs(a - b) < 1e-9 end
+    local MIN = DEFAULT_MIN_QUALITY
+
+    -- quest gold wins over BOTH unusable and a legendary rarity
+    local r, g, b = Borders.ResolveTint(5, true, true, true, MIN)
+    local qr, qg, qb = Borders.QuestRGB()
+    ck(near(r, qr) and near(g, qg) and near(b, qb), "quest gold wins the chain")
+    -- unusable red wins over rarity
+    local ur = Borders.UnusableRGB()
+    ck(near(select(1, Borders.ResolveTint(5, true, false, true, MIN)), ur), "unusable beats rarity")
+    -- rarity when neither flag is set
+    ck(near(select(1, Borders.ResolveTint(3, false, false, true, MIN)), FALLBACK[3][1]),
+        "rarity color when no override")
+    -- the floor and the toggle both close the gate
+    ck(Borders.ResolveTint(1, false, false, true, MIN) == nil, "common -> no tint")
+    ck(Borders.ResolveTint(nil, false, false, true, MIN) == nil, "empty -> no tint")
+    ck(Borders.ResolveTint(5, true, true, false, MIN) == nil, "toggle off -> no tint at all")
+    ck(Borders.ResolveTint(3, false, false, true, 4) == nil, "raised floor -> no tint")
+
+    -- GlowShown is the boolean face of it, and it is exactly what the well keys off.
+    ck(Borders.GlowShown(3, false, false, true, MIN) == true, "GlowShown: rare glows")
+    ck(Borders.GlowShown(1, false, false, true, MIN) == false, "GlowShown: common does not")
+    ck(Borders.GlowShown(1, false, true, true, MIN) == true, "GlowShown: quest common glows")
+    ck(Borders.GlowShown(4, false, false, false, MIN) == false, "GlowShown: toggle off silences epic")
+    -- the invariant the fix rests on: well suppressed IFF the halo is shown
+    for _, case in ipairs({
+        { 0, false, false }, { 1, false, false }, { 2, false, false }, { 4, false, false },
+        { 1, true, false }, { 1, false, true }, { nil, false, false },
+    }) do
+        local shown = Borders.GlowShown(case[1], case[2], case[3], true, MIN)
+        local want  = shown and Borders.WELL_GLOW_ALPHA or Borders.WELL_FULL_ALPHA
+        ck(Borders.WellAlpha(shown) == want, "well alpha tracks the halo for q=" .. tostring(case[1]))
+    end
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
         { name = "glow geometry (spec §2)", fn = testGlowGeometry },
         { name = "spec colors + bag gate",  fn = testSpecColorsAndBagGate },
+        { name = "resolve-tint precedence", fn = testResolveTintPrecedence },
+        { name = "well yield under glow",   fn = testWellYield },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "min-quality + unusable", fn = testMinQualityConfig },
