@@ -62,17 +62,52 @@ Frame.DEFAULT_COLUMNS    = 11
 Frame.DEFAULT_BUTTONSIZE = 37
 Frame.DEFAULT_GAP        = 2
 
+-- WINDOW SCALE (1.0-SIZE PARITY). 2.0 shipped with no scale concept at all, so it drew
+-- its 37px cells at 1:1 and read visibly LARGER than the owner's 1.x window side by side.
+--
+-- 1.x composes two multiplicative knobs, and the owner runs both below 1:
+--     Frame:SetScale(profile.scale)            -- his live value: 0.98
+--     itemButton:SetScale(profile.itemScale)   -- his live value: 0.91
+-- and its grid step is the SAME 37 + spacing(2) = 39 we use, applied inside the scaled
+-- button's own coordinate space. So the 1.x on-screen cell pitch is
+--     39 * itemScale * scale = 39 * 0.91 * 0.98 = 34.78 UIParent units.
+-- 2.0's pitch is (buttonSize + gap) * windowScale = 39 * scale, so ONE window scale
+-- reproduces both the cell size and the pitch:
+--     0.91 * 0.98 = 0.8918  ->  0.89 (on the options slider's 0.01 grid)
+-- giving 39 * 0.89 = 34.71 vs 1.x's 34.78 — a 0.2% delta, i.e. pixel-identical on screen.
+--
+-- Matching the window scale ALONE (0.98) would have left the grid ~10% oversized, which
+-- is exactly the difference the owner reported; itemScale is the knob that was missing.
+Frame.DEFAULT_SCALE = 0.89
+Frame.MIN_SCALE     = 0.50
+Frame.MAX_SCALE     = 1.50
+
 -- Window chrome bands (px). Kept in one place so the pure size math and the in-game
--- arrange agree exactly. 1.0 anatomy: a compact TITLE row (gold "<Char>'s Inventory"
+-- arrange agree exactly. 1.0 anatomy: a compact TITLE row (gold character name
 -- + top-right utility icon buttons + red X), then the equipped-bag ICON STRIP
 -- (top-left cluster, wraps to rows), the tight item grid, and a bottom bar
 -- (small icon L · "N/M" free/total counter C · money R). The 1.x modern toolbar band
 -- is GONE — its controls relocated into the title-row icon cluster.
 Frame.PAD         = 8    -- window inner padding (1.x inset ~8)
-Frame.TITLE_H     = 26   -- title row: gold title + right-cluster icon buttons + close
+Frame.TITLE_H     = 30   -- title row: gold title + right-cluster icon buttons + gear + close
+                         -- (26 -> 30 so the 22px Nexus-language controls get 4px of air
+                         --  above and below instead of sitting on the title rule)
 Frame.STRIP_ICON  = 28   -- equipped-bag icon button (1.x Bag.Size 32, tightened to suite)
 Frame.STRIP_GAP   = 4    -- 1.x bag pitch 36 = 32 + 4
-Frame.ICONBTN     = 20   -- top-right utility icon buttons (search/owner/find/sort)
+-- ── Title-row control strip (NEXUS DASHBOARD ICON LANGUAGE) ────────────────────────
+-- The strip is the same object as the Nexus titlebar's: a 22x22 BackdropTemplate button
+-- filled `inset` with a `borderLite` edge, holding a 64x64 white-on-transparent glyph
+-- mask inset 2px on every side (18x18 drawn, no SetTexCoord crop — the glyphs carry
+-- their own margin). The glyph is `muted` at rest and tints to `accent` on hover;
+-- the close is the one exception and tints to `danger`, because closing is the only
+-- destructive affordance in the row. Icons sit 8px from the window edge and 8px apart.
+--
+-- icon-gear and icon-close are byte-identical copies of the Nexus assets; the rest are
+-- authored in the same stroke family by dev/gen-bags-glyphs.lua.
+Frame.ICONBTN     = 22   -- title-row control button (Nexus dashboard parity)
+Frame.ICON_INSET  = 2    -- glyph inset inside the button => 18x18 drawn
+Frame.ICON_SPACE  = 8    -- gap between adjacent controls, and from the window edge
+Frame.ART = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\"
 Frame.WINDOW_BG_ALPHA = 0.94   -- 1.0-parity near-solid dark ground (Bags-side, not theme-wide)
 -- 1.0-parity strip icons (1.x Bag.StaticIcons): the backpack + keyring use their canonical
 -- game textures instead of "B"/"K" glyphs. Backpack = fileID 130716 = Button-Backpack-Up.
@@ -96,6 +131,17 @@ function Frame.Columns()    local db = Store and Store.db; return (db and db.col
 function Frame.ButtonSize()  local db = Store and Store.db; return (db and db.buttonSize) or Frame.DEFAULT_BUTTONSIZE end
 function Frame.Gap()         local db = Store and Store.db; return (db and db.gap)        or Frame.DEFAULT_GAP        end
 function Frame.Layout()      local db = Store and Store.db; return (db and db.layout)     or "combined"              end
+-- PURE: coerce any stored/slider value into the supported scale band. Non-numeric or
+-- absent reads as the 1.0-parity default, so a corrupt SV can never zero the window.
+function Frame.ClampScale(v)
+    v = tonumber(v)
+    if not v then return Frame.DEFAULT_SCALE end
+    if v < Frame.MIN_SCALE then return Frame.MIN_SCALE end
+    if v > Frame.MAX_SCALE then return Frame.MAX_SCALE end
+    return v
+end
+-- The live window scale (both windows share it, so inventory and bank stay one size).
+function Frame.Scale() local db = Store and Store.db; return Frame.ClampScale(db and db.scale) end
 function Frame.ShowKeyring() local db = Store and Store.db; if db and db.showKeyring ~= nil then return db.showKeyring end return true end
 -- Money bar visibility (audit §9.4 dead-control fix): absent/true => shown, explicit false hides.
 function Frame.MoneyShown()  local db = Store and Store.db; return not (db and db.showMoney == false) end
@@ -132,6 +178,10 @@ function Frame.ApplyDefaults(db)
     if db.buttonSize  == nil then db.buttonSize  = Frame.DEFAULT_BUTTONSIZE end
     if db.gap         == nil then db.gap         = Frame.DEFAULT_GAP        end
     if db.showKeyring == nil then db.showKeyring = true                     end
+    -- SEEDS ONLY WHEN ABSENT (SV rule: additive, never clobber). A user who already
+    -- moved the scale slider keeps their number; a DB from before the scale option
+    -- existed has no key at all, so it picks up the 1.0-parity default on next login.
+    if db.scale       == nil then db.scale       = Frame.DEFAULT_SCALE      end
     if type(db.hiddenBags) ~= "table" then db.hiddenBags = {} end  -- [cid]=true
     -- geometry keys are left nil until first save (RestoreGeometry falls back)
     return db
@@ -313,10 +363,68 @@ end
 -- store never flattens container identity, so cid rides on every entry.
 ----------------------------------------------------------------------
 
+----------------------------------------------------------------------
+-- PURE: KEYRING ONE-ROW CLAMP
+--
+-- The keyring is a 12-slot (upgradeable to 24/32) container, but a character carries
+-- a handful of keys. Rendering the whole ring at full width spent two grid rows on
+-- mostly-empty cells directly under the bags — "extra noise" that made the window
+-- taller for nothing. The keyring section now renders AT MOST ONE ROW.
+--
+-- The clamp drops EMPTY cells only; an occupied key is NEVER hidden. So:
+--   * take every occupied key slot, in ascending slot order
+--   * pad with the lowest-numbered EMPTY slots up to one row's worth (`columns`)
+--   * re-sort the result ascending, so the visual order is still slot order
+-- A ring holding fewer keys than `columns` therefore shows its keys plus a few empty
+-- cells (still drop targets) and stops. A ring holding MORE keys than one row's worth
+-- keeps all of them and spills — losing a key off-screen is never acceptable, and the
+-- run-split math already handles a multi-row keyring run.
+--
+-- Everything downstream follows for free: the run-split rows, the combined/split grid
+-- height and the window self-size are all derived from this entry list.
+----------------------------------------------------------------------
+
+Frame.KEYRING_MAX_ROWS = 1
+
+-- The slot indices a keyring container contributes, clamped to KEYRING_MAX_ROWS.
+-- Pure: takes the container record and the column count, returns an ascending array.
+function Frame.KeyringSlotIndices(container, columns)
+    local out = {}
+    if type(container) ~= "table" then return out end
+    local size = container.size or 0
+    if size <= 0 then return out end
+    columns = math.max(1, columns or Frame.DEFAULT_COLUMNS)
+    local cap = columns * math.max(1, Frame.KEYRING_MAX_ROWS)
+
+    local slots = container.slots or {}
+    local filled, empty = {}, {}
+    for slot = 1, size do
+        if slots[slot] ~= nil then filled[#filled + 1] = slot else empty[#empty + 1] = slot end
+    end
+
+    -- Never drop a key; otherwise stop at one row.
+    local take = math.max(#filled, math.min(cap, size))
+    for i = 1, #filled do out[#out + 1] = filled[i] end
+    for i = 1, (take - #filled) do out[#out + 1] = empty[i] end
+    table.sort(out)
+    return out
+end
+
 -- Append this container's slot entries onto `out`. Returns `out`.
-function Frame.AppendContainerEntries(out, owner, cid)
+--   opts = { columns = <n> }  -- only consulted for the keyring's one-row clamp
+function Frame.AppendContainerEntries(out, owner, cid, opts)
     local c = owner and owner.containers and owner.containers[cid]
     if not c then return out end
+
+    -- Keyring: one row of cells, occupied keys first-class (see KeyringSlotIndices).
+    if cid == Store.KEYRING_CONTAINER then
+        local columns = (opts and opts.columns) or Frame.Columns()
+        for _, slot in ipairs(Frame.KeyringSlotIndices(c, columns)) do
+            out[#out + 1] = { owner = owner, cid = cid, slot = slot, data = c.slots[slot] }
+        end
+        return out
+    end
+
     local size = c.size or 0
     for slot = 1, size do
         out[#out + 1] = { owner = owner, cid = cid, slot = slot, data = c.slots[slot] }
@@ -328,7 +436,7 @@ end
 function Frame.BuildCombinedEntries(owner, opts)
     local out = {}
     for _, cid in ipairs(Frame.CarriedContainerOrder(owner, opts)) do
-        Frame.AppendContainerEntries(out, owner, cid)
+        Frame.AppendContainerEntries(out, owner, cid, opts)
     end
     return out
 end
@@ -344,7 +452,7 @@ function Frame.BuildSplitGroups(owner, opts)
             class   = Store.ContainerClass(cid),
             size    = c.size or 0,
             link    = c.link,
-            entries = Frame.AppendContainerEntries({}, owner, cid),
+            entries = Frame.AppendContainerEntries({}, owner, cid, opts),
         }
         groups[#groups + 1] = g
     end
@@ -427,10 +535,14 @@ end
 -- All headless-tested so the window self-size and the rendered chrome agree exactly.
 ----------------------------------------------------------------------
 
--- Window title, 1.x TitleBags format ("<Character>'s Inventory"). A blank/nil name
--- (pre-capture / headless) falls back to the plain wordmark.
+-- Window title: the CHARACTER NAME, nothing else ("Poonyx"). The 1.x TitleBags format
+-- was "<Character>'s Inventory"; the possessive and the noun are both redundant — the
+-- window is plainly an inventory, and it is plainly his. Dropping them leaves the one
+-- word that actually varies (which character am I looking at?), which is the whole job
+-- of this title once the owner selector can point it at an alt.
+-- A blank/nil name (pre-capture / headless) falls back to the plain wordmark.
 function Frame.WindowTitle(name)
-    if type(name) == "string" and name ~= "" then return name .. "'s Inventory" end
+    if type(name) == "string" and name ~= "" then return name end
     return "Bags"
 end
 
@@ -438,6 +550,11 @@ end
 -- text = free .. "/" .. total). Counts the SAME containers the grid shows (respects the
 -- hidden set + keyring gate via CarriedContainerOrder). Pure: reads the store snapshot,
 -- no live C_Container — so it works for a cached alt too. total = Σ size; free = empties.
+--
+-- NOTE (keyring one-row clamp): this counts real container CAPACITY, deliberately NOT
+-- the clamped cell count. The clamp hides surplus EMPTY keyring cells from the grid; it
+-- does not shrink the ring. Reporting the clamped number here would under-state the
+-- owner's actual free space, which is what this counter exists to tell him.
 function Frame.SlotCounts(owner, opts)
     local free, total = 0, 0
     if owner and type(owner.containers) == "table" then
@@ -708,9 +825,10 @@ function Frame.Ensure()
     -- ESC closes it (FrameXML special-frame list; proven by Daseeki-Core hub).
     if _G.UISpecialFrames then table.insert(_G.UISpecialFrames, WINDOW_NAME) end
 
-    -- ── Title row (1.0 anatomy): gold "<Char>'s Inventory" + top-right icon cluster
-    --    (search · owner · find · sort) + red X. Drag to move (unless the window is locked);
-    --    RIGHT-CLICK flips the combined/split layout. ────────────────────────────
+    -- ── Title row: gold character NAME + the top-right control strip
+    --    (owner · find · sort · search · layout · gear · ✕), in the Nexus dashboard icon
+    --    language. Drag to move (unless the window is locked); RIGHT-CLICK still flips
+    --    the combined/split layout, which the layout button now also does visibly. ──
     local titleBar = _G.CreateFrame("Frame", nil, win)
     titleBar:SetPoint("TOPLEFT", win, "TOPLEFT", 0, 0)
     titleBar:SetPoint("TOPRIGHT", win, "TOPRIGHT", 0, 0)
@@ -740,48 +858,54 @@ function Frame.Ensure()
         win.makerMark = mark
     end
 
-    -- Title in warm GOLD (1.x TitleBags: GameFontNormalLeft gold). The framework ships
-    -- no gold-tinted font object, so we set the "warn" token (#FFD100) explicitly on the
-    -- ceremonial wordmark. Text is filled per viewed owner in Rebuild (WindowTitle).
+    -- Title = the character NAME, in warm GOLD.
+    --
+    -- FONT (owner: "fix the font"): this was UI.fonts.ceremonial — MORPHEUS, the suite's
+    -- brand-locked smallcaps titling face. It is right for a WORDMARK ("NEXUS") and wrong
+    -- for a proper noun: it made "Poonyx" read as ornament rather than as a name. The
+    -- title now uses UI.fonts.header, which follows the user's PICKED face from the Core
+    -- font picker (Fira Sans Condensed Medium out of the box) at the header size — the
+    -- same role the Nexus dashboard uses for its own header text.
+    --
+    -- COLOR: kept on the gold token. The framework ships no gold-tinted font object, so
+    -- "warn" is set explicitly, matching 1.x's gold TitleBags tone through a theme token
+    -- (Field Ledger #D6A24A) rather than a hardcoded color.
+    -- Text is filled per viewed owner in Rebuild (WindowTitle).
     local title = titleBar:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
+    title:SetFontObject(UI.fonts.header or UI.fonts.body)
     if mark then title:SetPoint("LEFT", mark, "RIGHT", 7, 0)
     else         title:SetPoint("LEFT", titleBar, "LEFT", 9, 0) end
     title:SetText(Frame.WindowTitle(nil))
     UI.Skin(title, function(self) self:SetTextColor(UI.Color("warn")) end)   -- gold title (1.0)
     win.title = title
 
-    -- Small square icon button factory for the title-row utility cluster. Each is a
-    -- theme-skinned BackdropTemplate button rendering either a texture or a glyph, with
-    -- a naming tooltip (1.0 had small icon menu buttons). Pure child textures — no
-    -- protected op. Returns the button.
+    -- Title-row control factory — the NEXUS DASHBOARD button, verbatim in behaviour:
+    -- 22x22 BackdropTemplate, FLAT_BACKDROP filled `inset` with a `borderLite` edge,
+    -- and a white glyph mask inset 2px on all four sides (18x18 drawn). The glyph — not
+    -- the border — carries the hover: `muted` at rest, `spec.hot` (default "accent") on
+    -- enter. `_hot` is stashed on the button so the UI.Skin callback, which re-runs on
+    -- every ThemeChanged, re-reads the CURRENT hover state instead of resetting a button
+    -- the cursor is parked on. Pure child textures — no protected op. Returns the button.
     local function makeIconButton(spec)
         local b = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
         b:SetSize(Frame.ICONBTN, Frame.ICONBTN)
         b:RegisterForClicks("LeftButtonUp")
-        local face
-        if spec.texture then
-            face = b:CreateTexture(nil, "ARTWORK")
-            face:SetPoint("TOPLEFT", b, "TOPLEFT", 3, -3)
-            face:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -3, 3)
-            face:SetTexture(spec.texture)
-        else
-            face = b:CreateFontString(nil, "OVERLAY")
-            face:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
-            face:SetPoint("CENTER", b, "CENTER", 0, 0)
-            face:SetText(spec.glyph or "?")
-        end
+        local hot = spec.hot or "accent"
+        local inset = Frame.ICON_INSET
+        local face = b:CreateTexture(nil, "ARTWORK")
+        face:SetPoint("TOPLEFT", b, "TOPLEFT", inset, -inset)
+        face:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -inset, inset)
+        face:SetTexture(Frame.ART .. spec.icon)
         b._face = face
-        b._applySkin = function()
-            b:SetBackdrop(UI.FLAT_BACKDROP)
-            b:SetBackdropColor(UI.Color("control"))
-            b:SetBackdropBorderColor(UI.Color("controlBorder"))
-            if face.SetVertexColor and spec.texture then face:SetVertexColor(UI.Color("muted"))
-            elseif face.SetTextColor then face:SetTextColor(UI.Color("muted")) end
-        end
-        UI.Skin(b, function() b._applySkin() end)
+        UI.Skin(b, function(self)
+            self:SetBackdrop(UI.FLAT_BACKDROP)
+            self:SetBackdropColor(UI.Color("inset"))
+            self:SetBackdropBorderColor(UI.Color("borderLite"))
+            self._face:SetVertexColor(UI.Color(self._hot and hot or "muted"))
+        end)
         b:SetScript("OnEnter", function(self)
-            self:SetBackdropBorderColor(UI.Color("brand"))
+            self._hot = true
+            self._face:SetVertexColor(UI.Color(hot))
             if _G.GameTooltip and spec.tooltip then
                 _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
                 _G.GameTooltip:SetText(spec.tooltip, UI.Color("text"))
@@ -790,71 +914,134 @@ function Frame.Ensure()
             end
         end)
         b:SetScript("OnLeave", function(self)
-            self:SetBackdropBorderColor(UI.Color("controlBorder"))
+            self._hot = nil
+            self._face:SetVertexColor(UI.Color("muted"))
             if _G.GameTooltip then _G.GameTooltip:Hide() end
         end)
         if spec.onClick then b:SetScript("OnClick", spec.onClick) end
         return b
     end
 
-    local closeBtn = _G.CreateFrame("Button", nil, titleBar)
-    closeBtn:SetSize(22, 22)
-    closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
-    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(UI.fonts.body)
-    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
-    cx:SetText("X")
-    UI.Skin(cx, function(self) self:SetTextColor(UI.Color("danger")) end)   -- red X (1.0)
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body); if cx.SetTextColor then cx:SetTextColor(UI.Color("danger")) end end)
-    closeBtn:SetScript("OnClick", function() Frame.Close() end)
+    -- Right cluster, laid RIGHT→LEFT from the window edge. Visual order matches the
+    -- Nexus dashboard's top-right pair — ... gear then ✕ — with the bag controls
+    -- continuing leftward: owner · find · sort · search · layout · gear · ✕.
+    local SPACE = Frame.ICON_SPACE
 
-    -- Right cluster, laid right→left from the close button: search · sort · find · owner.
-    local magBtn = makeIconButton({
-        texture = "Interface\\Common\\UI-Searchbox-Icon",   -- the game's own magnifier (1.0 look)
+    -- Close: the only control that hovers `danger` (destructive affordance). No tooltip —
+    -- ✕ is universal, and Nexus deliberately leaves it bare for the same reason.
+    local closeBtn = makeIconButton({ icon = "icon-close", hot = "danger",
+        onClick = function() Frame.Close() end })
+    closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -SPACE, 0)
+    win.closeBtn = closeBtn
+
+    -- Settings: MOVED HERE from the bottom-left corner glyph, which is retired. The gear
+    -- belongs beside the close in the suite's header grammar (Nexus does exactly this),
+    -- not orphaned in the footer where it read as decoration. A cog is ambiguous, so
+    -- unlike the ✕ it keeps its tooltip.
+    local gearBtn = makeIconButton({ icon = "icon-gear",
+        tooltip = "Bag settings", tooltip2 = "Right-click the title toggles combined/split",
+        onClick = function()
+            -- Options live in the Daseeki suite hub (options.lua RegisterAddon id="bags").
+            -- Try the hub's open surface defensively; guarded so a name mismatch just no-ops.
+            local S = _G.DaseekiSuite
+            if S then
+                if     S.OpenTo then S:OpenTo("bags")
+                elseif S.Open   then S:Open("bags")
+                elseif S.Toggle then S:Toggle("bags") end
+            end
+        end,
+    })
+    gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -SPACE, 0)
+    win.gearBtn = gearBtn
+
+    -- Layout toggle: combined <-> split. Right-clicking the title bar has always done
+    -- this and still does, but that was undiscoverable — this is the visible control.
+    local layoutBtn = makeIconButton({ icon = "icon-layout",
+        tooltip = "Bag layout", tooltip2 = "Switch between one combined grid and one group per bag",
+        onClick = function() Frame.SetLayout(Frame.Layout() == "split" and "combined" or "split") end,
+    })
+    layoutBtn:SetPoint("RIGHT", gearBtn, "LEFT", -SPACE, 0)
+    win.layoutBtn = layoutBtn
+
+    local magBtn = makeIconButton({ icon = "icon-search",
         tooltip = "Search these bags", tooltip2 = "Filter the grid as you type",
         onClick = function() Frame.ToggleSearch() end,
     })
-    magBtn:SetPoint("RIGHT", closeBtn, "LEFT", -4, 0)
+    magBtn:SetPoint("RIGHT", layoutBtn, "LEFT", -SPACE, 0)
     win.magBtn = magBtn
 
-    local sortBtn = makeIconButton({
-        glyph = "\226\134\147",   -- down-arrow ↓
+    local sortBtn = makeIconButton({ icon = "icon-sort",
         tooltip = "Sort bags", tooltip2 = "Merge stacks and arrange by type",
         onClick = function() if ns.Sort and ns.Sort.Run then ns.Sort.Run(ns.Sort.CarriedBagIDs()) end end,
     })
-    sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -4, 0)
+    sortBtn:SetPoint("RIGHT", magBtn, "LEFT", -SPACE, 0)
     win.sortBtn = sortBtn
 
-    local findBtn = makeIconButton({
-        glyph = "\226\137\161",   -- triple-bar ≡ (list across characters)
+    local findBtn = makeIconButton({ icon = "icon-find",
         tooltip = "Find an item", tooltip2 = "Search across all your characters",
         onClick = function() if ns.Find and ns.Find.Toggle then ns.Find.Toggle(win.searchBox and win.searchBox:GetText()) end end,
     })
-    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -4, 0)
+    findBtn:SetPoint("RIGHT", sortBtn, "LEFT", -SPACE, 0)
     win.findBtn = findBtn
 
     -- Owner selector (W3): compact flyout trigger in the icon cluster. Selecting an
     -- alt/remote owner flips the SHARED viewed-owner state (Frame.SetViewedOwner),
     -- re-rendering this window (and the bank) read-only.
+    --
+    -- ui_owner.lua owns the selector widget (and the bank reuses it at full width with a
+    -- name label), so it is NOT restyled at the source. Instead its exposed parts are
+    -- retrofitted HERE, guarded: the name text and seal pip are hidden and a 22x22 owner
+    -- glyph is laid over the face button, so the strip reads in one icon language. If
+    -- ui_owner ever stops exposing _btn/_name/_pip, the guards simply leave the widget
+    -- in its default form — the control keeps working either way.
     if ns.Owner and ns.Owner.CreateSelector then
         local sel = ns.Owner.CreateSelector(titleBar, {
-            width = 26,   -- compact: reads as an icon-ish pip+caret trigger
+            width = Frame.ICONBTN,
             onSelect = function(key) Frame.SetViewedOwner(key) end,
         })
         if sel then
             sel:ClearAllPoints()
-            sel:SetPoint("RIGHT", findBtn, "LEFT", -4, 0)
-            sel:SetHeight(Frame.ICONBTN)
+            sel:SetPoint("RIGHT", findBtn, "LEFT", -SPACE, 0)
+            sel:SetSize(Frame.ICONBTN, Frame.ICONBTN)
+            if sel._name and sel._name.Hide then sel._name:Hide() end
+            if sel._pip  and sel._pip.Hide  then sel._pip:Hide()  end
+            if sel._btn then
+                local inset = Frame.ICON_INSET
+                local og = sel._btn:CreateTexture(nil, "ARTWORK")
+                og:SetPoint("TOPLEFT", sel._btn, "TOPLEFT", inset, -inset)
+                og:SetPoint("BOTTOMRIGHT", sel._btn, "BOTTOMRIGHT", -inset, inset)
+                og:SetTexture(Frame.ART .. "icon-owner")
+                sel._btn._face = og
+                UI.Skin(sel._btn, function(self)
+                    self:SetBackdrop(UI.FLAT_BACKDROP)
+                    self:SetBackdropColor(UI.Color("inset"))
+                    self:SetBackdropBorderColor(UI.Color("borderLite"))
+                    if self._face then self._face:SetVertexColor(UI.Color(self._hot and "accent" or "muted")) end
+                end)
+                sel._btn:HookScript("OnEnter", function(self)
+                    self._hot = true
+                    if self._face then self._face:SetVertexColor(UI.Color("accent")) end
+                end)
+                sel._btn:HookScript("OnLeave", function(self)
+                    self._hot = nil
+                    if self._face then self._face:SetVertexColor(UI.Color("muted")) end
+                end)
+            end
             win.ownerSelector = sel
         end
     end
 
     -- Collapsed inline SEARCH box (1.0: search lived behind a toggle, not a standing
     -- toolbar). Hidden until the magnifier opens it; grows leftward from the cluster.
+    -- Anchored between the TITLE and the control strip, not floated at a fixed width.
+    -- It used to be a fixed 150px growing leftward from the magnifier, which now would
+    -- both cover the new glyphs and — with the strip six controls wide — run into the
+    -- character name. Two-point anchoring lets the box take exactly the space that is
+    -- actually free, at any window width or character-name length.
     local searchWrap = UI.FlatFrame(titleBar, "inset", "controlBorder")
-    searchWrap:SetSize(150, 18)
-    searchWrap:SetPoint("RIGHT", magBtn, "LEFT", -4, 0)
+    searchWrap:SetHeight(18)
+    searchWrap:SetPoint("RIGHT", win.ownerSelector or findBtn, "LEFT", -SPACE, 0)
+    searchWrap:SetPoint("LEFT", title, "RIGHT", 10, 0)
     searchWrap:Hide()
     local search = _G.CreateFrame("EditBox", nil, searchWrap)
     search:SetPoint("TOPLEFT", searchWrap, "TOPLEFT", 6, 0)
@@ -960,39 +1147,40 @@ function Frame.Ensure()
     UI.Skin(slotCount, function(self) self:SetTextColor(UI.Color("muted")) end)
     win.slotCount = slotCount
 
-    -- Small icon, bottom-LEFT (1.0): a quiet bag glyph that opens the options panel.
-    local footIcon = _G.CreateFrame("Button", nil, win)
-    footIcon:SetSize(18, 18)
-    footIcon:SetPoint("BOTTOMLEFT", win, "BOTTOMLEFT", PAD, PAD)
-    local fi = footIcon:CreateTexture(nil, "ARTWORK")
-    fi:SetAllPoints(footIcon)
-    fi:SetTexture("Interface\\Buttons\\Button-Backpack-Up")
-    footIcon:SetScript("OnEnter", function(self)
-        if fi.SetVertexColor then fi:SetVertexColor(UI.Color("text")) end
-        if _G.GameTooltip then
-            _G.GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-            _G.GameTooltip:SetText("Bag options", UI.Color("text"))
-            _G.GameTooltip:AddLine("Open settings · right-click title toggles combined/split", UI.Color("muted"))
-            _G.GameTooltip:Show()
-        end
-    end)
-    footIcon:SetScript("OnLeave", function() if fi.SetVertexColor then fi:SetVertexColor(UI.Color("muted")) end if _G.GameTooltip then _G.GameTooltip:Hide() end end)
-    footIcon:SetScript("OnClick", function()
-        -- Options live in the Daseeki suite hub (options.lua RegisterAddon id="bags").
-        -- Try the hub's open surface defensively; guarded so a name mismatch just no-ops.
-        local S = _G.DaseekiSuite
-        if S then
-            if     S.OpenTo then S:OpenTo("bags")
-            elseif S.Open   then S:Open("bags")
-            elseif S.Toggle then S:Toggle("bags") end
-        end
-    end)
-    UI.Skin(fi, function(self) self:SetVertexColor(UI.Color("muted")) end)
-    win.footIcon = footIcon
+    -- (The bottom-left options glyph is RETIRED. It was a second, competing settings
+    -- entry point parked in the footer where it read as decoration rather than as a
+    -- control; settings now live on the gear in the title row beside the ✕, matching the
+    -- Nexus dashboard. Nothing else used the corner, so the corner is simply empty.)
 
     Frame.window = win
+    Frame.ApplyScale(win)
     restoreGeometry(win)
     return win
+end
+
+-- Apply the window scale to a built window. Separated from Ensure so the options slider
+-- can re-scale a LIVE window with no reload. SetScale is a plain unprotected frame op.
+--
+-- Border note: the quality edges are snapped to a physical pixel derived from
+-- GetEffectiveScale, so they must be re-laid after a scale change. borders.lua's own
+-- snap driver only listens for the CLIENT's UI_SCALE_CHANGED, which an addon-level
+-- SetScale does not fire — so the caller pairs this with a Rebuild, whose ShowSlots pass
+-- runs Borders.Apply and re-snaps every visible edge. RefreshScale below does both.
+function Frame.ApplyScale(win)
+    win = win or Frame.window
+    if not win or not win.SetScale then return end
+    win:SetScale(Frame.Scale())
+end
+
+-- Re-scale every Daseeki-Bags window (inventory + bank) from the current setting, and
+-- repaint so the pixel-snapped item borders re-derive at the new effective scale. The
+-- bank window is a sibling built by ui_bank.lua; it reads the SAME db.scale, so the two
+-- windows can never disagree about size.
+function Frame.RefreshScale()
+    Frame.ApplyScale(Frame.window)
+    if ns.Bank and ns.Bank.ApplyScale then ns.Bank.ApplyScale() end
+    if Frame.IsShown() then Frame.Rebuild() end
+    if ns.Bank and ns.Bank.IsShown and ns.Bank.IsShown() and ns.Bank.Rebuild then ns.Bank.Rebuild() end
 end
 
 ----------------------------------------------------------------------
@@ -1339,13 +1527,17 @@ function Frame.DebugToolbar()
             tostring(f.GetFrameLevel and f:GetFrameLevel())))
     end
     P("[title-row] control geometry (left/right in screen px; overlaps => crowding):")
+    -- Listed right-to-left, i.e. the order they are anchored from the window edge.
+    d("closeBtn", win.closeBtn)
+    d("gearBtn", win.gearBtn)
+    d("layoutBtn", win.layoutBtn)
     d("magBtn(search)", win.magBtn)
-    d("ownerSelector", win.ownerSelector)
-    d("findBtn", win.findBtn)
     d("sortBtn", win.sortBtn)
+    d("findBtn", win.findBtn)
+    d("ownerSelector", win.ownerSelector)
     d("searchWrap", win.searchWrap)
     d("slotCount", win.slotCount)
-    d("footIcon", win.footIcon)
+    P(string.format("  window scale=%.2f (default %.2f)", Frame.Scale(), Frame.DEFAULT_SCALE))
     P("  ns.Find present=" .. tostring(ns.Find ~= nil) .. " ns.Sort present=" .. tostring(ns.Sort ~= nil))
 end
 
@@ -1454,7 +1646,7 @@ function Frame.Rebuild()
                    live = (ns.Items and ns.Items.IsLive and ns.Items.IsLive(owner)) and true or false,
                    hidden = (Store.db and Store.db.hiddenBags) or {} }
 
-    -- Gold title "<Character>'s Inventory" for the VIEWED owner (1.0 TitleBags).
+    -- Gold character NAME for the VIEWED owner (see Frame.WindowTitle).
     if win.title then
         local nm = owner and owner.name
         if not nm then
@@ -1765,8 +1957,9 @@ end
 local function testCombinedEntries(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local o = fixtureOwner()
-    local e = Frame.BuildCombinedEntries(o, { showKeyring = true })
-    -- 16 + 14 + 6 + 12 = 48 slot entries (empty slots included)
+    -- 12 columns: the fixture's 12-slot keyring is exactly one row, so the one-row clamp
+    -- is a no-op here and the entry list is the full 16 + 14 + 6 + 12 = 48.
+    local e = Frame.BuildCombinedEntries(o, { showKeyring = true, columns = 12 })
     ck(#e == 48, "combined entry count = sum of container sizes (48), got " .. #e)
     -- stable ordering: first 16 are backpack slots 1..16 in order
     ck(e[1].cid == 0 and e[1].slot == 1, "first entry is backpack slot 1")
@@ -1780,7 +1973,7 @@ local function testCombinedEntries(fails)
     -- every entry carries the owner record + a cid (never flattened)
     ck(e[1].owner == o and e[48].owner == o, "owner record on every entry")
     -- hidden bag removed from the flow
-    local eh = Frame.BuildCombinedEntries(o, { showKeyring = true, hidden = { [1] = true } })
+    local eh = Frame.BuildCombinedEntries(o, { showKeyring = true, hidden = { [1] = true }, columns = 12 })
     ck(#eh == 48 - 14, "hiding bag1 removes its 14 slots")
 end
 
@@ -1845,13 +2038,20 @@ local function testGridAndWindowSize(fails)
 
     -- The owner's REAL config (11 columns, gap 2) is the case the defect showed up in:
     -- 36 bag slots leave the row 3 cells in, so the old flat flow started the keys mid-row.
-    -- The break costs a WHOLE extra row there, not just the gap.
+    -- The break costs a WHOLE extra row there, not just the gap. With the one-row keyring
+    -- clamp the keys now occupy exactly ONE row (11 of the ring's 12 cells), so the whole
+    -- keyring band is a single quiet strip instead of two mostly-empty rows.
     local live = { columns = 11, buttonSize = 37, gap = 2, showKeyring = true }
     local hLive = Frame.ComputeContentSize(o, "combined", live).height
     local expLive = Frame.GridDims(36, 11, 37, 2).height + 2 + runGap
-                  + Frame.GridDims(12, 11, 37, 2).height
-    ck(hLive == expLive, "11-col content height = 4 bag rows + break + 2 keyring rows, got " .. hLive)
+                  + Frame.GridDims(11, 11, 37, 2).height
+    ck(hLive == expLive, "11-col content height = 4 bag rows + break + ONE keyring row, got " .. hLive)
     ck(hLive > Frame.GridDims(48, 11, 37, 2).height, "the mid-row break makes the window taller (intended 1.0 look)")
+    -- ...and the clamp is what removed the second keyring row: the pre-clamp height (a
+    -- full 12-cell ring at 11 columns = 2 rows) was one whole row taller.
+    local preClamp = Frame.GridDims(36, 11, 37, 2).height + 2 + runGap
+                   + Frame.GridDims(12, 11, 37, 2).height
+    ck(preClamp - hLive == 37 + 2, "one-row clamp saves exactly one grid row of height")
 end
 
 local function testGeometryRoundTrip(fails)
@@ -1933,22 +2133,126 @@ local function testKeyringDynamicSize(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local o = fixtureOwner()
     -- fixtureOwner's keyring (-2) is size 12; count keyring entries in the combined flow.
-    local function keyringEntryCount()
+    local function keyringEntryCount(cols)
         local n = 0
-        for _, e in ipairs(Frame.BuildCombinedEntries(o, { showKeyring = true })) do
+        for _, e in ipairs(Frame.BuildCombinedEntries(o, { showKeyring = true, columns = cols })) do
             if e.cid == Store.KEYRING_CONTAINER then n = n + 1 end
         end
         return n
     end
-    ck(keyringEntryCount() == 12, "keyring renders its captured size (12)")
+    -- Store-driven size still governs the CEILING: a 12-slot ring at 16 columns renders
+    -- all 12 (one row is wider than the ring), never a padded 16.
+    ck(keyringEntryCount(16) == 12, "keyring never renders more cells than it has (12)")
     -- Simulate a keyring upgrade: capture re-scans -2 to a larger size in the store.
     local key = Store.NewContainer(24)
     key.slots[1] = Store.NewSlot(5175, 1)
     Store.PutContainer(o, Store.KEYRING_CONTAINER, key, 200)
-    ck(keyringEntryCount() == 24, "grown keyring (24) reflected immediately — size is store-driven")
+    ck(keyringEntryCount(16) == 16, "grown keyring (24) fills one row and stops (clamp, not size)")
+    ck(keyringEntryCount(11) == 11, "same ring at 11 columns is 11 cells — always exactly one row")
     -- And it disappears entirely when the gate is off (setting/feature), not by size.
     ck(#Frame.CarriedContainerOrder(o, { showKeyring = false }) ==
        #Frame.CarriedContainerOrder(o, { showKeyring = true }) - 1, "gate off drops the keyring container")
+end
+
+-- KEYRING ONE-ROW CLAMP (owner: "expanding it to the full scale is extra noise").
+-- The rule: at most one row of keyring cells, occupied keys never dropped, slot order
+-- preserved. These pin every branch of Frame.KeyringSlotIndices.
+local function testKeyringOneRow(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function ring(size, filledSlots)
+        local c = Store.NewContainer(size)
+        for _, s in ipairs(filledSlots or {}) do c.slots[s] = Store.NewSlot(5175, 1) end
+        return c
+    end
+    local function eq(a, b, m)
+        if #a ~= #b then ck(false, m .. " (len " .. #a .. " vs " .. #b .. ")"); return end
+        for i = 1, #a do if a[i] ~= b[i] then ck(false, m .. " (at " .. i .. ": " .. tostring(a[i]) .. " vs " .. tostring(b[i]) .. ")"); return end end
+        ck(true, m)
+    end
+
+    -- The owner's real case: 5 keys in a 12-slot ring at 11 columns -> ONE row of 11,
+    -- his keys plus six empty cells, and the 12th cell is gone.
+    local ks = Frame.KeyringSlotIndices(ring(12, { 1, 2, 3, 4, 5 }), 11)
+    ck(#ks == 11, "5 keys in a 12-ring at 11 cols -> 11 cells (one row), got " .. #ks)
+    eq(ks, { 1,2,3,4,5,6,7,8,9,10,11 }, "clamped list is ascending slot order")
+
+    -- A ring SMALLER than a row is never padded up to the row.
+    ck(#Frame.KeyringSlotIndices(ring(6, { 1 }), 11) == 6, "6-slot ring at 11 cols stays 6 cells")
+
+    -- A key past the cut is NEVER dropped: it displaces a lower EMPTY cell and keeps its
+    -- own slot index (so the click still targets the right slot).
+    local far = Frame.KeyringSlotIndices(ring(12, { 1, 12 }), 11)
+    ck(#far == 11, "still one row when a key sits past the cut, got " .. #far)
+    ck(far[#far] == 12, "the slot-12 key survives the clamp (last cell)")
+    eq(far, { 1,2,3,4,5,6,7,8,9,10,12 }, "empty slot 11 is the one dropped, not the key")
+
+    -- More keys than a row fits: every key renders and the run spills to a 2nd row.
+    -- Losing a key off-screen is never acceptable; a taller keyring band is.
+    local full = {}
+    for s = 1, 12 do full[s] = s end
+    local over = Frame.KeyringSlotIndices(ring(12, full), 11)
+    ck(#over == 12, "12 keys at 11 cols -> all 12 render (spill beats hiding a key)")
+
+    -- Upgraded 24-slot ring with a handful of keys is still one row.
+    ck(#Frame.KeyringSlotIndices(ring(24, { 1, 2, 3 }), 11) == 11, "24-slot ring clamps to one row")
+
+    -- Degenerate inputs are guarded (never returns nil, never divides by zero columns).
+    ck(#Frame.KeyringSlotIndices(nil, 11) == 0, "nil container -> no cells")
+    ck(#Frame.KeyringSlotIndices(ring(0, {}), 11) == 0, "0-size ring -> no cells")
+    ck(#Frame.KeyringSlotIndices(ring(12, {}), 0) == 1, "columns 0 is floored to 1 cell, not an error")
+
+    -- The clamp reaches BOTH layouts through the shared append funnel.
+    local o = fixtureOwner()
+    local groups = Frame.BuildSplitGroups(o, { showKeyring = true, columns = 11 })
+    local kg = groups[#groups]
+    ck(kg.class == "keyring", "last split group is the keyring")
+    ck(#kg.entries == 11, "split layout keyring group is one row too, got " .. #kg.entries)
+    ck(kg.size == 12, "group.size still reports true CAPACITY (12), not the clamped cell count")
+
+    -- Capacity accounting is deliberately unclamped: free/total counts real bag space.
+    local _, total = Frame.SlotCounts(o, { showKeyring = true, columns = 11 })
+    ck(total == 48, "free/total counter still reports the ring's full 12 slots, got " .. total)
+end
+
+-- WINDOW SCALE: 1.0-size parity default, additive seeding, clamped reads.
+local function testWindowScale(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The default is the 1.x composite (itemScale 0.91 * frame scale 0.98 = 0.8918).
+    ck(Frame.DEFAULT_SCALE == 0.89, "default window scale is the 1.0-parity 0.89")
+    -- Pitch parity: 2.0's (buttonSize + gap) * scale vs 1.x's 39 * 0.91 * 0.98 = 34.78.
+    local pitch2 = (Frame.DEFAULT_BUTTONSIZE + Frame.DEFAULT_GAP) * Frame.DEFAULT_SCALE
+    local pitch1 = 39 * 0.91 * 0.98
+    ck(math.abs(pitch2 - pitch1) / pitch1 < 0.01,
+       "cell pitch within 1% of the 1.x window, got " .. pitch2 .. " vs " .. pitch1)
+
+    -- SEEDS ONLY WHEN ABSENT. A DB that predates the option has no key and takes the
+    -- default; a user who already moved the slider keeps their number.
+    local fresh = {}
+    Frame.ApplyDefaults(fresh)
+    ck(fresh.scale == Frame.DEFAULT_SCALE, "absent scale seeded with the parity default")
+    local tuned = { scale = 1.15 }
+    Frame.ApplyDefaults(tuned)
+    ck(tuned.scale == 1.15, "an existing user scale is never clobbered")
+
+    -- Clamp: garbage and out-of-band values can never produce a zero/huge window.
+    ck(Frame.ClampScale(nil)      == Frame.DEFAULT_SCALE, "nil -> default")
+    ck(Frame.ClampScale("nope")   == Frame.DEFAULT_SCALE, "non-numeric -> default")
+    ck(Frame.ClampScale(0)        == Frame.MIN_SCALE,     "0 -> min (never a zero-size window)")
+    ck(Frame.ClampScale(-3)       == Frame.MIN_SCALE,     "negative -> min")
+    ck(Frame.ClampScale(99)       == Frame.MAX_SCALE,     "huge -> max")
+    ck(Frame.ClampScale(1.0)      == 1.0,                 "in-band value passes through")
+    ck(Frame.ClampScale("0.75")   == 0.75,                "numeric string coerced")
+end
+
+-- HEADER: the title is the character NAME ONLY (no possessive, no noun).
+local function testWindowTitle(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    ck(Frame.WindowTitle("Poonyx") == "Poonyx", "title is the bare character name")
+    ck(Frame.WindowTitle("Daseeki") == "Daseeki", "no possessive, no 'Inventory'")
+    ck(Frame.WindowTitle(nil) == "Bags", "nil name -> wordmark fallback")
+    ck(Frame.WindowTitle("")  == "Bags", "blank name -> wordmark fallback")
+    ck(Frame.WindowTitle(42)  == "Bags", "non-string -> wordmark fallback")
 end
 
 -- W4.5: category-section content/window sizing (pure). A prebuilt section list
@@ -2129,8 +2433,8 @@ end
 local function testParityAnatomy(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
-    -- Title (1.x TitleBags "%s's Inventory").
-    ck(Frame.WindowTitle("Daseeki") == "Daseeki's Inventory", "title = <name>'s Inventory")
+    -- Title: the character NAME only (full coverage in the window-title suite below).
+    ck(Frame.WindowTitle("Daseeki") == "Daseeki", "title = the bare character name")
     ck(Frame.WindowTitle(nil) == "Bags", "nil name -> plain wordmark")
     ck(Frame.WindowTitle("")  == "Bags", "blank name -> plain wordmark")
 
@@ -2185,6 +2489,9 @@ function Frame.RunSelfTests(verbose)
         { name = "density migration",   fn = testDensityMigration },
         { name = "keyring gate",        fn = testKeyringGate },
         { name = "keyring dynamic size", fn = testKeyringDynamicSize },
+        { name = "keyring one-row clamp", fn = testKeyringOneRow },
+        { name = "window scale (1.0 parity)", fn = testWindowScale },
+        { name = "window title (name only)",  fn = testWindowTitle },
         { name = "category section size", fn = testCategorySectionSize },
         { name = "effective mode",       fn = testEffectiveMode },
         { name = "strip slots",          fn = testStripSlots },

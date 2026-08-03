@@ -153,6 +153,34 @@ function Options.Build(flow)
         set = function(v) local db = DB(); if db then db.gap = math.floor(v + 0.5); db.densityUserChose = true end regrid() end,
     }).Refresh)
 
+    -- Window scale. Separate from Button size on purpose: Button size changes the GRID
+    -- (more or less of the screen for the same number of slots), while this shrinks the
+    -- whole window — chrome, title, bag strip and all — the way 1.x's frame scale did.
+    -- Default 0.89 is the 1.0-size-parity value (see Frame.DEFAULT_SCALE). Applies to the
+    -- bank window too; RefreshScale re-scales both and repaints so the pixel-snapped
+    -- quality borders re-derive at the new effective scale.
+    register(grid:Slider({
+        label = "Window scale",
+        min   = (ns.Frame and ns.Frame.MIN_SCALE) or 0.5,
+        max   = (ns.Frame and ns.Frame.MAX_SCALE) or 1.5,
+        step  = 0.01, width = 260,
+        format = function(v) return string.format("%d%%", math.floor((tonumber(v) or 1) * 100 + 0.5)) end,
+        get = function()
+            local db = DB()
+            if ns.Frame and ns.Frame.ClampScale then return ns.Frame.ClampScale(db and db.scale) end
+            return (db and db.scale) or 0.89
+        end,
+        set = function(v)
+            local db = DB()
+            if db then
+                db.scale = (ns.Frame and ns.Frame.ClampScale and ns.Frame.ClampScale(v)) or tonumber(v) or 0.89
+            end
+            if ns.Frame and ns.Frame.RefreshScale then
+                if ns.SafeCall then ns:SafeCall(ns.Frame.RefreshScale) else ns.Frame.RefreshScale() end
+            end
+        end,
+    }).Refresh)
+
     -- ── Item borders (1.0 / CII-style) ──────────────────────────────────────────
     -- Full-saturation quality borders with a configurable minimum quality (default
     -- Uncommon, matching 1.x's Uncommon+ floor). Unusable gear always shows a red border.

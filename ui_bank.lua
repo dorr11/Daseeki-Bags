@@ -54,10 +54,10 @@ local Store = ns.Store
 ----------------------------------------------------------------------
 
 -- 1.0-LOOK PARITY: mirror the inventory chrome metrics so the two windows read as
--- siblings (gold "<Char>'s Bank" title, tight red-brown grid via the shared Frame.Gap,
+-- siblings (gold "<Char> · Bank" title, tight red-brown grid via the shared Frame.Gap,
 -- bottom bar = small icon L · free/total C · money R).
 Bank.PAD       = 8
-Bank.TITLE_H   = 26
+Bank.TITLE_H   = 30   -- matches Frame.TITLE_H: room for the 22px title-row controls
 Bank.STRIP_H   = 22   -- bank-bag purchase/toggle strip
 Bank.MONEY_H   = 20
 Bank.VGAP      = 6
@@ -165,9 +165,11 @@ function Bank.ComputeWindowSize(owner, opts)
     return { width = w, height = h }
 end
 
--- Window title, 1.x TitleBank format ("<Character>'s Bank"). Blank/nil -> "Bank".
+-- Window title: "<Character> · Bank". The possessive is dropped to match the inventory
+-- window's name-first treatment; the role word is kept because, unlike the inventory,
+-- this window is not identifiable from its contents alone. Blank/nil -> "Bank".
 function Bank.WindowTitle(name)
-    if type(name) == "string" and name ~= "" then return name .. "'s Bank" end
+    if type(name) == "string" and name ~= "" then return name .. " \194\183 Bank" end
     return "Bank"
 end
 
@@ -333,9 +335,13 @@ function Bank.Ensure()
         mark = UI.MakerMark(titleBar, { size = 16 })
         mark:SetPoint("LEFT", titleBar, "LEFT", 7, 0)
     end
-    -- Gold "<Character>'s Bank" (1.x TitleBank). Text filled per viewed owner in Rebuild.
+    -- Gold "<Character> · Bank". Same header treatment as the inventory window: the
+    -- possessive is dropped and the face moves off the ceremonial MORPHEUS smallcaps onto
+    -- UI.fonts.header (the user's picked face). The role word STAYS here — unlike the
+    -- inventory, this window is not self-evident from its contents, and the two windows
+    -- are open side by side at the bank. Text filled per viewed owner in Rebuild.
     local title = titleBar:CreateFontString(nil, "OVERLAY")
-    title:SetFontObject(UI.fonts.ceremonial or UI.fonts.header)
+    title:SetFontObject(UI.fonts.header or UI.fonts.body)
     if mark then title:SetPoint("LEFT", mark, "RIGHT", 7, 0)
     else         title:SetPoint("LEFT", titleBar, "LEFT", 9, 0) end
     title:SetText(Bank.WindowTitle(nil))
@@ -355,21 +361,78 @@ function Bank.Ensure()
     -- Offline "Updated …" stamp (shown when the viewed bank is a cached snapshot).
     local stamp = titleBar:CreateFontString(nil, "OVERLAY")
     stamp:SetFontObject(UI.fonts.small)
-    stamp:SetPoint("RIGHT", titleBar, "RIGHT", -36, 0)
+    -- Clear of the title-row controls: 8 edge + 22 close + 8 + 22 gear = 60, plus air.
+    stamp:SetPoint("RIGHT", titleBar, "RIGHT", -68, 0)
     UI.Skin(stamp, function(self) self:SetTextColor(UI.Color("muted")) end)
     win.stamp = stamp
 
-    local closeBtn = _G.CreateFrame("Button", nil, titleBar)
-    closeBtn:SetSize(22, 22)
-    closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -6, 0)
-    local cx = closeBtn:CreateFontString(nil, "OVERLAY")
-    cx:SetFontObject(UI.fonts.body)
-    cx:SetPoint("CENTER", closeBtn, "CENTER", 0, 0)
-    cx:SetText("X")
-    UI.Skin(cx, function(self) self:SetTextColor(UI.Color("danger")) end)   -- red X (1.0)
-    closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
-    closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body); if cx.SetTextColor then cx:SetTextColor(UI.Color("danger")) end end)
+    -- Close: the same owned ✕ mask + hover behaviour as the inventory window and the
+    -- Nexus dashboard (22x22, glyph inset 2px, `muted` at rest -> `danger` on hover, and
+    -- `_hot` stashed so a ThemeChanged re-skin under a parked cursor keeps the hover).
+    -- The metrics are read off ns.Frame so the two title rows can never drift apart.
+    local F = ns.Frame
+    local ICONBTN = (F and F.ICONBTN) or 22
+    local INSET   = (F and F.ICON_INSET) or 2
+    local SPACE   = (F and F.ICON_SPACE) or 8
+    local closeBtn = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
+    closeBtn:SetSize(ICONBTN, ICONBTN)
+    closeBtn:SetPoint("RIGHT", titleBar, "RIGHT", -SPACE, 0)
+    local cx = closeBtn:CreateTexture(nil, "ARTWORK")
+    cx:SetPoint("TOPLEFT", closeBtn, "TOPLEFT", INSET, -INSET)
+    cx:SetPoint("BOTTOMRIGHT", closeBtn, "BOTTOMRIGHT", -INSET, INSET)
+    cx:SetTexture(((F and F.ART) or ("Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\")) .. "icon-close")
+    closeBtn._face = cx
+    UI.Skin(closeBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self._face:SetVertexColor(UI.Color(self._hot and "danger" or "muted"))
+    end)
+    closeBtn:SetScript("OnEnter", function(self) self._hot = true;  self._face:SetVertexColor(UI.Color("danger")) end)
+    closeBtn:SetScript("OnLeave", function(self) self._hot = nil;   self._face:SetVertexColor(UI.Color("muted"))  end)
     closeBtn:SetScript("OnClick", function() Bank.Close() end)
+    win.closeBtn = closeBtn
+
+    -- Settings gear, left of the ✕ — same pair, same order as the inventory window and
+    -- the Nexus dashboard. Hovers `accent` (not `danger`) and keeps a tooltip, because a
+    -- cog is ambiguous where a ✕ is not.
+    local gearBtn = _G.CreateFrame("Button", nil, titleBar, "BackdropTemplate")
+    gearBtn:SetSize(ICONBTN, ICONBTN)
+    gearBtn:SetPoint("RIGHT", closeBtn, "LEFT", -SPACE, 0)
+    local gx = gearBtn:CreateTexture(nil, "ARTWORK")
+    gx:SetPoint("TOPLEFT", gearBtn, "TOPLEFT", INSET, -INSET)
+    gx:SetPoint("BOTTOMRIGHT", gearBtn, "BOTTOMRIGHT", -INSET, INSET)
+    gx:SetTexture(((F and F.ART) or ("Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\")) .. "icon-gear")
+    gearBtn._face = gx
+    UI.Skin(gearBtn, function(self)
+        self:SetBackdrop(UI.FLAT_BACKDROP)
+        self:SetBackdropColor(UI.Color("inset"))
+        self:SetBackdropBorderColor(UI.Color("borderLite"))
+        self._face:SetVertexColor(UI.Color(self._hot and "accent" or "muted"))
+    end)
+    gearBtn:SetScript("OnEnter", function(self)
+        self._hot = true
+        self._face:SetVertexColor(UI.Color("accent"))
+        if _G.GameTooltip then
+            _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+            _G.GameTooltip:SetText("Bag settings", UI.Color("text"))
+            _G.GameTooltip:Show()
+        end
+    end)
+    gearBtn:SetScript("OnLeave", function(self)
+        self._hot = nil
+        self._face:SetVertexColor(UI.Color("muted"))
+        if _G.GameTooltip then _G.GameTooltip:Hide() end
+    end)
+    gearBtn:SetScript("OnClick", function()
+        local S = _G.DaseekiSuite
+        if S then
+            if     S.OpenTo then S:OpenTo("bags")
+            elseif S.Open   then S:Open("bags")
+            elseif S.Toggle then S:Toggle("bags") end
+        end
+    end)
+    win.gearBtn = gearBtn
 
     -- One entry-head hairline under the titlebar (§3).
     local titleRule
@@ -450,11 +513,23 @@ function Bank.Ensure()
 
     win._group = nil   -- pooled ns.Items group (built on first Rebuild)
     Bank.window = win
+    Bank.ApplyScale()
 
     -- Anchor the bank window offset from the inventory window if that exists, else centered.
     win:ClearAllPoints()
     win:SetPoint("CENTER", _G.UIParent, "CENTER", 260, 0)
     return win
+end
+
+-- Window scale. The bank deliberately has NO scale setting of its own: it reads the one
+-- shared db.scale through ns.Frame, so the two windows are always the same size side by
+-- side (they sit next to each other at the bank, where a mismatch would be obvious).
+-- Called from Ensure and re-called by Frame.RefreshScale when the slider moves.
+function Bank.ApplyScale()
+    local win = Bank.window
+    if not win or not win.SetScale then return end
+    local s = (ns.Frame and ns.Frame.Scale and ns.Frame.Scale()) or 1
+    win:SetScale(s)
 end
 
 ----------------------------------------------------------------------
@@ -613,7 +688,7 @@ function Bank.Rebuild()
     -- the title, money and grid were ever painted — the bank window came up blank.
     if win.ownerSelector and win.ownerSelector.Refresh then win.ownerSelector:Refresh() end
 
-    -- Gold title "<Character>'s Bank" for the VIEWED owner (1.0 TitleBank).
+    -- Gold "<Character> · Bank" for the VIEWED owner (see Bank.WindowTitle).
     if win.title then
         local nm = viewed and viewed.name
         if not nm then
@@ -860,7 +935,7 @@ end
 -- 1.0-LOOK PARITY: bank title format + free/total counter (bottom-center sibling).
 local function testBankTitleAndCounts(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
-    ck(Bank.WindowTitle("Daseeki") == "Daseeki's Bank", "title = <name>'s Bank")
+    ck(Bank.WindowTitle("Daseeki") == "Daseeki \194\183 Bank", "title = <name> \194\183 Bank")
     ck(Bank.WindowTitle(nil) == "Bank", "nil name -> Bank")
     ck(Bank.WindowTitle("")  == "Bank", "blank name -> Bank")
     local o = makeOwner({
