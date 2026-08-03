@@ -18,8 +18,6 @@
 
     Own-character data (DaseekiBagsAccount) is untouched. The remote read-cache
     (DaseekiBagsMesh) is retained and now filled by onRemote instead of DBAG.
-
-    Bagnon-derived (GPL) fork; this file is our own work.
 --]]
 
 local ADDON, Addon = ...
