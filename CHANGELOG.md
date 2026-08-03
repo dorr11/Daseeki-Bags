@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- **The bag cell is now Bags 1's bag cell, element for element.** Two earlier rounds fixed
+  the glow and then the panel underneath it, and the grid still read busier than Bags 1
+  side by side. The cause was never one detail — it was that a 2.0 cell simply had more
+  things drawn on it. A cell now draws exactly what Bags 1 draws:
+  - **The grey panel behind every slot is gone**, not dimmed. Bags 1 paints no panel at
+    all — an item's own icon is the slot, and an empty slot is the familiar bag-slot art.
+    2.0 now does the same, so the grid is icons on the window background instead of a
+    lattice of hard-edged squares with a gutter between them.
+  - **Empty slots use the classic empty-bag-slot art** instead of a flat dark rectangle.
+  - **Grey (junk) items are no longer greyed out.** Bags 1 keeps them in full colour and
+    puts the small vendor coin on the slot; that is what you get now. A third of a Classic
+    bag being rendered in greyscale was most of "hard to view".
+  - **Coloured items get their crisp ring back under the glow.** Bags 1 draws both — a thin
+    quality-coloured frame hugging the icon, with the soft halo washing over it. Without
+    the frame the halo was an unanchored colour spill; with it, the glow belongs to its own
+    slot again.
+  - **The stack-count numeral is the game's own again**, in its own place, exactly as in
+    Bags 1 — no custom font, no shifted corner.
+  - **Equipment-set items glow teal instead of carrying a bronze corner dot.** Bags 1 has
+    always expressed gear-set membership as a glow colour, in the order quest gold, then
+    can't-use red, then set teal, then rarity. One cue per slot, not two.
+- **The glow itself is re-derived from Bags 1 rather than from a reference spec**: very
+  slightly smaller, a touch brighter, sitting dead-centre instead of one pixel high, and
+  layered under the slot's own numerals and icons rather than over them. Everything still
+  scales with the density slider, so any cell size reads like a scaled Bags 1.
+- Search dimming now fades to the same depth Bags 1 uses.
+- The only thing 2.0 still draws that Bags 1 does not is the crimson new-item dot, which is
+  a deliberate 2.0 feature; a test now pins that it is the *only* extra.
+- No new settings, nothing you had configured changed, and the equipment-set toggle still
+  works — it now switches the teal glow instead of the corner dot.
+
 - **The quality glow is now exact.** The soft colored halo around each item was close
   but not right: it was drawn very slightly too small, a touch too bright, and sat one
   pixel low. It is now the reference treatment parameter for parameter — the halo is a

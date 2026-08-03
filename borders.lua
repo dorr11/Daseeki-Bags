@@ -3,20 +3,21 @@
 --
 -- The quality cue is INFORMATION the player wants (rarity-at-a-glance).
 --
--- ── The cue is a soft GLOW, not a hard outline — now SPEC-EXACT ───────────────────
+-- ── The cue is a soft GLOW + the template ring — now transcribed from 1.x SOURCE ──
 -- The beta drew a thin hard quality-colored SQUARE OUTLINE around each cell. The look
--- the owner wants is a soft additive halo that washes over the icon edge. The display
--- round shipped an approximation of that; this file now matches the clean-room
--- CII_BEHAVIOR_SPEC.md §2 anatomy exactly — 68/37 (not 67/37), alpha 0.49 (not 0.5),
--- a (0, 1) CENTER offset, and a plain OVERLAY texture with no sublevel. See the SUITE
--- GLOW GEOMETRY block for the parameter-by-parameter derivation, including why the
--- spec's fixed pixel sizes are carried here as ratios against its 37px reference button.
+-- the owner wants is 1.x's: a soft additive halo washing over the icon edge, WITH the
+-- template's own IconBorder ring re-tinted underneath it. The display round shipped an
+-- approximation; the round after that pinned it to the clean-room CII_BEHAVIOR_SPEC.md §2.
+-- Neither was the target. The target is our own 1.x tree (Daseeki-Bags on main), and this
+-- file is now a line-cited transcription of it — 67/37, alpha 0.5, no CENTER offset,
+-- OVERLAY sublevel -1, and the IconBorder driven rather than killed. See the SUITE GLOW
+-- GEOMETRY block for the parameter-by-parameter derivation and the four rows where 1.x
+-- and the spec disagree.
 --
--- Spec §3 gating is SURFACE-DEPENDENT and this file serves the BAG surface: the
--- reference's item-link/id lookup path (bags, bank, merchant) requires quality above
--- Common, which is exactly our Uncommon+ floor, plus the quest-item override. The
--- EVERY-QUALITY rule (poor and common included) belongs to the equipped-slot path and
--- lives in Daseeki-Armory's borders.lua.
+-- Gating stays as it was and 1.x and the spec agree on it for the BAG surface: quality
+-- above Common (1.x glowQuality `quality > 1`), plus the quest / unusable / equipment-set
+-- overrides. The EVERY-QUALITY rule (poor and common included) belongs to the equipped-slot
+-- path and lives in Daseeki-Armory's borders.lua.
 --
 -- What did NOT change: the per-quality COLORS (full saturation), the configurable
 -- min-quality floor (db.qualityBorderMin, default Uncommon+), the on/off toggle
@@ -93,12 +94,12 @@ end
 -- NORMAL_FONT_COLOR (which is 1, .82, 0): routing it through a Blizzard global would
 -- silently shift the blue channel.
 --
--- DELIBERATE DIVERGENCE from CII_BEHAVIOR_SPEC §3. The spec's quest-item override uses
--- a synthetic quality appended to the color table at PURE YELLOW (1, 1, 0). We keep our
--- warmer GOLD. The spec legitimises the OVERRIDE (quest class wins over rarity, which is
--- what our precedence chain does); the exact tint is a suite look decision, and gold
--- reads as "quest" against the near-black Daseeki ground where a pure yellow sits close
--- to Legendary orange under an ADD blend. Owner-flagged, not an oversight.
+-- This is 1.x VERBATIM (core/classes/item.lua:198: r,g,b = 1, .82, .2) and therefore the
+-- owner's target. It DIVERGES from CII_BEHAVIOR_SPEC §3, whose quest-item override uses a
+-- synthetic quality at PURE YELLOW (1, 1, 0) — the spec legitimises the OVERRIDE (quest
+-- class wins over rarity, which is what our chain does), but 1.x wins on the tint, and
+-- gold reads as "quest" against the near-black ground where a pure yellow sits close to
+-- Legendary orange under an ADD blend.
 function Borders.QuestRGB()
     return 1, 0.82, 0.2
 end
@@ -163,68 +164,94 @@ function Borders.ShouldShow(quality, enabled, minQuality)
     return quality >= (minQuality or DEFAULT_MIN_QUALITY)
 end
 
--- PURE: the WHOLE precedence chain in one place — 1.x's UpdateBorder branch order, top
--- down: quest gold > unusable red > rarity (above the floor). Returns r,g,b for the tint
--- the cell should glow, or nil when it should not glow at all. `provider` is injected
--- exactly as for QualityRGB (live: the game's quality-color function).
+-- EQUIPMENT-SET teal — 1.x item.lua:202 (glowSets branch): r,g,b = .2, 1, .8.
 --
--- This is the SINGLE glow decision. Apply() paints from it and the well-yield suppression
--- keys off it, so "is this cell glowing?" has exactly one answer and the halo and the well
--- can never disagree about a cell's state.
-function Borders.ResolveTint(quality, unusable, quest, enabled, minQuality, provider)
+-- CELL-PARITY change: 2.0 previously expressed set membership as a separate BRONZE CORNER
+-- PIP, which is a per-cell mark 1.x does not draw. 1.x has exactly one cue per cell — the
+-- halo — and set membership is a BRANCH OF THAT CHAIN, sitting between the unusable red
+-- and the rarity color. Restoring it here removes a mark from every set item's cell and is
+-- the 1.x model verbatim. The db.setMarkers toggle still gates the cue; it now gates the
+-- tint instead of the pip (no SavedVariables change).
+function Borders.SetRGB()
+    return 0.2, 1, 0.8
+end
+
+-- PURE: the WHOLE precedence chain in one place — 1.x's UpdateBorder branch order, top
+-- down (item.lua:197-205):
+--     quest gold  >  unusable red  >  equipment-set teal  >  rarity (above the floor)
+-- Returns r,g,b for the tint the cell should glow, or nil when it should not glow at all.
+-- `provider` is injected exactly as for QualityRGB (live: the game's quality-color function).
+--
+-- This is the SINGLE glow decision. Apply() paints the halo AND the template's IconBorder
+-- from it, so "is this cell glowing?" has exactly one answer and the two can never disagree.
+function Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider)
     if not enabled then return nil end
-    if quest    then return Borders.QuestRGB() end          -- 1.x's FIRST branch
-    if unusable then return Borders.UnusableRGB() end       -- "can't use", over rarity
+    if quest    then return Borders.QuestRGB() end           -- 1.x's FIRST branch
+    if unusable then return Borders.UnusableRGB() end        -- "can't use", over rarity
+    if set      then return Borders.SetRGB() end             -- 1.x glowSets, over rarity
     if not Borders.ShouldShow(quality, enabled, minQuality) then return nil end
-    return Borders.QualityRGB(quality, provider)            -- may still be nil (unknown quality)
+    return Borders.QualityRGB(quality, provider)             -- may still be nil (unknown quality)
 end
 
 -- PURE: the boolean form of ResolveTint — "does this cell's halo show?".
-function Borders.GlowShown(quality, unusable, quest, enabled, minQuality, provider)
-    return Borders.ResolveTint(quality, unusable, quest, enabled, minQuality, provider) ~= nil
+function Borders.GlowShown(quality, unusable, quest, set, enabled, minQuality, provider)
+    return Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider) ~= nil
 end
 
 ----------------------------------------------------------------------
--- SUITE GLOW GEOMETRY — the CII_BEHAVIOR_SPEC §2 border anatomy
+-- SUITE GLOW GEOMETRY — TRANSCRIBED FROM 1.x, NOT FROM THE SPEC
 --
--- 2.0 first drew the quality cue as a thin HARD square outline; the owner wanted the
--- soft additive halo back, and the display round shipped an approximation of it. This
--- block is the SPEC-EXACT version: every number below is taken from the clean-room
--- behavioral spec (CII_BEHAVIOR_SPEC.md §2), not from an approximation.
+-- HISTORY, so nobody re-litigates this a fourth time. Round 1 of the glow work pinned
+-- these constants to CII_BEHAVIOR_SPEC.md §2 (68/37, alpha 0.49, a (0, 1) CENTER nudge,
+-- a plain OVERLAY texture in a child frame one level ABOVE the button). The spec is a
+-- clean-room description of a THIRD-PARTY reference addon. It is not our target.
 --
--- Spec §2, restated:
---   * texture  Interface\Buttons\UI-ActionButton-Border (the soft action-button glow)
---   * layer    a plain OVERLAY child texture of the button — NO negative sublevel
---   * blend    ADD, so it adds light over the icon edge instead of rimming it
---   * size     68 x 68 on a 37 x 37 item button (Ammo slot excepted: 58 x 58)
---   * anchor   CENTER to the parent's CENTER, offset (0, 1)
---   * alpha    0.49 applied UNIFORMLY to every border
+-- The owner's target is verbatim "what 1.x looks like" — and 1.x is OUR OWN code, which
+-- we can read. Where 1.x and the spec disagree, 1.x wins. They disagree on four rows,
+-- every one of them transcribed below with its file:line:
 --
--- Those are FIXED pixel values in the reference because the reference only ever draws
--- on 37px buttons. Our buttons are not fixed: the Bags density slider moves the cell
--- size, and the sibling Armory draws on 37px paper-doll slots AND 32px flyout leads.
--- So we carry the spec's numbers as RATIOS against its 37px reference button —
--- 68/37, 58/37, 1/37 — and derive size and offset from the host button's measured
--- width. At 37px that reproduces the spec exactly (68, 58, 1); at any other size it
--- reproduces the same halo PROPORTION, so the look is identical at every density.
+--   Daseeki-Bags/core/classes/item.lua:54   b.IconGlow = b:CreateTexture(nil, 'OVERLAY', nil, -1)
+--   Daseeki-Bags/core/classes/item.lua:55   :SetTexture('Interface/Buttons/UI-ActionButton-Border')
+--   Daseeki-Bags/core/classes/item.lua:56   :SetBlendMode('ADD')
+--   Daseeki-Bags/core/classes/item.lua:57   :SetPoint('CENTER')          -- NO (0,1) offset
+--   Daseeki-Bags/core/classes/item.lua:58   :SetSize(67, 67)             -- 67, not 68
+--   Daseeki-Bags/core/api/settings.lua:34   glowAlpha = 0.5              -- 0.5, not 0.49
+--   Daseeki-Bags/core/classes/item.lua:208  IconGlow:SetVertexColor(r,g,b, Addon.sets.glowAlpha)
 --
--- The overhang is the whole point: at 68/37 the halo is ~1.84x the cell, which is what
--- makes it bleed past the icon as a wash instead of sitting on the edge as a rim.
+-- and the 37 the ratios are taken against is the item button's own side length: 1.x never
+-- resizes the button, it leaves ContainerFrameItemButtonTemplate at its native 37 and
+-- scales it (skin/others.lua:10 — grid step 37 + spacing, button scaled by itemScale).
 --
--- These ship as CONSTANTS, not settings — no new SavedVariables key. The reference
--- exposes alpha as a user "intensity" clamped [0.1, 1.0]; we deliberately do not, and
--- pin its DEFAULT (0.49) as our one value. Precedence (quest gold > unusable red >
--- rarity) and the configurable Borders.MinQuality() floor are unchanged.
+-- LAYER is the fourth row and the one with teeth. 1.x's glow is a texture ON THE BUTTON at
+-- OVERLAY sublevel -1, so it sorts BELOW the button's other OVERLAY art (the stack-count
+-- numeral, the quest bang, the cooldown text). Round 1 dropped the sublevel per the spec
+-- AND kept the glow in a child frame at button level + 1 — which puts the halo above every
+-- one of those, and above the neighbouring cells' overlay art too. We now reproduce 1.x:
+-- same frame level as the button, texture at OVERLAY sublevel -1.
 --
--- Armory's borders.lua carries this identical constant block (the sibling contract);
--- both harnesses gate the numbers so the two can never drift apart silently.
+-- Our buttons are not fixed at 37 (the Bags density slider moves the cell), so the 1.x
+-- pixel values are carried as RATIOS against 1.x's own 37px button and derived from the
+-- host button's measured width. At 37 that reproduces 1.x literally (67, 0); at any other
+-- density it reproduces the same halo PROPORTION, so every density reads like a scaled 1.x.
+--
+-- These ship as CONSTANTS, not settings — no new SavedVariables key. 1.x exposes glowAlpha
+-- as a slider; we pin its default (0.5) as our one value.
+--
+-- SIBLING-CONTRACT DRIFT, DELIBERATE: Daseeki-Armory's borders.lua still carries the SPEC
+-- numbers (68/37, 0.49, (0,1)). Armory serves the EQUIPPED-slot surface, where the spec's
+-- every-quality rule (§3) also applies and where there is no 1.x Daseeki-Bags counterpart
+-- to transcribe. The two files are no longer byte-identical and the Bags harness no longer
+-- claims they are. If the owner wants the character window to match the bag grid, Armory
+-- should be trued up to THIS block, not the other way round.
 ----------------------------------------------------------------------
-Borders.GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"
-Borders.GLOW_REF_BUTTON = 37     -- spec §2: the reference's item-button side length
-Borders.GLOW_SCALE      = 68 / 37   -- spec §2: a 68px halo on a 37px item button
-Borders.GLOW_SCALE_AMMO = 58 / 37   -- spec §2 exception: the Ammo slot halo is 58px
-Borders.GLOW_ALPHA      = 0.49      -- spec §2/§5: the reference "intensity" default
-Borders.GLOW_OFFSET_Y_SCALE = 1 / 37 -- spec §2: CENTER anchored with a (0, 1) offset
+Borders.GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"  -- 1.x item.lua:55
+Borders.GLOW_REF_BUTTON = 37        -- 1.x: the template item button, never resized
+Borders.GLOW_SCALE      = 67 / 37   -- 1.x item.lua:58  SetSize(67, 67)
+Borders.GLOW_SCALE_AMMO = 58 / 37   -- CII §2 Ammo exception; Bags has no ammo cell (dormant)
+Borders.GLOW_ALPHA      = 0.5       -- 1.x core/api/settings.lua:34  glowAlpha = 0.5
+Borders.GLOW_OFFSET_Y_SCALE = 0     -- 1.x item.lua:57  SetPoint('CENTER') — no offset
+Borders.GLOW_LAYER      = "OVERLAY" -- 1.x item.lua:54
+Borders.GLOW_SUBLEVEL   = -1        -- 1.x item.lua:54 — BELOW the button's other OVERLAY art
 
 -- PURE: the halo's side length for a cell of `buttonSize`, so the wash bleeds past the
 -- icon by the spec's proportion at any cell size the density slider produces. Pass
@@ -245,44 +272,26 @@ function Borders.GlowOffsetY(buttonSize)
 end
 
 ----------------------------------------------------------------------
--- WELL YIELD — the glowing cell's own edge art steps out of the halo's way
+-- THE WELL IS GONE (this supersedes the previous round's WELL YIELD)
 --
--- The per-slot dress (ui_items.ensureDress) paints a WELL texture on every cell: a solid
--- `inset` rect when empty, recolored `raised` when filled, inset 1px inside the button.
--- That rect IS the cell's visible edge in 2.0 — there is no separate hairline any more.
--- Its boundary is HARD and full-strength, so under the soft additive halo a glowing cell
--- read as "grey square with a glow behind it" instead of "the glow owns this cell"
--- (owner report, side-by-side against 1.x).
+-- The round before this one made the per-cell WELL texture yield to alpha 0 while its cell
+-- was glowing, because the owner reported a grey square reading through the halo. That was
+-- a patch on one state of one element. The 1.x model has no such element in ANY state:
 --
--- 1.x has no such conflict by construction: Item:Construct does `normal:Hide()` on the
--- button's NormalTexture outright, so a 1.x cell carries NO slot art of its own and the
--- IconGlow is the only thing describing the cell edge. We match the PERCEIVED result
--- rather than the mechanism — our well still exists (empty and non-glowing cells want
--- it), it just yields to alpha 0 for exactly as long as that cell is glowing.
+--   Daseeki-Bags/core/classes/item.lua:51-52   local normal = b:GetNormalTexture()
+--                                              if normal then normal:Hide() end
 --
--- STATE-DRIVEN, single source of truth: the suppression is keyed off ResolveTint below —
--- the same call that decides whether the halo shows at all — so the two can never drift.
--- Any tint (quest gold, unusable red, rarity) suppresses; no tint restores. Restoration
--- is automatic on every repaint that stops glowing: item removed (Apply(button, nil)),
--- quality dropped below the floor, the min-quality slider raised, or the Item-borders
--- toggle switched off (options.lua's regrid repaints).
+-- ...and nothing is created to replace it. A 1.x cell draws exactly ONE substrate — the
+-- icon texture itself — for both states: the item's icon when filled, and the empty-slot
+-- art when empty (item.lua:12-19 Backgrounds[2] = 'interface/paperdoll/ui-backpack-emptyslot',
+-- selected by the slotBackground = 2 default at core/api/settings.lua). There is no card,
+-- no panel, no rect, and therefore no cell edge to fight the halo — filled OR empty,
+-- glowing OR not.
 --
--- CONSTANTS, not settings — no new SavedVariables key, exactly like the glow geometry.
---
--- SEARCH-DIM is untouched: the dim cascade (Items._applyDress -> Borders.SetAlpha) scales
--- the GLOW CONTAINER's alpha and has never touched the well. Region alpha (SetAlpha) and
--- texture color alpha (SetColorTexture) are independent multipliers, so ui_items'
--- setWellState recolor after Apply cannot resurrect a suppressed well, and our SetAlpha
--- cannot fight the recolor — the two are order-independent.
+-- ui_items no longer creates the well at all, so WellAlpha / SetWellAlpha / WELL_* are
+-- retired rather than re-tuned. Nothing to suppress is strictly stronger than suppressing
+-- it in one state, and it is what 1.x actually does.
 ----------------------------------------------------------------------
-Borders.WELL_GLOW_ALPHA = 0    -- glowing cell: the well yields entirely (1.x: normal:Hide())
-Borders.WELL_FULL_ALPHA = 1    -- everything else: the quiet inset/raised well, unchanged
-
--- PURE: the well's region alpha for a cell whose glow is / is not shown.
-function Borders.WellAlpha(glowShown)
-    if glowShown then return Borders.WELL_GLOW_ALPHA end
-    return Borders.WELL_FULL_ALPHA
-end
 
 -- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, uncommon/rare = 1. Only
 -- meaningful when ShouldShow is true. RETAINED as a pure tier descriptor (and used by
@@ -368,9 +377,9 @@ local function ensureSnapDriver()
     end)
 end
 
--- Size and re-anchor the halo to the button it belongs to, at the spec's 68/37
--- proportion with the (0, 1)-at-37px CENTER offset. The cell size follows the density
--- slider, so both are read from the button rather than hardcoded.
+-- Size and re-anchor the halo to the button it belongs to, at 1.x's 67/37 proportion with
+-- its plain CENTER anchor (no offset). The cell size follows the density slider, so both
+-- are read from the button rather than hardcoded.
 local function layoutGlow(b)
     local glow = b._glow
     if not glow then return end
@@ -397,16 +406,16 @@ function Borders.Attach(button)
     -- than the cell (1.x's 67-on-37), so the wash bleeds over the icon edge on all sides.
     b:SetPoint("TOPLEFT", button, "TOPLEFT", 0, 0)
     b:SetPoint("BOTTOMRIGHT", button, "BOTTOMRIGHT", 0, 0)
-    if b.SetFrameLevel then b:SetFrameLevel((button:GetFrameLevel() or 1) + 1) end
+    -- CELL PARITY: the container sits at the button's OWN frame level, not one above it.
+    -- 1.x's IconGlow is a texture ON the button (item.lua:54), so it is ordered against the
+    -- button's other art by draw layer alone. A level+1 container ordered the halo above
+    -- EVERYTHING — the count numeral, the quest bang, the cooldown, and the neighbouring
+    -- cells' overlay art. Same level + OVERLAY(-1) below reproduces 1.x's ordering exactly.
+    if b.SetFrameLevel then b:SetFrameLevel(button:GetFrameLevel() or 1) end
     b._host = button
 
-    -- Spec §2: a PLAIN OVERLAY texture — no negative sublevel. (The sublevel is inert
-    -- here anyway: this container frame holds exactly ONE texture, and it already sits a
-    -- frame level above the button, so the sublevel could never order it against the
-    -- button's own OVERLAY art — the cooldown text, quest bang and marker pips. Dropping
-    -- it to the spec's plain OVERLAY is therefore a no-op in render order and simply
-    -- removes a parameter we had no basis for.)
-    local glow = b:CreateTexture(nil, "OVERLAY")
+    -- 1.x item.lua:54 — OVERLAY at sublevel -1, i.e. BELOW the button's other OVERLAY art.
+    local glow = b:CreateTexture(nil, Borders.GLOW_LAYER, nil, Borders.GLOW_SUBLEVEL)
     glow:SetTexture(Borders.GLOW_TEXTURE)
     glow:SetBlendMode("ADD")
     glow:SetPoint("CENTER", b, "CENTER", 0, 0)   -- re-anchored with the spec offset by layoutGlow
@@ -444,40 +453,53 @@ local function showGlow(b, r, g, bl)
     b:Show()
 end
 
--- FRAME (texture-op): park the cell's WELL at the yield alpha while its halo is shown,
--- and restore it the moment the halo is not. Guard-free of the WoW API (it only ever
--- calls SetAlpha on a texture region the dress already created), so the harness drives it
--- headless with a fake button. A cell without our dress — or an empty cell, which never
--- glows and therefore always lands on WELL_FULL_ALPHA — is left exactly as it was.
+-- FRAME (texture-op): the TEMPLATE's own IconBorder, driven exactly as 1.x drives it.
 --
--- SECURE / TAINT: SetAlpha on a CHILD texture of the button. Not a protected op; safe in
--- combat, same class as everything else Apply does.
-function Borders.SetWellAlpha(button, glowShown)
-    local well = button and button._dsWell
-    if not (well and well.SetAlpha) then return end
-    well:SetAlpha(Borders.WellAlpha(glowShown))
+-- CELL PARITY: 2.0 used to kill IconBorder outright (ui_items._killTemplateArt) on the
+-- grounds that Blizzard's full-saturation quality ring was "the bright rim". 1.x does NOT
+-- kill it — it re-colors it to the SAME tint as the halo and shows it on exactly the cells
+-- that glow:
+--
+--   Daseeki-Bags/core/classes/item.lua:194   SetItemButtonQuality(self, quality, link, false, isBound)
+--   Daseeki-Bags/core/classes/item.lua:210   self.IconBorder:SetVertexColor(r, g, b)
+--   Daseeki-Bags/core/classes/item.lua:220   self.IconBorder:SetShown(r)
+--
+-- That crisp ring hugging the icon is what ANCHORS the soft 67px wash to its own cell. With
+-- the ring killed, the halo was the only thing describing a glowing cell and read as an
+-- unanchored coloured bloom spilling into the gutters — which is the "cluttered" half of
+-- the owner's report. ui_items calls SetItemButtonQuality (as 1.x does) so Blizzard sets
+-- the region's own art; we only override color + shown, so no texture path is guessed here.
+--
+-- SECURE / TAINT: SetVertexColor / SetShown on a CHILD region of the button. Not protected.
+function Borders.SetIconBorder(button, r, g, bl)
+    local ib = button and (button.IconBorder
+        or (button.GetName and _G and _G[(button:GetName() or "") .. "IconBorder"]))
+    if not ib then return end
+    if r and ib.SetVertexColor then ib:SetVertexColor(r, g, bl) end
+    if ib.SetAlpha then ib:SetAlpha(r and 1 or 0) end
+    if r then if ib.Show then ib:Show() end
+    else if ib.Hide then ib:Hide() end end
 end
 
--- Color (or hide) a button's quality glow, and yield/restore that cell's well with it.
+-- Color (or hide) a button's quality glow AND the template IconBorder under it.
 -- Precedence is 1.x's UpdateBorder chain, top down:
---   quest (gold)  >  unusable (red)  >  quality (rarity)
+--   quest (gold)  >  unusable (red)  >  equipment set (teal)  >  quality (rarity)
 -- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the glow half of
 -- 1.x's quest treatment, the bang glyph being reserved for quest STARTERS (ui_items draws
--- that). `unusable` (1.x glowUnusable) draws a RED glow. Otherwise a FULL-SATURATION
--- rarity glow is drawn when the quality clears the configurable floor. Honors the store
--- toggle live. Recolor/resize/show/hide/alpha of textures only — safe on every repaint,
--- even in combat.
+-- that). `unusable` (1.x glowUnusable) draws a RED glow. `set` (1.x glowSets) draws the
+-- teal. Otherwise a FULL-SATURATION rarity glow is drawn when the quality clears the
+-- configurable floor. Honors the store toggle live. Recolor/resize/show/hide/alpha of
+-- textures only — safe on every repaint, even in combat.
 --
--- The tint is resolved ONCE (Borders.ResolveTint) and both consumers read that one
--- verdict: the halo is painted from it, and the well yields iff it is non-nil. The well
--- op runs BEFORE the Attach guard on purpose — the yield must hold on any button carrying
--- our dress, including a headless/harness button with no glow container.
-function Borders.Apply(button, quality, unusable, quest)
+-- The tint is resolved ONCE (Borders.ResolveTint) and both consumers read that one verdict:
+-- the halo and the IconBorder. The IconBorder op runs BEFORE the Attach guard on purpose —
+-- it must hold on any item button, including a headless/harness one with no glow container.
+function Borders.Apply(button, quality, unusable, quest, set)
     local r, g, bl = Borders.ResolveTint(
-        quality, unusable, quest, Borders.Enabled(), Borders.MinQuality(), liveProvider)
+        quality, unusable, quest, set, Borders.Enabled(), Borders.MinQuality(), liveProvider)
 
-    -- WELL YIELD: the glowing cell's own edge art steps aside so the halo owns the edge.
-    Borders.SetWellAlpha(button, r ~= nil)
+    -- 1.x item.lua:210/220 — the crisp ring that anchors the wash to this cell.
+    Borders.SetIconBorder(button, r, g, bl)
 
     local b = Borders.Attach(button)
     if not b then return end
@@ -738,22 +760,31 @@ local function testMinQualityConfig(fails)
     ck(r and r > g and r > b, "unusable red is red-dominant")
 end
 
--- SUITE GLOW GEOMETRY — pinned to CII_BEHAVIOR_SPEC §2. These constants ARE the look,
--- and they are a SIBLING CONTRACT: Daseeki-Armory's borders.lua declares the identical
--- block and its harness gates the identical numbers, so the character window and the
--- bag grid can never drift apart. Any edit here must be mirrored there.
+-- SUITE GLOW GEOMETRY — pinned to 1.x SOURCE (Daseeki-Bags on main), not to the spec.
+-- These constants ARE the look; every one is a literal transcription with a file:line
+-- citation in the constant block above. The former sibling-contract claim against
+-- Daseeki-Armory is deliberately NOT asserted any more (Armory serves the equipped
+-- surface and still carries the spec numbers) — see the constant block.
 local function testGlowGeometry(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local function near(a, b) return math.abs(a - b) < 1e-9 end
 
-    -- Spec §2 anatomy, constant by constant.
+    -- 1.x anatomy, constant by constant.
     ck(Borders.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border",
-        "spec §2 glow texture")
-    ck(Borders.GLOW_REF_BUTTON == 37, "spec §2 reference button is 37px")
-    ck(near(Borders.GLOW_SCALE, 68 / 37), "spec §2 proportion: a 68px halo on a 37px button")
-    ck(near(Borders.GLOW_SCALE_AMMO, 58 / 37), "spec §2 Ammo exception: a 58px halo")
-    ck(Borders.GLOW_ALPHA == 0.49, "spec §2 intensity default 0.49, uniform on every border")
-    ck(near(Borders.GLOW_OFFSET_Y_SCALE, 1 / 37), "spec §2 CENTER anchor offset (0, 1)")
+        "1.x item.lua:55 glow texture")
+    ck(Borders.GLOW_REF_BUTTON == 37, "1.x reference button is the template's own 37px")
+    ck(near(Borders.GLOW_SCALE, 67 / 37), "1.x item.lua:58 SetSize(67,67) on a 37px button")
+    ck(Borders.GLOW_ALPHA == 0.5, "1.x settings.lua:34 glowAlpha = 0.5, uniform on every tint")
+    ck(Borders.GLOW_OFFSET_Y_SCALE == 0, "1.x item.lua:57 SetPoint('CENTER') — no offset")
+    ck(Borders.GLOW_LAYER == "OVERLAY", "1.x item.lua:54 OVERLAY layer")
+    ck(Borders.GLOW_SUBLEVEL == -1, "1.x item.lua:54 sublevel -1 (below the button's own overlay art)")
+
+    -- REGRESSION LOCK on the previous round: these are the four spec values 1.x overrides.
+    -- If any of them comes back, the glow is no longer the owner's target.
+    ck(not near(Borders.GLOW_SCALE, 68 / 37), "NOT the spec's 68/37")
+    ck(Borders.GLOW_ALPHA ~= 0.49, "NOT the spec's 0.49")
+    ck(not near(Borders.GLOW_OFFSET_Y_SCALE, 1 / 37), "NOT the spec's (0,1) nudge")
+    ck(Borders.GLOW_SUBLEVEL ~= nil, "NOT the spec's plain-OVERLAY (no sublevel)")
 
     -- The halo is strictly LARGER than the cell — that overhang is what makes it read as
     -- a wash over the icon edge rather than as a rim around it.
@@ -761,24 +792,27 @@ local function testGlowGeometry(fails)
     ck(Borders.GLOW_SCALE_AMMO > 1, "even the Ammo halo overhangs")
     ck(Borders.GLOW_SCALE_AMMO < Borders.GLOW_SCALE, "the Ammo halo is the smaller exception")
 
-    -- At the spec's own button size the ratios reproduce its literal pixel values.
-    ck(near(Borders.GlowSize(37), 68), "a 37px cell -> the spec's literal 68px halo")
-    ck(near(Borders.GlowSize(37, true), 58), "…and the Ammo variant -> literally 58")
-    ck(near(Borders.GlowOffsetY(37), 1), "…and the offset -> literally 1")
+    -- At 1.x's own button size the ratios reproduce its literal pixel values.
+    ck(near(Borders.GlowSize(37), 67), "a 37px cell -> 1.x's literal 67px halo")
+    ck(near(Borders.GlowOffsetY(37), 0), "…and the offset -> literally 0")
 
     -- Scales with the density slider's cell size, so the look holds at any cell.
     ck(Borders.GlowSize(48) > Borders.GlowSize(37), "a bigger cell gets a bigger halo")
-    ck(near(Borders.GlowSize(74), 136), "a doubled cell doubles the halo (proportion held)")
-    ck(near(Borders.GlowOffsetY(74), 2), "…and doubles the offset")
+    ck(near(Borders.GlowSize(74), 134), "a doubled cell doubles the halo (proportion held)")
+    ck(Borders.GlowOffsetY(74) == 0, "…and the zero offset stays zero at every density")
     ck(Borders.GlowSize(0) == 0, "degenerate cell -> no halo")
     ck(Borders.GlowSize(-5) == 0, "negative cell -> no halo")
     ck(Borders.GlowSize(nil) == 0, "nil cell -> no halo")
     ck(Borders.GlowOffsetY(0) == 0 and Borders.GlowOffsetY(nil) == 0, "degenerate cell -> no offset")
 
-    -- UNIFORM intensity across the precedence chain: the spec applies ONE alpha to quest
-    -- gold, unusable red and every rarity, and lets the COLOR carry the distinction.
+    -- UNIFORM intensity across the precedence chain: 1.x applies ONE glowAlpha to quest
+    -- gold, unusable red, set teal and every rarity, letting the COLOR carry the distinction.
     -- (The per-tier thickness below is retained for the shared outline factory only.)
     ck(Borders.TierPx(2) ~= Borders.TierPx(4), "TierPx still describes the rarity tiers")
+
+    -- The retired well API must stay retired: 1.x draws no cell substrate in any state.
+    ck(Borders.WellAlpha == nil and Borders.SetWellAlpha == nil, "well-yield API retired (1.x has no well)")
+    ck(Borders.WELL_GLOW_ALPHA == nil and Borders.WELL_FULL_ALPHA == nil, "well constants retired")
 end
 
 -- Spec §3 colors + the BAG-surface gating rule, kept next to the geometry because the
@@ -812,133 +846,141 @@ local function testSpecColorsAndBagGate(fails)
     ck(qg < 1, "…deliberately warmer than the spec's (1, 1, 0)")
 end
 
--- WELL YIELD (owner defect: "the grey inset well border renders at full strength
--- underneath/through the halo"). Drives the REAL Borders.Apply headless — there is no
--- _G.CreateFrame in the harness, so Attach returns nil and Apply exercises exactly the
--- pure decision + the well texture-op, which is the part under test. A fake button
--- carrying only `_dsWell` records the alpha it was parked at.
-local function testWellYield(fails)
+-- CELL PARITY: the TEMPLATE IconBorder is 1.x's second half of the quality cue and is now
+-- driven by the same single tint verdict as the halo. Drives the REAL Borders.Apply headless
+-- — there is no _G.CreateFrame in the harness, so Attach returns nil and Apply exercises
+-- exactly the pure decision + the IconBorder texture-op, which is the part under test.
+local function testIconBorderParity(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return a and b and math.abs(a - b) < 1e-9 end
 
     local function fakeCell()
-        local well = { alpha = 1 }
-        function well:SetAlpha(a) self.alpha = a end
-        return { _dsWell = well }
+        local ib = { alpha = 0, shown = false, r = nil, g = nil, b = nil }
+        function ib:SetVertexColor(r, g, b) self.r, self.g, self.b = r, g, b end
+        function ib:SetAlpha(a) self.alpha = a end
+        function ib:Show() self.shown = true end
+        function ib:Hide() self.shown = false end
+        return { IconBorder = ib }
     end
 
     local saved = Store.db
     Store.db = { qualityBorders = true }    -- toggle ON, default Uncommon+ floor
 
-    -- The constants themselves: the well yields to (near) nothing and restores to full.
-    ck(Borders.WELL_GLOW_ALPHA <= 0.05, "a glowing cell's well yields to ~0 alpha")
-    ck(Borders.WELL_FULL_ALPHA == 1, "a non-glowing cell's well is fully opaque")
-    ck(Borders.WellAlpha(true) == Borders.WELL_GLOW_ALPHA, "WellAlpha(shown) -> yield alpha")
-    ck(Borders.WellAlpha(false) == Borders.WELL_FULL_ALPHA, "WellAlpha(hidden) -> full alpha")
-    ck(Borders.WellAlpha(nil) == Borders.WELL_FULL_ALPHA, "WellAlpha(nil) -> full alpha")
-
-    -- GLOW SHOWN -> well suppressed, for EVERY tint in the precedence chain.
+    -- SHOWN + TINTED for every branch of 1.x's chain, and always the SAME color the halo got.
     local rare = fakeCell()
-    Borders.Apply(rare, 3)                                   -- rarity blue
-    ck(rare._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "rarity glow suppresses the well")
-    local epic = fakeCell()
-    Borders.Apply(epic, 4)
-    ck(epic._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "epic glow suppresses the well")
+    Borders.Apply(rare, 3)
+    ck(rare.IconBorder.shown == true and rare.IconBorder.alpha == 1, "rarity -> IconBorder shown")
+    ck(near(rare.IconBorder.r, FALLBACK[3][1]), "…tinted the rarity color, not Blizzard's own")
+
     local questCell = fakeCell()
     Borders.Apply(questCell, 1, false, true)                 -- quest gold beats the floor
-    ck(questCell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "quest gold suppresses the well")
+    local qr = select(1, Borders.QuestRGB())
+    ck(questCell.IconBorder.shown == true and near(questCell.IconBorder.r, qr), "quest gold ring")
+
     local unusableCell = fakeCell()
     Borders.Apply(unusableCell, 1, true, false)              -- unusable red beats the floor
-    ck(unusableCell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "unusable red suppresses the well")
+    ck(unusableCell.IconBorder.shown == true, "unusable red ring")
 
-    -- GLOW HIDDEN -> well restored, by every route that can stop a glow.
-    local common = fakeCell()
-    Borders.Apply(common, 1)
-    ck(common._dsWell.alpha == Borders.WELL_FULL_ALPHA, "below-floor common keeps its well")
-    local poor = fakeCell()
-    Borders.Apply(poor, 0)
-    ck(poor._dsWell.alpha == Borders.WELL_FULL_ALPHA, "poor keeps its well")
+    local setCell = fakeCell()
+    Borders.Apply(setCell, 1, false, false, true)            -- 1.x glowSets teal
+    local sr, sg, sb = Borders.SetRGB()
+    ck(setCell.IconBorder.shown == true, "equipment-set teal ring")
+    ck(near(setCell.IconBorder.r, sr) and near(setCell.IconBorder.g, sg)
+        and near(setCell.IconBorder.b, sb), "…at 1.x's (.2, 1, .8)")
 
-    -- RESTORE PATH on the SAME cell: glow, then stop glowing (item removed / replaced by a
-    -- common / floor raised / toggle off). Each must hand the well back at full alpha.
-    local cell = fakeCell()
-    Borders.Apply(cell, 5)
-    ck(cell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "legendary suppresses")
-    Borders.Apply(cell, nil)                                  -- item removed -> empty slot
-    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "item removed -> well restored")
-    Borders.Apply(cell, 3)
-    ck(cell._dsWell.alpha == Borders.WELL_GLOW_ALPHA, "…re-suppressed on the next rare")
-    Store.db = { qualityBorders = true, qualityBorderMin = 4 }  -- floor raised past rare
-    Borders.Apply(cell, 3)
-    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "floor raised past it -> well restored")
-    Store.db = { qualityBorders = false }                       -- Item-borders toggled OFF
-    Borders.Apply(cell, 5)
-    ck(cell._dsWell.alpha == Borders.WELL_FULL_ALPHA, "toggle off -> well restored even on legendary")
-    Store.db = { qualityBorders = true }
-
-    -- EMPTY CELL: never glows, so its well is never touched off full — the owner's
-    -- "grey empty cells look correct as-is" is a hard invariant here.
-    -- (An empty slot is quality nil with no flags — paintButton's empty branch calls
-    -- Apply(button, nil). Repeated paints must never move it off full alpha.)
-    local empty = fakeCell()
-    for _ = 1, 3 do
-        Borders.Apply(empty, nil, false, false)
-        ck(empty._dsWell.alpha == Borders.WELL_FULL_ALPHA, "empty cell's well is untouched")
+    -- HIDDEN whenever the halo is hidden — the ring can never outlive the glow.
+    for _, q in ipairs({ 0, 1 }) do
+        local c = fakeCell()
+        Borders.Apply(c, q)
+        ck(c.IconBorder.shown == false and c.IconBorder.alpha == 0,
+            "q" .. q .. " below the floor -> no ring at all")
     end
 
-    -- No dress (a foreign / not-yet-dressed button) must not error.
-    local ok = pcall(Borders.Apply, {}, 4)
-    ck(ok, "a button without a well survives Apply")
-    ck(pcall(Borders.SetWellAlpha, nil, true), "SetWellAlpha(nil) is inert")
+    -- SAME CELL, state transitions: every route that stops a glow must also drop the ring.
+    local cell = fakeCell()
+    Borders.Apply(cell, 5)
+    ck(cell.IconBorder.shown == true, "legendary rings")
+    Borders.Apply(cell, nil)                                  -- item removed -> empty slot
+    ck(cell.IconBorder.shown == false, "item removed -> ring dropped")
+    Borders.Apply(cell, 3)
+    ck(cell.IconBorder.shown == true, "…re-rings on the next rare")
+    Store.db = { qualityBorders = true, qualityBorderMin = 4 }  -- floor raised past rare
+    Borders.Apply(cell, 3)
+    ck(cell.IconBorder.shown == false, "floor raised past it -> ring dropped")
+    Store.db = { qualityBorders = false }                       -- Item-borders toggled OFF
+    Borders.Apply(cell, 5)
+    ck(cell.IconBorder.shown == false, "toggle off -> no ring even on legendary")
+    Store.db = { qualityBorders = true }
+
+    -- EMPTY CELL: never glows, so it never rings. Repeated paints must stay quiet.
+    local empty = fakeCell()
+    for _ = 1, 3 do
+        Borders.Apply(empty, nil, false, false, false)
+        ck(empty.IconBorder.shown == false, "empty cell never rings")
+    end
+
+    -- $parentIconBorder fallback shape (a button with no accessor field but a name).
+    local named = { GetName = function() return "DaseekiBags2FakeIB" end }
+    local gib = fakeCell().IconBorder
+    _G["DaseekiBags2FakeIBIconBorder"] = gib
+    Borders.Apply(named, 4)
+    ck(gib.shown == true, "global $parentIconBorder fallback is driven too")
+    _G["DaseekiBags2FakeIBIconBorder"] = nil
+
+    -- A foreign / region-less button must not error.
+    ck(pcall(Borders.Apply, {}, 4), "a button with no IconBorder survives Apply")
+    ck(pcall(Borders.SetIconBorder, nil, 1, 1, 1), "SetIconBorder(nil) is inert")
 
     Store.db = saved
 end
 
--- The glow decision is ONE decision: ResolveTint drives both the halo and the well yield,
--- and it must reproduce 1.x's UpdateBorder precedence exactly (quest > unusable > rarity).
+-- The glow decision is ONE decision: ResolveTint drives both the halo and the template
+-- IconBorder, and it must reproduce 1.x's UpdateBorder precedence exactly
+-- (item.lua:197-205 — quest > unusable > set > rarity).
 local function testResolveTintPrecedence(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local function near(a, b) return math.abs(a - b) < 1e-9 end
     local MIN = DEFAULT_MIN_QUALITY
 
-    -- quest gold wins over BOTH unusable and a legendary rarity
-    local r, g, b = Borders.ResolveTint(5, true, true, true, MIN)
+    -- quest gold wins over unusable, set AND a legendary rarity
+    local r, g, b = Borders.ResolveTint(5, true, true, true, true, MIN)
     local qr, qg, qb = Borders.QuestRGB()
     ck(near(r, qr) and near(g, qg) and near(b, qb), "quest gold wins the chain")
-    -- unusable red wins over rarity
+    -- unusable red wins over set and rarity
     local ur = Borders.UnusableRGB()
-    ck(near(select(1, Borders.ResolveTint(5, true, false, true, MIN)), ur), "unusable beats rarity")
-    -- rarity when neither flag is set
-    ck(near(select(1, Borders.ResolveTint(3, false, false, true, MIN)), FALLBACK[3][1]),
+    ck(near(select(1, Borders.ResolveTint(5, true, false, true, true, MIN)), ur),
+        "unusable beats set + rarity")
+    -- set teal wins over rarity
+    local sr, sg, sb = Borders.SetRGB()
+    local xr, xg, xb = Borders.ResolveTint(5, false, false, true, true, MIN)
+    ck(near(xr, sr) and near(xg, sg) and near(xb, sb), "set teal beats rarity (1.x glowSets)")
+    -- ...and a set item BELOW the rarity floor still glows teal (the branch is above the gate)
+    ck(near(select(1, Borders.ResolveTint(1, false, false, true, true, MIN)), sr),
+        "a COMMON set item still glows teal")
+    -- rarity when no flag is set
+    ck(near(select(1, Borders.ResolveTint(3, false, false, false, true, MIN)), FALLBACK[3][1]),
         "rarity color when no override")
     -- the floor and the toggle both close the gate
-    ck(Borders.ResolveTint(1, false, false, true, MIN) == nil, "common -> no tint")
-    ck(Borders.ResolveTint(nil, false, false, true, MIN) == nil, "empty -> no tint")
-    ck(Borders.ResolveTint(5, true, true, false, MIN) == nil, "toggle off -> no tint at all")
-    ck(Borders.ResolveTint(3, false, false, true, 4) == nil, "raised floor -> no tint")
+    ck(Borders.ResolveTint(1, false, false, false, true, MIN) == nil, "common -> no tint")
+    ck(Borders.ResolveTint(nil, false, false, false, true, MIN) == nil, "empty -> no tint")
+    ck(Borders.ResolveTint(5, true, true, true, false, MIN) == nil, "toggle off -> no tint at all")
+    ck(Borders.ResolveTint(3, false, false, false, true, 4) == nil, "raised floor -> no tint")
 
-    -- GlowShown is the boolean face of it, and it is exactly what the well keys off.
-    ck(Borders.GlowShown(3, false, false, true, MIN) == true, "GlowShown: rare glows")
-    ck(Borders.GlowShown(1, false, false, true, MIN) == false, "GlowShown: common does not")
-    ck(Borders.GlowShown(1, false, true, true, MIN) == true, "GlowShown: quest common glows")
-    ck(Borders.GlowShown(4, false, false, false, MIN) == false, "GlowShown: toggle off silences epic")
-    -- the invariant the fix rests on: well suppressed IFF the halo is shown
-    for _, case in ipairs({
-        { 0, false, false }, { 1, false, false }, { 2, false, false }, { 4, false, false },
-        { 1, true, false }, { 1, false, true }, { nil, false, false },
-    }) do
-        local shown = Borders.GlowShown(case[1], case[2], case[3], true, MIN)
-        local want  = shown and Borders.WELL_GLOW_ALPHA or Borders.WELL_FULL_ALPHA
-        ck(Borders.WellAlpha(shown) == want, "well alpha tracks the halo for q=" .. tostring(case[1]))
-    end
+    -- GlowShown is the boolean face of it, and it is exactly what the IconBorder keys off.
+    ck(Borders.GlowShown(3, false, false, false, true, MIN) == true, "GlowShown: rare glows")
+    ck(Borders.GlowShown(1, false, false, false, true, MIN) == false, "GlowShown: common does not")
+    ck(Borders.GlowShown(1, false, true, false, true, MIN) == true, "GlowShown: quest common glows")
+    ck(Borders.GlowShown(1, false, false, true, true, MIN) == true, "GlowShown: set common glows")
+    ck(Borders.GlowShown(4, false, false, false, false, MIN) == false, "GlowShown: toggle off silences epic")
 end
 
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
-        { name = "glow geometry (spec §2)", fn = testGlowGeometry },
+        { name = "glow geometry (1.x source)", fn = testGlowGeometry },
         { name = "spec colors + bag gate",  fn = testSpecColorsAndBagGate },
         { name = "resolve-tint precedence", fn = testResolveTintPrecedence },
-        { name = "well yield under glow",   fn = testWellYield },
+        { name = "icon-border parity",      fn = testIconBorderParity },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "min-quality + unusable", fn = testMinQualityConfig },

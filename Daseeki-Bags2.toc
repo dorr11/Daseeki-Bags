@@ -60,6 +60,12 @@ migrate_settings.lua
 # --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
 borders.lua
 ui_items.lua
+# parity.lua: the CELL-PARITY GATE. A line-cited transcription of what Daseeki-Bags 1.x
+# draws in one bag cell, kept next to what 2.0 draws, with an assertion on every row. It
+# exists to stop the "the grid still reads cluttered" loop becoming a fourth round of
+# guessing: any per-cell element that drifts from the 1.x model turns the suite red and
+# names the row. Pure Lua, no frames; loads after ui_items so both models are resolvable.
+parity.lua
 ui_frame.lua
 ui_owner.lua
 ui_bank.lua

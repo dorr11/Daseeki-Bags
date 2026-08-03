@@ -206,8 +206,8 @@ function Options.Build(flow)
     -- that belong to one of your saved gear sets — NOT a border, so quality/unusable borders
     -- keep precedence. Additive; default ON, but INERT unless Daseeki-Armory is installed.
     register(ib:Checkbox({
-        label = "Show equipment-set markers",
-        tooltip = "Mark bag items that belong to a Daseeki-Armory equipment set with a bronze corner tick. Search with set:<name> (or bare set: for any set). Requires Daseeki-Armory.",
+        label = "Glow equipment-set items",
+        tooltip = "Glow bag items that belong to a Daseeki-Armory equipment set in teal, the way Bags 1 does. Search with set:<name> (or bare set: for any set). Requires Daseeki-Armory.",
         get = function() local db = DB(); return db == nil or db.setMarkers ~= false end,
         set = function(v) local db = DB(); if db then db.setMarkers = v and true or false end regrid() end,
     }).Refresh)

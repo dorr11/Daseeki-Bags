@@ -595,7 +595,7 @@ end
 -- attach borders at paint), then ui_frame last (it consumes ns.Items).
 local TOC_ORDER = { "core.lua", "store.lua", "nexus.lua", "capture.lua", "migrate.lua",
                     "migrate_settings.lua",
-                    "borders.lua", "ui_items.lua", "ui_frame.lua",
+                    "borders.lua", "ui_items.lua", "parity.lua", "ui_frame.lua",
                     "ui_owner.lua", "ui_bank.lua",
                     "search.lua", "rules2.lua", "sort.lua", "ui_find.lua", "options.lua", "features.lua" }
 
@@ -671,7 +671,7 @@ end
 -- which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
-    "borders", "capture", "core", "features", "migrate", "migrate_settings", "nexus",
+    "borders", "capture", "cell-parity", "core", "features", "migrate", "migrate_settings", "nexus",
     "options", "rules2", "search", "sort", "store",
     "ui_bank", "ui_find", "ui_frame", "ui_items", "ui_owner",
 }
