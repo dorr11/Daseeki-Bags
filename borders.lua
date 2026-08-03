@@ -3,12 +3,20 @@
 --
 -- The quality cue is INFORMATION the player wants (rarity-at-a-glance).
 --
--- ── DISPLAY ROUND, ITEM 8 — the cue is a 1.x GLOW, not a hard outline ─────────────
--- The beta drew a thin hard quality-colored SQUARE OUTLINE around each cell. 1.x draws
--- a soft additive halo that washes over the icon edge, and the owner asked for that
--- look back. The frame layer below is therefore ONE centered additive
--- UI-ActionButton-Border texture at 1.x's 67/37 proportion and 1.x's glowAlpha (0.5) —
--- see the GLOW GEOMETRY block for the parameter-by-parameter derivation.
+-- ── The cue is a soft GLOW, not a hard outline — now SPEC-EXACT ───────────────────
+-- The beta drew a thin hard quality-colored SQUARE OUTLINE around each cell. The look
+-- the owner wants is a soft additive halo that washes over the icon edge. The display
+-- round shipped an approximation of that; this file now matches the clean-room
+-- CII_BEHAVIOR_SPEC.md §2 anatomy exactly — 68/37 (not 67/37), alpha 0.49 (not 0.5),
+-- a (0, 1) CENTER offset, and a plain OVERLAY texture with no sublevel. See the SUITE
+-- GLOW GEOMETRY block for the parameter-by-parameter derivation, including why the
+-- spec's fixed pixel sizes are carried here as ratios against its 37px reference button.
+--
+-- Spec §3 gating is SURFACE-DEPENDENT and this file serves the BAG surface: the
+-- reference's item-link/id lookup path (bags, bank, merchant) requires quality above
+-- Common, which is exactly our Uncommon+ floor, plus the quest-item override. The
+-- EVERY-QUALITY rule (poor and common included) belongs to the equipped-slot path and
+-- lives in Daseeki-Armory's borders.lua.
 --
 -- What did NOT change: the per-quality COLORS (full saturation), the configurable
 -- min-quality floor (db.qualityBorderMin, default Uncommon+), the on/off toggle
@@ -33,7 +41,8 @@
 -- Split into a PURE decision layer (ShouldShow / QualityRGB / GlowSize / TierPx /
 -- Desaturate / Enabled — headless-testable) and a thin FRAME layer (Attach / Apply /
 -- SetAlpha — in-game only, guarded on _G.CreateFrame). Fresh code — no lines copied
--- from 1.x; the glow PARAMETERS are behavior facts read off the 1.x tree.
+-- from anywhere; the glow PARAMETERS are behavior facts quoted from the clean-room
+-- CII_BEHAVIOR_SPEC.md, which is the only reference this file was written against.
 --
 -- Toggle: Store.db.qualityBorders (defaults ON when unset).
 
@@ -80,13 +89,32 @@ function Borders.UnusableRGB()
     return 1, 0.1, 0.1
 end
 
--- QUEST gold — the exact 1.x glowQuest color, a literal triple in 1.x's UpdateBorder
--- (`r,g,b = 1, .82, .2`), applied to the icon border/overlay at full alpha. Kept as a
--- literal here for the same reason: it is NOT NORMAL_FONT_COLOR (which is 1, .82, 0), so
--- routing it through a Blizzard global would silently shift the blue channel.
+-- QUEST gold — our 1.x quest tint (1, .82, .2), kept as a literal because it is NOT
+-- NORMAL_FONT_COLOR (which is 1, .82, 0): routing it through a Blizzard global would
+-- silently shift the blue channel.
+--
+-- DELIBERATE DIVERGENCE from CII_BEHAVIOR_SPEC §3. The spec's quest-item override uses
+-- a synthetic quality appended to the color table at PURE YELLOW (1, 1, 0). We keep our
+-- warmer GOLD. The spec legitimises the OVERRIDE (quest class wins over rarity, which is
+-- what our precedence chain does); the exact tint is a suite look decision, and gold
+-- reads as "quest" against the near-black Daseeki ground where a pure yellow sits close
+-- to Legendary orange under an ADD blend. Owner-flagged, not an oversight.
 function Borders.QuestRGB()
     return 1, 0.82, 0.2
 end
+
+-- POOR near-black (CII_BEHAVIOR_SPEC §3). The reference MUTATES the bag quality-color
+-- table at load so quality 0 is r=g=b=0.1 rather than Blizzard's 0.62 grey, and every
+-- surface that resolves a color reads the mutated table. Under an ADD blend a 0.1 tint
+-- is very nearly nothing, which is the point: a poor item registers as "bordered but
+-- almost dark" rather than as a bright grey halo. Modelled here as an OVERRIDE that
+-- wins over the live provider, because the reference's mutation likewise wins over
+-- Blizzard's own value. In Bags this is a DORMANT path — the bag floor is Uncommon+
+-- (spec §3, the item-link lookup requires quality > Common) so a poor item never
+-- glows here — but the color layer is a sibling contract with Armory's equipped
+-- surface (where poor DOES glow), so both files carry it verbatim.
+local POOR_RGB = { 0.1, 0.1, 0.1 }
+Borders.POOR_RGB = POOR_RGB
 
 ----------------------------------------------------------------------
 -- Public quality colors (Blizzard's ITEM_QUALITY_COLORS values; game facts, not
@@ -94,7 +122,7 @@ end
 -- (i.e. the headless harness), so QualityRGB is deterministic under test.
 ----------------------------------------------------------------------
 local FALLBACK = {
-    [0] = { 0.62, 0.62, 0.62 }, -- Poor (grey)
+    [0] = { 0.1,  0.1,  0.1  }, -- Poor — spec §3 near-black override, NOT Blizzard's 0.62 grey
     [1] = { 1.00, 1.00, 1.00 }, -- Common (white)
     [2] = { 0.12, 1.00, 0.00 }, -- Uncommon (green)
     [3] = { 0.00, 0.44, 0.87 }, -- Rare (blue)
@@ -114,6 +142,10 @@ Borders._fallback = FALLBACK
 -- (a still-uncached migrated item) yields nil so the caller hides the edge.
 function Borders.QualityRGB(quality, provider)
     if quality == nil then return nil end
+    -- Poor is the one quality whose color is NOT the game's: spec §3 replaces it with
+    -- near-black, so the override runs BEFORE the provider (the reference mutates the
+    -- shared table, so its value is what every lookup sees).
+    if quality == 0 then return POOR_RGB[1], POOR_RGB[2], POOR_RGB[3] end
     if provider then
         local r, g, b = provider(quality)
         if r then return r, g, b end
@@ -132,39 +164,63 @@ function Borders.ShouldShow(quality, enabled, minQuality)
 end
 
 ----------------------------------------------------------------------
--- 1.x GLOW GEOMETRY (display round, ITEM 8)
+-- SUITE GLOW GEOMETRY — the CII_BEHAVIOR_SPEC §2 border anatomy
 --
--- 2.0 drew the quality cue as a thin HARD square outline. 1.x draws a soft colored
--- GLOW that washes over the icon edge, and that is the look the owner wants back.
--- The 1.x mechanism, read off core/classes/item.lua (behavior facts, no code copied):
+-- 2.0 first drew the quality cue as a thin HARD square outline; the owner wanted the
+-- soft additive halo back, and the display round shipped an approximation of it. This
+-- block is the SPEC-EXACT version: every number below is taken from the clean-room
+-- behavioral spec (CII_BEHAVIOR_SPEC.md §2), not from an approximation.
 --
---   b.IconGlow = b:CreateTexture(nil, 'OVERLAY', nil, -1)   -- :54
---   b.IconGlow:SetTexture('Interface/Buttons/UI-ActionButton-Border')  -- :55
---   b.IconGlow:SetBlendMode('ADD')                          -- :56
---   b.IconGlow:SetPoint('CENTER')                           -- :57 (centered, NOT allpoints)
---   b.IconGlow:SetSize(67, 67)                              -- :58 on a 37px ItemButton
---   ...
---   self.IconGlow:SetVertexColor(r, g, b, Addon.sets.glowAlpha)   -- :208
+-- Spec §2, restated:
+--   * texture  Interface\Buttons\UI-ActionButton-Border (the soft action-button glow)
+--   * layer    a plain OVERLAY child texture of the button — NO negative sublevel
+--   * blend    ADD, so it adds light over the icon edge instead of rimming it
+--   * size     68 x 68 on a 37 x 37 item button (Ammo slot excepted: 58 x 58)
+--   * anchor   CENTER to the parent's CENTER, offset (0, 1)
+--   * alpha    0.49 applied UNIFORMLY to every border
 --
--- and glowAlpha DEFAULTS TO 0.5 (core/api/settings.lua:34). So: an additive
--- UI-ActionButton-Border halo, drawn at ~1.81x the cell, tinted per-quality at half
--- alpha. The 67/37 ratio is what makes it bleed past the icon instead of rimming it.
+-- Those are FIXED pixel values in the reference because the reference only ever draws
+-- on 37px buttons. Our buttons are not fixed: the Bags density slider moves the cell
+-- size, and the sibling Armory draws on 37px paper-doll slots AND 32px flyout leads.
+-- So we carry the spec's numbers as RATIOS against its 37px reference button —
+-- 68/37, 58/37, 1/37 — and derive size and offset from the host button's measured
+-- width. At 37px that reproduces the spec exactly (68, 58, 1); at any other size it
+-- reproduces the same halo PROPORTION, so the look is identical at every density.
 --
--- 2.0 ships the same three parameters as CONSTANTS (a look decision, not a setting —
--- no new SavedVariables key). The per-quality COLORS and the min-quality floor are
--- unchanged: the precedence chain is still quest gold > unusable red > rarity, and
--- Borders.MinQuality() still gates which rarities glow at all.
+-- The overhang is the whole point: at 68/37 the halo is ~1.84x the cell, which is what
+-- makes it bleed past the icon as a wash instead of sitting on the edge as a rim.
+--
+-- These ship as CONSTANTS, not settings — no new SavedVariables key. The reference
+-- exposes alpha as a user "intensity" clamped [0.1, 1.0]; we deliberately do not, and
+-- pin its DEFAULT (0.49) as our one value. Precedence (quest gold > unusable red >
+-- rarity) and the configurable Borders.MinQuality() floor are unchanged.
+--
+-- Armory's borders.lua carries this identical constant block (the sibling contract);
+-- both harnesses gate the numbers so the two can never drift apart silently.
 ----------------------------------------------------------------------
 Borders.GLOW_TEXTURE = "Interface\\Buttons\\UI-ActionButton-Border"
-Borders.GLOW_SCALE   = 67 / 37   -- 1.x: a 67px halo on its 37px ItemButton
-Borders.GLOW_ALPHA   = 0.5       -- 1.x sets.glowAlpha default
+Borders.GLOW_REF_BUTTON = 37     -- spec §2: the reference's item-button side length
+Borders.GLOW_SCALE      = 68 / 37   -- spec §2: a 68px halo on a 37px item button
+Borders.GLOW_SCALE_AMMO = 58 / 37   -- spec §2 exception: the Ammo slot halo is 58px
+Borders.GLOW_ALPHA      = 0.49      -- spec §2/§5: the reference "intensity" default
+Borders.GLOW_OFFSET_Y_SCALE = 1 / 37 -- spec §2: CENTER anchored with a (0, 1) offset
 
 -- PURE: the halo's side length for a cell of `buttonSize`, so the wash bleeds past the
--- icon by the same proportion 1.x does at any cell size the density slider produces.
-function Borders.GlowSize(buttonSize)
+-- icon by the spec's proportion at any cell size the density slider produces. Pass
+-- `ammo` truthy for the spec's 58px Ammo-slot exception (no ammo cell exists in Bags;
+-- the parameter is here so the pure layer matches Armory's byte for byte).
+function Borders.GlowSize(buttonSize, ammo)
     local s = tonumber(buttonSize) or 0
     if s <= 0 then return 0 end
-    return s * Borders.GLOW_SCALE
+    return s * (ammo and Borders.GLOW_SCALE_AMMO or Borders.GLOW_SCALE)
+end
+
+-- PURE: the halo's vertical CENTER offset for a cell of `buttonSize` — the spec's
+-- (0, 1) nudge, carried as a ratio so it stays proportional at any cell size.
+function Borders.GlowOffsetY(buttonSize)
+    local s = tonumber(buttonSize) or 0
+    if s <= 0 then return 0 end
+    return s * Borders.GLOW_OFFSET_Y_SCALE
 end
 
 -- Edge thickness in LOGICAL pixels for a quality: epic+ = 2, uncommon/rare = 1. Only
@@ -251,8 +307,9 @@ local function ensureSnapDriver()
     end)
 end
 
--- Size the halo to the button it belongs to, at 1.x's 67/37 proportion. The cell size
--- follows the density slider, so this is read from the button rather than hardcoded.
+-- Size and re-anchor the halo to the button it belongs to, at the spec's 68/37
+-- proportion with the (0, 1)-at-37px CENTER offset. The cell size follows the density
+-- slider, so both are read from the button rather than hardcoded.
 local function layoutGlow(b)
     local glow = b._glow
     if not glow then return end
@@ -261,6 +318,10 @@ local function layoutGlow(b)
     local side = Borders.GlowSize(w)
     if side <= 0 then return end
     glow:SetSize(side, side)
+    if glow.ClearAllPoints then
+        glow:ClearAllPoints()
+        glow:SetPoint("CENTER", b, "CENTER", 0, Borders.GlowOffsetY(w))
+    end
 end
 
 -- Attach the quality-GLOW structure to a button ONCE, at creation. Idempotent: returns
@@ -278,10 +339,16 @@ function Borders.Attach(button)
     if b.SetFrameLevel then b:SetFrameLevel((button:GetFrameLevel() or 1) + 1) end
     b._host = button
 
-    local glow = b:CreateTexture(nil, "OVERLAY", nil, -1)   -- 1.x item.lua:54 layer
+    -- Spec §2: a PLAIN OVERLAY texture — no negative sublevel. (The sublevel is inert
+    -- here anyway: this container frame holds exactly ONE texture, and it already sits a
+    -- frame level above the button, so the sublevel could never order it against the
+    -- button's own OVERLAY art — the cooldown text, quest bang and marker pips. Dropping
+    -- it to the spec's plain OVERLAY is therefore a no-op in render order and simply
+    -- removes a parameter we had no basis for.)
+    local glow = b:CreateTexture(nil, "OVERLAY")
     glow:SetTexture(Borders.GLOW_TEXTURE)
     glow:SetBlendMode("ADD")
-    glow:SetPoint("CENTER", b, "CENTER", 0, 0)
+    glow:SetPoint("CENTER", b, "CENTER", 0, 0)   -- re-anchored with the spec offset by layoutGlow
     glow:Hide()
     b._glow = glow
     layoutGlow(b)
@@ -299,9 +366,9 @@ function Borders.Attach(button)
     return b
 end
 
--- Paint the halo one color and show it. Alpha is 1.x's uniform glowAlpha for every
--- branch — quest, unusable and rarity all glow at the same strength, and the COLOR is
--- what distinguishes them (1.x item.lua:208 passes one sets.glowAlpha for all four).
+-- Paint the halo one color and show it. Alpha is the spec's single uniform intensity
+-- for every branch — quest, unusable and rarity all glow at the same strength, and the
+-- COLOR is what distinguishes them (spec §2: one alpha "applied to every border").
 local function showGlow(b, r, g, bl)
     local glow = b._glow
     if not glow then return end
@@ -604,35 +671,85 @@ local function testMinQualityConfig(fails)
     ck(r and r > g and r > b, "unusable red is red-dominant")
 end
 
--- ITEM 8 (display round): the 1.x GLOW parameters. These three constants are the whole
--- contract a sibling window (the Armory character panel) needs to reproduce the identical
--- treatment, so they are gated here rather than left as loose literals in the frame layer.
+-- SUITE GLOW GEOMETRY — pinned to CII_BEHAVIOR_SPEC §2. These constants ARE the look,
+-- and they are a SIBLING CONTRACT: Daseeki-Armory's borders.lua declares the identical
+-- block and its harness gates the identical numbers, so the character window and the
+-- bag grid can never drift apart. Any edit here must be mirrored there.
 local function testGlowGeometry(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local function near(a, b) return math.abs(a - b) < 1e-9 end
+
+    -- Spec §2 anatomy, constant by constant.
     ck(Borders.GLOW_TEXTURE == "Interface\\Buttons\\UI-ActionButton-Border",
-        "1.x glow texture (item.lua:55)")
-    ck(math.abs(Borders.GLOW_SCALE - 67 / 37) < 1e-9, "1.x glow proportion 67px halo on a 37px cell")
-    ck(Borders.GLOW_ALPHA == 0.5, "1.x sets.glowAlpha default (settings.lua:34)")
+        "spec §2 glow texture")
+    ck(Borders.GLOW_REF_BUTTON == 37, "spec §2 reference button is 37px")
+    ck(near(Borders.GLOW_SCALE, 68 / 37), "spec §2 proportion: a 68px halo on a 37px button")
+    ck(near(Borders.GLOW_SCALE_AMMO, 58 / 37), "spec §2 Ammo exception: a 58px halo")
+    ck(Borders.GLOW_ALPHA == 0.49, "spec §2 intensity default 0.49, uniform on every border")
+    ck(near(Borders.GLOW_OFFSET_Y_SCALE, 1 / 37), "spec §2 CENTER anchor offset (0, 1)")
+
     -- The halo is strictly LARGER than the cell — that overhang is what makes it read as
     -- a wash over the icon edge rather than as a rim around it.
     ck(Borders.GLOW_SCALE > 1, "the halo overhangs the cell")
-    ck(Borders.GlowSize(37) == 37 * (67 / 37), "37px cell -> the 1.x 67px halo")
-    ck(math.abs(Borders.GlowSize(37) - 67) < 1e-9, "…which is literally 67")
+    ck(Borders.GLOW_SCALE_AMMO > 1, "even the Ammo halo overhangs")
+    ck(Borders.GLOW_SCALE_AMMO < Borders.GLOW_SCALE, "the Ammo halo is the smaller exception")
+
+    -- At the spec's own button size the ratios reproduce its literal pixel values.
+    ck(near(Borders.GlowSize(37), 68), "a 37px cell -> the spec's literal 68px halo")
+    ck(near(Borders.GlowSize(37, true), 58), "…and the Ammo variant -> literally 58")
+    ck(near(Borders.GlowOffsetY(37), 1), "…and the offset -> literally 1")
+
     -- Scales with the density slider's cell size, so the look holds at any cell.
     ck(Borders.GlowSize(48) > Borders.GlowSize(37), "a bigger cell gets a bigger halo")
+    ck(near(Borders.GlowSize(74), 136), "a doubled cell doubles the halo (proportion held)")
+    ck(near(Borders.GlowOffsetY(74), 2), "…and doubles the offset")
     ck(Borders.GlowSize(0) == 0, "degenerate cell -> no halo")
     ck(Borders.GlowSize(-5) == 0, "negative cell -> no halo")
     ck(Borders.GlowSize(nil) == 0, "nil cell -> no halo")
-    -- UNIFORM intensity across the precedence chain: 1.x applies ONE glowAlpha to quest
+    ck(Borders.GlowOffsetY(0) == 0 and Borders.GlowOffsetY(nil) == 0, "degenerate cell -> no offset")
+
+    -- UNIFORM intensity across the precedence chain: the spec applies ONE alpha to quest
     -- gold, unusable red and every rarity, and lets the COLOR carry the distinction.
     -- (The per-tier thickness below is retained for the shared outline factory only.)
     ck(Borders.TierPx(2) ~= Borders.TierPx(4), "TierPx still describes the rarity tiers")
 end
 
+-- Spec §3 colors + the BAG-surface gating rule, kept next to the geometry because the
+-- two together are what makes our halo read as the reference's.
+local function testSpecColorsAndBagGate(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    -- Poor is the spec's near-black override, and it beats the live provider (the
+    -- reference mutates the shared color table, so its value wins over Blizzard's).
+    ck(Borders.POOR_RGB[1] == 0.1 and Borders.POOR_RGB[2] == 0.1 and Borders.POOR_RGB[3] == 0.1,
+        "spec §3 Poor is near-black 0.1/0.1/0.1")
+    local pr, pg, pb = Borders.QualityRGB(0, function() return 0.62, 0.62, 0.62 end)
+    ck(pr == 0.1 and pg == 0.1 and pb == 0.1, "…and it overrides the live provider's grey")
+    ck(Borders._fallback[0][1] == 0.1, "the static table agrees with the override")
+    -- Common stays white (spec §3: white items get white on the equipped surface).
+    ck(Borders._fallback[1][1] == 1 and Borders._fallback[1][3] == 1, "spec §3 Common is white")
+
+    -- BAG surface gate (spec §3, the item-link lookup row): quality must exceed Common.
+    -- This is the floor Bags ships; the every-quality rule is the EQUIPPED path and
+    -- belongs to Armory, not here.
+    ck(Borders.DEFAULT_MIN_QUALITY == 2, "bag surface floor is above Common (spec §3)")
+    ck(Borders.ShouldShow(0, true) == false, "bag: poor does NOT glow")
+    ck(Borders.ShouldShow(1, true) == false, "bag: common does NOT glow")
+    ck(Borders.ShouldShow(2, true) == true,  "bag: uncommon glows")
+
+    -- The quest override survives the gate (spec §3 quest-class row) — it is applied by
+    -- Apply() ahead of the floor, so a Common quest item still glows. DELIBERATE
+    -- DIVERGENCE: our tint is gold (1, .82, .2), the spec's synthetic quest quality is
+    -- pure yellow (1, 1, 0). The override is the spec's; the tint is ours.
+    local qr, qg, qb = Borders.QuestRGB()
+    ck(qr == 1 and qg == 0.82 and qb == 0.2, "quest gold is our suite tint, not the spec's pure yellow")
+    ck(qg < 1, "…deliberately warmer than the spec's (1, 1, 0)")
+end
+
 function Borders.RunSelfTests(verbose)
     local suites = {
         { name = "should-show gate",     fn = testShouldShow },
-        { name = "glow geometry (1.x)",  fn = testGlowGeometry },
+        { name = "glow geometry (spec §2)", fn = testGlowGeometry },
+        { name = "spec colors + bag gate",  fn = testSpecColorsAndBagGate },
         { name = "quality-floor matrix", fn = testQualityFloorMatrix },
         { name = "mixed-bag mapping",    fn = testMixedBagMapping },
         { name = "min-quality + unusable", fn = testMinQualityConfig },

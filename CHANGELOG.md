@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- **The quality glow is now exact.** The soft colored halo around each item was close
+  but not right: it was drawn very slightly too small, a touch too bright, and sat one
+  pixel low. It is now the reference treatment parameter for parameter — the halo is a
+  little wider relative to the cell, the intensity is slightly softer, and it is nudged
+  up one pixel so it sits centered on the icon rather than under it. All three scale with
+  the density slider, so the halo looks identical at every cell size.
+- Poor-quality items now carry the reference's near-black tint instead of Blizzard's grey.
+  You will not see this in bags — poor and common items are still deliberately unglowed
+  there — but the color table now matches the character window, which *does* glow every
+  quality.
+- No new settings, and nothing you had configured changed: the on/off toggle, the
+  minimum-quality floor, and the quest-gold-over-red-over-rarity order are all as they were.
+
 ## 1.1.4
 - Fixed item/keyring changes not propagating when both accounts were already online when a session started — API-poll discovery now also sends the item manifest, not just gold.
 - Fixed rev divergence sticking forever: OnManifest now re-syncs on any rev mismatch (not just when behind), so a phantom stale rev heals on next contact.
