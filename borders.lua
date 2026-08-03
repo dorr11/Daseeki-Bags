@@ -172,6 +172,13 @@ end
 -- and the rarity color. Restoring it here removes a mark from every set item's cell and is
 -- the 1.x model verbatim. The db.setMarkers toggle still gates the cue; it now gates the
 -- tint instead of the pip (no SavedVariables change).
+--
+-- REGRESSION FOLLOW-UP: this branch is CORRECT and stays exactly as transcribed — but the
+-- cue that feeds it is now DEFAULT OFF. 1.x's set branch is unreachable on Classic Era
+-- unless ItemRack is loaded (Daseeki-Bags/libs/ItemSearch-1.3/API.lua:145-146 assigns
+-- `Lib.BelongsToSet = nop`), so "1.x parity" for the owner's install means NO teal at all.
+-- Left on, the teal outranks rarity and repaints roughly a third of a geared character's
+-- bag. The gate lives in ui_items (Items.SetCueEnabled); this file just resolves colours.
 function Borders.SetRGB()
     return 0.2, 1, 0.8
 end

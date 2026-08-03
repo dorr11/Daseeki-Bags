@@ -62,6 +62,7 @@ MigrateSettings.MARKER = "migratedSettingsFrom1x"
 
 function MigrateSettings.Defaults()
     local F = ns.Frame
+    local I = ns.Items
     return {
         columns             = (F and F.DEFAULT_COLUMNS)    or 11,
         buttonSize          = (F and F.DEFAULT_BUTTONSIZE) or 37,
@@ -72,6 +73,13 @@ function MigrateSettings.Defaults()
         qualityBorders      = true,
         moneyTooltipFaction = false,
         moneyTooltipMinGold = 0,
+        -- Equipment-set teal: OFF by default (1.x's own set branch is inert on Era —
+        -- ItemSearch-1.3/API.lua:145-146). See ui_items.lua's slotIsSet note.
+        setMarkers          = false,
+        -- Slot appearance defaults are the OWNER'S live 1.x profile values, owned by
+        -- ui_items so this file can never drift from them.
+        slotBackground      = (I and I.DEFAULT_SLOT_BACKGROUND) or 6,
+        slotAlpha           = (I and I.DEFAULT_SLOT_ALPHA)      or 0.29,
     }
 end
 
@@ -216,10 +224,46 @@ function MigrateSettings.MapSettings(db, sets, opts)
 
     -- Quality colouring of item slots (1.x drew it as a glow, 2.0 as a border; the
     -- toggle means the same thing to the owner). 1.x's per-quality glow switches
-    -- (glowNew / glowQuest / glowSets / glowUnusable / glowPoor) and its glowAlpha have
-    -- no 2.0 equivalent: 2.0 has a minimum-quality floor instead, which is a different
+    -- (glowNew / glowQuest / glowUnusable / glowPoor) and its glowAlpha have no 2.0
+    -- equivalent: 2.0 has a minimum-quality floor instead, which is a different
     -- control, so it is deliberately left at its own default.
     put(db, "qualityBorders", asBool(sets.glowQuality), DEF.qualityBorders)
+
+    -- 1.x glowSets is DELIBERATELY NOT MIGRATED onto 2.0's setMarkers. On Classic Era
+    -- 1.x's set branch is inert unless ItemRack is loaded (ItemSearch-1.3/API.lua:145-146
+    -- binds BelongsToSet to a no-op), so a stored `glowSets = true` records "I never
+    -- touched this switch", not "I want my bag repainted teal". Carrying it would turn a
+    -- cue the source install could not draw into one the destination install can — which
+    -- is exactly the regression this round fixes. 2.0's setMarkers stays off until the
+    -- owner asks for it on the options page.
+    rep.unavailable[#rep.unavailable + 1] = "glowSets (1.x set branch is inert on Era)"
+
+    -- SLOT APPEARANCE — the three keys 1.x keeps directly on `sets` (its own
+    -- SHARED_PROFILE_KEYS, core/api/settings.lua:145). 2.0's shipped defaults are already
+    -- the owner's live values, so this normally matches rather than applies; it exists so
+    -- ANY 1.x profile (a different character, a re-imported file) lands intact.
+    if type(sets.slotBackground) == "number" and ns.Items
+        and (ns.Items.SLOT_BACKGROUNDS[sets.slotBackground] ~= nil or sets.slotBackground == 1) then
+        put(db, "slotBackground", math.floor(sets.slotBackground), DEF.slotBackground)
+    end
+    if type(sets.slotAlpha) == "number" then
+        put(db, "slotAlpha", math.max(0, math.min(1, sets.slotAlpha)), DEF.slotAlpha)
+    end
+    do
+        local c = sets.slotBorderColor
+        if type(c) == "table" and type(c[1]) == "number"
+            and type(c[2]) == "number" and type(c[3]) == "number" then
+            -- A colour is a table, so `put`'s identity compare can never match or be
+            -- "still at the default"; write it only when 2.0 has no value of its own.
+            if db.slotBorderColor == nil then
+                db.slotBorderColor = { c[1], c[2], c[3], type(c[4]) == "number" and c[4] or 1 }
+                rep.applied[#rep.applied + 1] = "slotBorderColor"
+                rep.considered = rep.considered + 1
+            else
+                rep.kept[#rep.kept + 1] = "slotBorderColor"
+            end
+        end
+    end
 
     -- Money tooltip: identical key names and identical meaning on both sides.
     put(db, "moneyTooltipFaction", asBool(sets.moneyTooltipFaction), DEF.moneyTooltipFaction)

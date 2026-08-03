@@ -69,16 +69,49 @@ Parity.ONE_X = {
     SET_RGB       = { 0.2, 1, 0.8 },    -- :202
     MIN_QUALITY   = 2,                  -- :203  glowQuality and quality > 1
 
+    -- IS THE SET BRANCH REACHABLE ON THIS CLIENT? No — and this row is why the teal
+    -- regression happened. 1.x's :201 calls Search:BelongsToSet, and ItemSearch binds that
+    -- method by environment: libs/ItemSearch-1.3/API.lua:113 needs ItemRack loaded (the
+    -- owner's AddOns.txt says `ItemRack: disabled`), :128 needs a client NEWER than
+    -- Classic, and :145-146 is the else — `Lib.BelongsToSet = nop`. On Classic Era with
+    -- ItemRack off, 1.x therefore paints ZERO set teal no matter what glowSets says.
+    SET_BRANCH_LIVE = false,     -- libs/ItemSearch-1.3/API.lua:145-146  Lib.BelongsToSet = nop
+
     -- What is drawn on the cell besides the icon
     CELL_SUBSTRATE_REGIONS = 0,  -- :51-52 normal:Hide(); nothing is created to replace it
     ICON_TEXCOORD          = nil, -- 1.x never calls SetTexCoord on the item icon (grep-verified)
-    EMPTY_ICON    = "interface/paperdoll/ui-backpack-emptyslot",  -- :14 Backgrounds[2]
-    EMPTY_ALPHA   = 1,           -- core/api/settings.lua slotAlpha = 1; item.lua:167
+
+    -- EMPTY CELL — the OWNER'S PROFILE, not 1.x's shipped default. The previous round
+    -- cited skin/defaults.lua:59-60 (slotBackground = 2, slotAlpha = 1) and shipped the
+    -- bevelled backpack art at full opacity. His live DaseekiBagsSets (WTF, account #1 and
+    -- confirmed identical in #2/#3, and in every one of his named profiles) says:
+    --   slotBackground = 6  ->  item.lua:18 Backgrounds[6] = icon:SetAtlas(
+    --                           'MountJournalIcons-Horde') — the faction crest, not a bevel
+    --                           (his Alliance profile is 5, the Alliance crest)
+    --   slotAlpha      = 0.29 -> item.lua:167 draws that crest at 29% on an empty cell
+    -- ...which renders as the near-black cell carrying a faint tint in his screenshot.
+    -- OWNER-DIRECTED, not incidental: "this was something i deliberately implemented in
+    -- bags 1. the darkened, slightly opaque background is easier on the eyes."
+    EMPTY_BACKGROUND = 6,        -- owner profile slotBackground (item.lua:18 atlas entry)
+    EMPTY_ALPHA      = 0.29,     -- owner profile slotAlpha; item.lua:167
+    EMPTY_ICON_1X_DEFAULT = "interface/paperdoll/ui-backpack-emptyslot",  -- :14 Backgrounds[2]
+
     ICONBORDER_DRIVEN = true,    -- :194 SetItemButtonQuality, :210 SetVertexColor, :220 SetShown(r)
     JUNKICON_DRIVEN   = true,    -- :222 SetShown(glowPoor and quality == 0 and not hasNoValue)
     NEWITEM_KILLED    = true,    -- :49  b.NewItemTexture:Hide()  -> 1.x shows NO new-item cue
     COUNT_RESTYLED    = false,   -- :168 bare SetItemButtonCount; no font/colour/anchor call
-    SLOT_BORDER_ALPHA = 0,       -- :70 SetBackdropBorderColor(1,1,1,0); defaults slotBorderColor a=0
+
+    -- SLOT BORDER — again the owner's profile, not the default. 1.x CREATES a 2px backdrop
+    -- edge on every cell (:65-71) and re-colours it on every update from slotBorderColor
+    -- (:171-174), unconditionally — filled cells included. Its shipped default is invisible
+    -- ({1,1,1,0}, :70), which is why the previous round recorded alpha 0 and drew nothing.
+    -- The owner's value is a near-black maroon at 59%, and it is the other half of the
+    -- "darkened, slightly opaque" look he asked for.
+    SLOT_BORDER_PX     = 2,      -- :69  edgeSize = 2
+    SLOT_BORDER_RGBA   = { 0.207843, 0, 0.023529, 0.59 },  -- owner profile slotBorderColor
+    SLOT_BORDER_SCOPE  = "all",  -- :171-174 runs for every cell, filled or empty
+    SLOT_BORDER_ALPHA_1X_DEFAULT = 0,  -- :70 SetBackdropBorderColor(1,1,1,0)
+
     DIM_ALPHA         = 0.3,     -- :233 SetAlpha(matches and 1 or 0.3)
     CORNER_PIPS       = 0,       -- 1.x draws no addon-owned corner marks at all
     GROUND_RGBA       = { 0, 0, 0, 0.85 },  -- skin/defaults.lua:17  color = {0,0,0,0.85}
@@ -146,18 +179,24 @@ end
 
 -- 1.x, straight off core/classes/item.lua's Update / UpdateBorder.
 function Parity.OneXElementCount(ctx)
-    local n = 1                        -- :162-167  the icon region, ALWAYS drawn (item art
-                                       --            when filled, Backgrounds[2] when empty)
-    -- :51-52 the NormalTexture is hidden and nothing replaces it -> no substrate region
-    -- :70 SlotBorder ships at alpha 0 -> not drawn
+    local n = 1                        -- :156-167  the icon region, ALWAYS drawn (item art
+                                       --            when filled, Backgrounds[slotBackground]
+                                       --            at slotAlpha when empty)
+    -- :51-52 the NormalTexture is hidden and nothing replaces it -> no substrate FILL
     -- :48-49 BattlepayItemTexture / NewItemTexture hidden -> no new-item cue at all
+
+    -- :65-71 / :171-174 SlotBorder — created for EVERY cell and coloured on every update.
+    -- Drawn iff the profile's slotBorderColor alpha is above zero, which the owner's is.
+    if (Parity.ONE_X.SLOT_BORDER_RGBA[4] or 0) > 0 then n = n + 1 end
+
     if not ctx.filled then return n end
     local quest    = ctx.isQuest or ctx.isQuestStarter
     local glows = false
     if not ctx.dimmed then                                    -- :197-205 the tint chain
         if quest then glows = true
         elseif ctx.isUnusable then glows = true
-        elseif ctx.isSet then glows = true
+        -- :201 the set branch, gated by whether ItemSearch bound BelongsToSet at all
+        elseif ctx.isSet and Parity.ONE_X.SET_BRANCH_LIVE then glows = true
         elseif ctx.quality and ctx.quality > 1 then glows = true end
     end
     if glows then
@@ -175,12 +214,18 @@ end
 -- here: adding a region to the dress and wiring it to a state flag moves this number.
 function Parity.TwoOhElementCount(ctx)
     local Items, B = ns.Items, ns.Borders
-    local n = 1                        -- the icon region (item art / EMPTY_SLOT_TEXTURE)
-    -- the well is retired; no hairline; SlotBorder equivalent never existed
+    local n = 1                        -- the icon region (item art / slot-background art)
+    -- the well is retired; no hairline
+    -- the per-cell SLOT BORDER, drawn on every cell iff its live alpha is above zero
+    local _, _, _, sba = Items.SlotBorderColor()
+    if (sba or 0) > 0 then n = n + 1 end
     if not ctx.filled then return n end
     local spec = Items.ResolveState(ctx)
+    -- the set cue only reaches the chain when the (default-OFF) toggle is on, exactly as
+    -- 1.x's only reaches it when ItemSearch bound BelongsToSet to something real
+    local setLive = ctx.isSet and Items.SetCueEnabled()
     local glows = B.GlowShown(ctx.quality, ctx.isUnusable,
-        (ctx.isQuest or ctx.isQuestStarter), ctx.isSet, true, B.DEFAULT_MIN_QUALITY)
+        (ctx.isQuest or ctx.isQuestStarter), setLive, true, B.DEFAULT_MIN_QUALITY)
     if ctx.dimmed then glows = false end
     if glows then n = n + 2 end        -- halo + template IconBorder (borders.Apply)
     if spec.showQuestTab then n = n + 1 end
@@ -304,10 +349,39 @@ local function testCellComposition(fails)
     ck(B.WellAlpha == nil and B.SetWellAlpha == nil, "2.0: the well API is retired")
     ck(B.WELL_GLOW_ALPHA == nil and B.WELL_FULL_ALPHA == nil, "2.0: no well alpha constants")
 
-    -- EMPTY CELL. 1.x expresses it as the bag-slot art in the ICON region at slotAlpha.
-    ck(Items.EMPTY_SLOT_TEXTURE:lower():gsub("\\", "/"):find("paperdoll/ui%-backpack%-emptyslot") ~= nil,
-        "2.0 empty cell uses 1.x's Backgrounds[2] art (item.lua:14)")
-    ck(Items.EMPTY_SLOT_ALPHA == X.EMPTY_ALPHA, "…at 1.x's slotAlpha (1)")
+    -- EMPTY CELL — measured against the OWNER'S live 1.x profile, not 1.x's shipped
+    -- defaults. His slotBackground is the faction crest (6), NOT the bevelled backpack art
+    -- (2), and his slotAlpha is 0.29, NOT 1.
+    ck(Items.SlotBackground() == X.EMPTY_BACKGROUND,
+        "2.0 empty cell uses the owner's slotBackground (6 = faction crest, item.lua:18)")
+    ck(approx(Items.SlotAlpha(), X.EMPTY_ALPHA),
+        "…at the owner's slotAlpha (0.29), not 1.x's shipped default of 1")
+    ck(type(Items.SlotBackgroundArt(X.EMPTY_BACKGROUND)) == "table"
+        and Items.SlotBackgroundArt(X.EMPTY_BACKGROUND).atlas ~= nil,
+        "…and enum 6 resolves to an ATLAS entry, as 1.x's Backgrounds[6] function does")
+    ck(Items.SlotBackgroundArt(1) == nil, "enum 1 (None) draws no empty-slot art (1.x Era)")
+    ck(tostring(Items.SlotBackgroundArt(2)):lower():gsub("\\", "/")
+        :find("paperdoll/ui%-backpack%-emptyslot") ~= nil,
+        "enum 2 is still 1.x's Backgrounds[2] art (item.lua:14) for anyone who picks it")
+    -- The empty cell's icon alpha reaches the dress as its OWN multiplier, so the search
+    -- dim and slotAlpha compose the way they compose on screen in 1.x.
+    ck(approx(Items.ResolveState({ emptySlot = true }).iconAlpha, X.EMPTY_ALPHA),
+        "…and the empty-cell spec carries slotAlpha as the icon's own alpha")
+    ck(Items.ResolveState({ quality = 2, filled = true }).iconAlpha == 1,
+        "…while a FILLED cell's icon is always full alpha (1.x item.lua:167)")
+
+    -- SLOT BORDER. 1.x creates it for every cell and colours it on every update; the owner
+    -- runs it visible. 2.0 must draw it on every cell too, at his colour, 2px.
+    ck(X.SLOT_BORDER_SCOPE == "all", "1.x model: the slot border frames EVERY cell")
+    ck(Items.SLOT_BORDER_PX == X.SLOT_BORDER_PX, "slot border is 2px (1.x item.lua:69)")
+    do
+        local r, g, b, a = Items.SlotBorderColor()
+        local w = X.SLOT_BORDER_RGBA
+        ck(approx(r, w[1]) and approx(g, w[2]) and approx(b, w[3]) and approx(a, w[4]),
+            "slot border colour == the owner's slotBorderColor (0.208, 0, 0.024, 0.59)")
+        ck(a > X.SLOT_BORDER_ALPHA_1X_DEFAULT,
+            "…and it is VISIBLE, unlike 1.x's shipped {1,1,1,0} default")
+    end
 
     -- ICON CROP. 1.x never calls SetTexCoord on an item icon, so the icon file's own baked
     -- dark rim shows and gives each cell its separation. 2.0 must not crop either.
@@ -348,9 +422,18 @@ local function testCellComposition(fails)
         "EPIC cell: same element count as 1.x (icon + halo + ring)")
     ck(Parity.TwoOhElementCount(ctxOf(0)) == Parity.OneXElementCount(ctxOf(0)),
         "JUNK cell: same element count as 1.x (icon + coin)")
+    -- SET MEMBER. This is the regression row. 1.x cannot draw the teal on this client at
+    -- all (SET_BRANCH_LIVE = false), and 2.0's cue is default-OFF, so a set member must
+    -- render EXACTLY like any other cell of its rarity — no extra element, and the rarity
+    -- colour it would otherwise lose.
     ck(Parity.TwoOhElementCount(ctxOf(3, { isSet = true }))
         == Parity.OneXElementCount(ctxOf(3, { isSet = true })),
-        "SET member: same element count as 1.x (icon + teal halo + ring, no pip)")
+        "SET member: same element count as 1.x (no teal — 1.x's set branch is a nop here)")
+    ck(Items.SetCueEnabled() == false,
+        "the equipment-set teal is OFF by default (1.x parity: ItemSearch nop on Era)")
+    ck(Parity.TwoOhElementCount(ctxOf(3, { isSet = true }))
+        == Parity.TwoOhElementCount(ctxOf(3)),
+        "…so a RARE set member draws the same cell as a rare non-member")
 
     -- The ONE row where the two models are knowingly allowed to differ, by exactly one:
     -- the new-item wax dot, which 1.x does not have at all (it hides NewItemTexture).
@@ -396,7 +479,44 @@ local function testMutations(fails)
     X.DIM_ALPHA = savedDim
     ck(ns.Items.DressAlpha(true) == X.DIM_ALPHA, "…and restoring 0.3 makes the row pass again")
 
-    -- MUTATION 4 — the ELEMENT-COUNT row, mutated on the 2.0 side. Re-introduce a cell
+    -- MUTATION 4 — the EMPTY-CELL row. Put the previous round's citation (1.x's shipped
+    -- defaults: the bevelled backpack art at alpha 1) back into the model and the live 2.0
+    -- values must be detected as a mismatch.
+    local savedBg, savedAlpha = X.EMPTY_BACKGROUND, X.EMPTY_ALPHA
+    X.EMPTY_BACKGROUND, X.EMPTY_ALPHA = 2, 1
+    ck(ns.Items.SlotBackground() ~= X.EMPTY_BACKGROUND,
+        "MUTATION: '1.x default' slotBackground=2 is detected (the empty-art row is live)")
+    ck(ns.Items.SlotAlpha() ~= X.EMPTY_ALPHA,
+        "MUTATION: …and slotAlpha=1 is detected too")
+    X.EMPTY_BACKGROUND, X.EMPTY_ALPHA = savedBg, savedAlpha
+    ck(ns.Items.SlotBackground() == X.EMPTY_BACKGROUND and ns.Items.SlotAlpha() == X.EMPTY_ALPHA,
+        "…and restoring the owner's 6 / 0.29 makes the row pass again")
+
+    -- MUTATION 5 — the SLOT-BORDER row. Flip the model back to 1.x's invisible default and
+    -- both the colour check and the per-cell element count must move.
+    local savedRGBA = X.SLOT_BORDER_RGBA
+    X.SLOT_BORDER_RGBA = { 1, 1, 1, 0 }
+    local r5, g5, b5, a5 = ns.Items.SlotBorderColor()
+    ck(not (approx(r5, 1) and approx(g5, 1) and approx(b5, 1) and approx(a5, 0)),
+        "MUTATION: 1.x's invisible {1,1,1,0} default is detected (the slot-border row is live)")
+    ck(Parity.OneXElementCount(ctxOf(1)) ~= Parity.TwoOhElementCount(ctxOf(1)),
+        "MUTATION: …and an unpainted 1.x slot border moves the element count")
+    X.SLOT_BORDER_RGBA = savedRGBA
+    ck(Parity.OneXElementCount(ctxOf(1)) == Parity.TwoOhElementCount(ctxOf(1)),
+        "…and restoring the owner's 59% edge makes the row pass again")
+
+    -- MUTATION 6 — the SET-CUE row. Declare 1.x's set branch live (as it would be with
+    -- ItemRack loaded) while 2.0's cue stays off, and the set member's cell must diverge.
+    local savedLive = X.SET_BRANCH_LIVE
+    X.SET_BRANCH_LIVE = true
+    local setCtx = ctxOf(1, { isSet = true })
+    ck(Parity.OneXElementCount(setCtx) ~= Parity.TwoOhElementCount(setCtx),
+        "MUTATION: a live 1.x set branch is detected against 2.0's default-off cue")
+    X.SET_BRANCH_LIVE = savedLive
+    ck(Parity.OneXElementCount(setCtx) == Parity.TwoOhElementCount(setCtx),
+        "…and restoring the nop makes the row pass again")
+
+    -- MUTATION 7 — the ELEMENT-COUNT row, mutated on the 2.0 side. Re-introduce a cell
     -- substrate (the retired well) as one more drawn element and the count row must break.
     local realTwoOh = Parity.TwoOhElementCount
     Parity.TwoOhElementCount = function(ctx) return realTwoOh(ctx) + 1 end   -- "the well is back"

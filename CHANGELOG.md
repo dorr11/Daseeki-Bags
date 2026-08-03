@@ -28,6 +28,27 @@
   already names the character, so the selector no longer says it twice.
 - Nothing you had configured changed, and no new settings were added.
 
+- **The teal rings are gone.** After the last round almost every piece of gear in the bag
+  was wearing a teal ring instead of its rarity colour. The cue itself was working
+  correctly — those really were items in your Armory gear sets — but on a geared character
+  that is roughly a third of the bag, and because set teal outranks rarity, all of those
+  slots lost their green/blue/purple. It also was not what Bags 1 does: on Classic Era,
+  Bags 1 can only draw that cue when ItemRack is loaded, and it isn't, so Bags 1 draws no
+  teal at all. **The equipment-set glow is now off by default** and lives on the options
+  page under Item borders if you want it. Searching with `set:` works either way.
+  The membership test itself was also tightened while it was open: it now only counts an
+  item that a set actually names in a slot that set has not disabled, only for equippable
+  gear, and it stays completely silent when Armory is missing or has no sets.
+- **The slot background from Bags 1 is back — your Bags 1 look, not Bags 1's defaults.**
+  The last round read the shipped defaults out of the Bags 1 source and gave every empty
+  slot the bevelled backpack artwork at full opacity, which is a much louder grid than the
+  one you actually run. Your real Bags 1 profile draws a faction crest at 29% opacity in
+  empty slots, and frames *every* slot — full or empty — with a quiet dark 2px edge. That
+  is what 2.0 draws now, and those are its new defaults. Three new controls under
+  **Slot appearance**: empty slot art (None / Classic / Lion / Alliance / Horde), empty
+  slot opacity, and slot edge opacity. If you had those settings in Bags 1, they now
+  migrate across too.
+
 - **The bag cell is now Bags 1's bag cell, element for element.** Two earlier rounds fixed
   the glow and then the panel underneath it, and the grid still read busier than Bags 1
   side by side. The cause was never one detail — it was that a 2.0 cell simply had more

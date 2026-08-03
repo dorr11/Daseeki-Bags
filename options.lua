@@ -202,15 +202,77 @@ function Options.Build(flow)
     }).Refresh)
     ib:Hint("Unusable gear (your class can't equip it, or it's below its required level) always shows a red border.")
 
-    -- Equipment-set marker (audit §2.8, Daseeki-Armory). A subtle bronze corner tick on items
-    -- that belong to one of your saved gear sets — NOT a border, so quality/unusable borders
-    -- keep precedence. Additive; default ON, but INERT unless Daseeki-Armory is installed.
+    -- Equipment-set teal (Daseeki-Armory bridge). DEFAULT OFF, deliberately — see the long
+    -- note above slotIsSet in ui_items.lua: Bags 1 CANNOT draw this cue on Classic Era
+    -- unless ItemRack is loaded (ItemSearch-1.3/API.lua:145-146 binds BelongsToSet to a
+    -- no-op otherwise), so "off" is what Bags 1 renders. Left ON it repaints roughly a
+    -- third of a geared character's bag teal, hiding those cells' rarity colours.
     register(ib:Checkbox({
         label = "Glow equipment-set items",
-        tooltip = "Glow bag items that belong to a Daseeki-Armory equipment set in teal, the way Bags 1 does. Search with set:<name> (or bare set: for any set). Requires Daseeki-Armory.",
-        get = function() local db = DB(); return db == nil or db.setMarkers ~= false end,
+        tooltip = "Glow bag items that belong to a Daseeki-Armory equipment set in teal. OFF by default: the teal wins over the rarity colour, so on a geared character it can repaint a large part of the bag. Search with set:<name> (or bare set: for any set) works either way. Requires Daseeki-Armory.",
+        get = function() local db = DB(); return db ~= nil and db.setMarkers == true end,
         set = function(v) local db = DB(); if db then db.setMarkers = v and true or false end regrid() end,
     }).Refresh)
+
+    -- ── Slot appearance (Bags 1 parity: slotBackground / slotAlpha / slotBorderColor) ──
+    -- The owner's deliberate Bags 1 look: a quiet faction crest in each EMPTY cell at low
+    -- opacity, and a dark, slightly-opaque 2px edge on EVERY cell. Defaults here are his
+    -- live Bags 1 profile values, not Bags 1's shipped defaults.
+    local slot = flow:AddSection("Slot appearance")
+    slot:Hint("The empty-slot artwork and the quiet edge every slot carries — the darkened, easier-on-the-eyes look from Bags 1.")
+
+    local bgRow = slot:AddRow({ vAlign = "center" })
+    bgRow:Label("Empty slot art")
+    register(bgRow:SegmentedChoice({
+        compact = true,
+        choices = (ns.Items and ns.Items.SLOT_BACKGROUND_CHOICES)
+            or { { value = 1, text = "None" }, { value = 2, text = "Classic" } },
+        get = function()
+            local db = DB()
+            if db and type(db.slotBackground) == "number" then return db.slotBackground end
+            return (ns.Items and ns.Items.DEFAULT_SLOT_BACKGROUND) or 6
+        end,
+        set = function(v)
+            local db = DB()
+            if db then db.slotBackground = tonumber(v) or (ns.Items and ns.Items.DEFAULT_SLOT_BACKGROUND) or 6 end
+            regrid()
+        end,
+    }).Refresh)
+
+    register(slot:Slider({
+        label = "Empty slot opacity", min = 0, max = 100, step = 1, width = 260,
+        format = function(v) return string.format("%d%%", math.floor((tonumber(v) or 0) + 0.5)) end,
+        get = function()
+            local db = DB()
+            local a = (db and type(db.slotAlpha) == "number") and db.slotAlpha
+                or (ns.Items and ns.Items.DEFAULT_SLOT_ALPHA) or 0.29
+            return a * 100
+        end,
+        set = function(v)
+            local db = DB()
+            if db then db.slotAlpha = math.max(0, math.min(1, (tonumber(v) or 0) / 100)) end
+            regrid()
+        end,
+    }).Refresh)
+
+    register(slot:Slider({
+        label = "Slot edge opacity", min = 0, max = 100, step = 1, width = 260,
+        format = function(v) return string.format("%d%%", math.floor((tonumber(v) or 0) + 0.5)) end,
+        get = function()
+            if not (ns.Items and ns.Items.SlotBorderColor) then return 0 end
+            local _, _, _, a = ns.Items.SlotBorderColor()
+            return (a or 0) * 100
+        end,
+        set = function(v)
+            local db = DB()
+            if db and ns.Items and ns.Items.SlotBorderColor then
+                local r, g, b = ns.Items.SlotBorderColor()
+                db.slotBorderColor = { r, g, b, math.max(0, math.min(1, (tonumber(v) or 0) / 100)) }
+            end
+            regrid()
+        end,
+    }).Refresh)
+    slot:Hint("Empty slot art and opacity apply to empty slots; the edge frames every slot, filled or not — exactly as Bags 1 does it.")
 
     -- ── Sorting ───────────────────────────────────────────────────────────────
     local sorting = flow:AddSection("Sorting")
