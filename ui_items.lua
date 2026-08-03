@@ -758,7 +758,9 @@ local TOKEN_FALLBACK = {
     danger     = { 0.8118, 0.3647, 0.2902 },
     -- Core-less parity (latent white-square bug): tokenRGB returns {1,1,1} for an unknown
     -- key, so any token used by the dress that was NOT listed here rendered PURE WHITE on
-    -- an install without Daseeki-Core (which is OptionalDeps, not Dependencies). `bronze`
+    -- an install without Daseeki-Core. Since 2.0.0 Core is a HARD "## Dependencies", so
+    -- this whole fallback table is belt-and-braces rather than a live code path -- kept
+    -- because it is inert and because a force-loaded install can still reach it. `bronze`
     -- is the set marker; `idle` is used by the owner selector. Values mirror
     -- Daseeki-Core/theme.lua's Field Ledger defaults (bronze = accentDim, idle = faint).
     bronze     = { 0.5412, 0.4471, 0.2235 }, -- metallic keyline / ornament

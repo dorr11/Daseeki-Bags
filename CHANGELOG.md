@@ -8,6 +8,14 @@ the way you install any other update. There is nothing to export, nothing to re-
 and nothing to set up again. The first time you log in, Bags 2 reads your old saved data
 and brings it across, once, automatically.
 
+**Requirements: Daseeki Core 2.2.0 or later is now required.** 1.x listed Core as optional,
+but Bags 2 draws its whole window with Core's shared look — without it there is no window at
+all. Core is therefore a proper dependency from this release: the game will not load Bags
+until Core is installed and enabled, and CurseForge will offer Core alongside it. (If Bags
+is forced to load with Core missing, it now leaves your normal Blizzard bags working and
+tells you why in chat, instead of leaving you with no bags at all.) Daseeki Nexus stays
+entirely optional.
+
 ### What carries over
 
 - **Every character's bags, bank, keyring and gold** — including alts you have not logged
@@ -40,6 +48,13 @@ and brings it across, once, automatically.
 - **A handful of 1.x appearance knobs with no 2.0 equivalent** (frame strata/alpha, per-frame
   named profiles, the individual glow switches). Where 2.0 expresses the same idea a
   different way, it keeps its own control rather than guessing at a conversion.
+- **The launcher button on Titan Panel / Bazooka bars is gone.** 1.x registered a data-broker
+  plugin you could click to open your bags from a bar addon; open them with your bag key,
+  the bag icons, or `/bags` instead.
+- **The tracked-currency row along the bottom of the bag window is gone**, and so are the
+  currency counts 1.x added to currency tooltips (the *count currency* setting) — Classic
+  Era has almost nothing to track, and Bags 2 counts tokens the same way it counts any
+  other item.
 - **The equipment-set glow is deliberately left off**, even if 1.x had it on. On Classic Era
   1.x could only ever draw that cue with ItemRack installed, so a stored "on" recorded a
   switch you never touched, not a look you chose. Turn it on under Item borders if you want it.

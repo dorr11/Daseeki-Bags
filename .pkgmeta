@@ -4,6 +4,16 @@
 # second addon. Release-gate C.11. Do not "modernise" it to Daseeki-Bags2.
 package-as: Daseeki-Bags
 license-output: LICENSE
+
+# CurseForge project relations. BigWigsMods/packager reads these lists and uploads them
+# as the project's Relations, so the site offers Core alongside Bags and the client
+# never lands in the Core-less state the .toc header describes (release verification N1).
+# Values are CurseForge project SLUGS, lower-cased by the packager -- NOT project ids.
+# daseeki-core is https://www.curseforge.com/wow/addons/daseeki-core (project 1592402),
+# which is the X-Curse-Project-ID Daseeki-Core.toc declares.
+required-dependencies:
+  - daseeki-core
+
 ignore:
   - README.md
   - CHANGELOG.md

@@ -1,10 +1,11 @@
 ## Title: Daseeki Bags
-## Notes: A standalone bag interface for WoW Classic Era.
+## Notes: A single-window bag interface for WoW Classic Era. Requires Daseeki-Core.
 ## Author: Daseeki
 ## Category: Bags & Inventory
 ## X-License: MIT
 ## X-Curse-Project-ID: 1592410
-## OptionalDeps: Daseeki-Core, Daseeki-Nexus
+## Dependencies: Daseeki-Core
+## OptionalDeps: Daseeki-Nexus
 ## Interface: 11507, 11508, 11509
 ## Version: 2.0.0
 ## SavedVariables: DaseekiBags2DB, DaseekiBags2Data, DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
@@ -21,6 +22,26 @@
 ## (WTF/.../SavedVariables/Daseeki-Bags.lua — it is named for the folder), same
 ## Bindings.xml action names, same slash commands. Nothing here asks the client,
 ## CurseForge, or the user's WTF folder to treat this as a different addon.
+##
+## DEPENDENCIES — Daseeki-Core IS HARD, AND HONESTLY SO (release verification N1).
+## Until 2.0.0 Daseeki-Core sat on OptionalDeps and the README claimed Bags "works
+## standalone". It does not, and the failure was silent and total: ui_frame.lua's
+## Frame.Ensure() returns nil the moment _G.DaseekiUI is absent (no window can ever be
+## built), while Frame.HookBagToggles() replaced all NINE Blizzard bag globals
+## unconditionally. Result on a Core-less install: the bag key opens nothing, the
+## Blizzard bags are gone too, and nothing is printed. A hard "## Dependencies" line is
+## the honest statement — the client refuses to load Bags without Core rather than
+## loading it into a state where it cannot draw. The matching CurseForge relation lives
+## in .pkgmeta (required-dependencies: daseeki-core) so the site installs Core with us.
+##
+## Daseeki-Nexus stays OPTIONAL and must NOT be promoted: nexus.lua is fully type-guarded
+## and Bags is unchanged without it. Its presence on OptionalDeps is a LOAD-ORDER
+## statement only (Nexus SavedVariables must be attached before our ADDON_LOADED runs
+## Store.Init -> Migrate.Migrate, or the mesh-import deferral decides blind).
+##
+## Defence in depth: even a hard dependency can be force-loaded with the dependency
+## disabled, so Frame.OnLogin re-checks _G.DaseekiUI, SKIPS the toggle hook and prints one
+## plain line when it is missing. The Blizzard bags then survive. See ui_frame.lua.
 ##
 ## SAVEDVARIABLES CONTRACT (ROLLOUT_CONTINUITY_AUDIT AT-RISK-1 — the cutover's
 ## most destructive defect, and the reason all FIVE globals are declared here):
@@ -76,7 +97,7 @@ migrate.lua
 # different marker, and it consumes the search grammar at CALL time (not load time),
 # so its position here is free.
 migrate_settings.lua
-# --- W2 (UI) --- loads after Daseeki-Core (OptionalDeps) so DaseekiUI exists ---
+# --- W2 (UI) --- loads after Daseeki-Core (Dependencies) so DaseekiUI exists ---
 borders.lua
 ui_items.lua
 # parity.lua: the CELL-PARITY GATE. A line-cited transcription of what Daseeki-Bags 1.x

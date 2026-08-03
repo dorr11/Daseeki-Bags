@@ -2605,6 +2605,43 @@ function Frame.HookBagToggles()
 end
 
 ----------------------------------------------------------------------
+-- CORE-LESS SAFETY VALVE  (release verification N1)
+--
+-- Frame.Ensure() above returns nil the moment _G.DaseekiUI is absent: with no Daseeki-Core
+-- there is no theme provider, so no window can EVER be built. HookBagToggles, meanwhile,
+-- used to run unconditionally and replace all nine Blizzard bag globals. Those two facts
+-- together produced the worst possible outcome on a Core-less install: our window cannot
+-- open, and the Blizzard bags that would have opened have been overwritten. The owner
+-- presses their bag key and NOTHING happens, with nothing printed to explain it.
+--
+-- Daseeki-Core is now a HARD "## Dependencies" in the .toc, so the client will not load
+-- Bags at all without it and this branch should be unreachable. It is kept because the
+-- client can still be talked into loading an addon whose dependency is missing or merely
+-- DISABLED in the addon list, and because a hard dep is a promise about load order, not a
+-- guarantee about the global. When the guard trips we leave the Blizzard globals alone --
+-- the owner keeps working bags -- and say once, in plain language, what is wrong.
+--
+-- Returns true when the hook was installed, false when it was deliberately skipped.
+Frame.CORE_MISSING_NOTICE =
+    "Daseeki Bags needs Daseeki-Core — bags are using the standard Blizzard windows until it's installed/enabled."
+Frame._coreMissingNoticed = false
+function Frame.EnsureBagToggleHook()
+    -- Headless (no CreateFrame): there are no Blizzard bag globals to protect and no chat
+    -- to print to. HookBagToggles already no-ops here; stay silent so the harness and the
+    -- in-game path agree.
+    if not _G.CreateFrame then return false end
+    if _G.DaseekiUI then
+        Frame.HookBagToggles()
+        return true
+    end
+    if not Frame._coreMissingNoticed then
+        Frame._coreMissingNoticed = true
+        if ns and ns.Print then ns:Print(Frame.CORE_MISSING_NOTICE) end
+    end
+    return false
+end
+
+----------------------------------------------------------------------
 -- Login wiring (called by a future core.lua). Idempotent + guarded.
 ----------------------------------------------------------------------
 
@@ -2629,7 +2666,10 @@ function Frame.OnLogin()
         Frame.MigrateDensity(Store.db)
         Frame.MigrateScale(Store.db)
     end
-    Frame.HookBagToggles()
+    -- N1: NOT Frame.HookBagToggles() directly. Without Daseeki-Core we cannot draw a
+    -- window, so taking the Blizzard bag globals would leave the owner with no bags at
+    -- all; EnsureBagToggleHook skips the hook and prints one line instead.
+    Frame.EnsureBagToggleHook()
     Frame.EnsureStripEvents()
     -- Subscribe to W1 capture's store-updated event (capture.lua fires
     -- ns:Fire("BAGS_CAPTURED", nameRealm, owner)). The subscribe side is provided
@@ -3085,7 +3125,9 @@ local function testScaleHeal(fails)
     end
 
     -- (7) THE CALL SITE. A heal nothing calls is worthless, and OnLogin is the only caller.
-    -- Headless-safe: HookBagToggles / EnsureStripEvents both no-op without _G.CreateFrame.
+    -- Headless-safe: EnsureBagToggleHook / EnsureStripEvents both no-op without
+    -- _G.CreateFrame. The Core-less variant of this call (CreateFrame present, DaseekiUI
+    -- absent) is the harness's "core-absent-login" suite, which needs frame stubs.
     if Store then
         local savedDb = Store.db
         Store.db = { scale = 0.89 }

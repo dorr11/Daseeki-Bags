@@ -1,6 +1,6 @@
 # Daseeki Bags
 
-A standalone bag interface for WoW Classic Era — combines all your bags into a single sortable, searchable view, with cross-character item counts and account-wide gold tracking.
+A bag interface for WoW Classic Era — combines all your bags into a single sortable, searchable view, with cross-character item counts and account-wide gold tracking.
 
 ## Features
 
@@ -12,7 +12,12 @@ A standalone bag interface for WoW Classic Era — combines all your bags into a
 
 ## Requires
 
-- Optional: [Daseeki Core](../Daseeki-Core) — adds the bag's options panel to the shared Daseeki options hub. Daseeki Bags works standalone without it.
+- **Required: [Daseeki Core](../Daseeki-Core) 2.2.0+.** Core provides the shared look every
+  Daseeki window is drawn with, and the options hub the bag's settings page lives in. Bags
+  cannot draw its window without it, so from 2.0.0 it is a hard dependency (`## Dependencies`
+  in the .toc, and a required-dependency relation on CurseForge): the game will not load
+  Bags until Core is installed and enabled. If Bags somehow loads anyway, it leaves the
+  standard Blizzard bags alone and says so in chat rather than leaving you with no bags.
 - Optional: [Daseeki Nexus](../Daseeki-Nexus) — when its Inventory module is present, Bags sources its cross-account character summaries from the Nexus graph. Fully optional; Bags falls back to its own store without it.
 
 ## Upgrading from 1.x

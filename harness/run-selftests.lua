@@ -379,24 +379,42 @@ realprint("")
 --
 --  3. OPTIONALDEPS (added with the W2 Nexus bridge). Daseeki-Nexus must stay on the
 --     OptionalDeps line. It is NOT a dependency -- nexus.lua is fully type-guarded and
---     Bags runs standalone without it -- it is a LOAD-ORDER statement: it is what makes
+--     Bags runs unchanged without it -- it is a LOAD-ORDER statement: it is what makes
 --     the client load Daseeki-Nexus first when present, so DaseekiNexusData is attached
 --     before our ADDON_LOADED runs Store.Init -> Migrate.Migrate and the mesh-import
 --     deferral decision can actually see the Nexus store. Drop the name and the bridge
 --     still works for the tooltips (they read at hover time) but the deferral silently
---     stops deciding correctly on the first login of every session. Daseeki-Core is
---     checked alongside it for the same reason it was always there (DaseekiUI tokens).
+--     stops deciding correctly on the first login of every session.
 --
---     A HARD "## Dependencies:" line naming either addon would be a defect, not a
---     stricter version of this: it would stop Bags loading at all when the other addon
---     is absent. Guarded below.
+--     A HARD "## Dependencies:" line naming Daseeki-NEXUS would be a defect: it would
+--     stop Bags loading at all when a genuinely optional companion is absent. Guarded.
+--
+--  4. DEPENDENCIES -- Daseeki-Core (release verification N1, added 2026-08-03). This one
+--     inverted. Core was on OptionalDeps beside Nexus, on the theory that Bags degrades
+--     gracefully without it. It does not: ui_frame.lua's Frame.Ensure() returns nil the
+--     moment _G.DaseekiUI is absent, so no window can ever be built, while
+--     Frame.HookBagToggles() replaced all NINE Blizzard bag toggle globals regardless.
+--     A Core-less install therefore lost BOTH sets of bags, silently. Core is now a hard
+--     "## Dependencies:" line -- the honest statement of what Bags actually needs -- and
+--     must NOT be on OptionalDeps as well (two lines naming the same addon is ambiguous
+--     and hides which one is load-bearing). Both halves are asserted below.
+--
+--     The .pkgmeta relation (required-dependencies: daseeki-core) is the CurseForge-side
+--     half of the same fix; it is asserted here too, because the toc and the packager
+--     must not disagree about what is required.
 ----------------------------------------------------------------------
 local REQUIRED_SV_2X = {
     "DaseekiBags2DB", "DaseekiBags2Data",
     "DaseekiBagsAccount", "DaseekiBagsSets", "DaseekiBagsMesh",
 }
-local REQUIRED_OPTIONAL_DEPS = { "Daseeki-Core", "Daseeki-Nexus" }
-local FORBIDDEN_HARD_DEPS    = { "Daseeki-Core", "Daseeki-Nexus" }
+local REQUIRED_OPTIONAL_DEPS = { "Daseeki-Nexus" }
+local FORBIDDEN_HARD_DEPS    = { "Daseeki-Nexus" }
+-- N1: hard deps that MUST be declared, and must not also appear on OptionalDeps.
+local REQUIRED_HARD_DEPS     = { "Daseeki-Core" }
+-- N1: the CurseForge slug the packager must upload as a requiredDependency relation.
+-- BigWigsMods/packager reads `required-dependencies:` from .pkgmeta as a list of project
+-- SLUGS (lower-cased), not project ids.
+local REQUIRED_PKGMETA_RELATIONS = { ["required-dependencies"] = "daseeki-core" }
 -- Post-cutover this is the single SHIPPING toc. It was { "Daseeki-Bags2.toc", "v2.toc" }
 -- while the 2.0 tree rode in beside a 1.x Daseeki-Bags.toc; both beta files are gone and
 -- the name below is the one the client loads. A .toc absent on a branch is skipped, so
@@ -482,6 +500,70 @@ for _, toc in ipairs(TOCS_2X) do
                 realprint("  [FAIL] " .. toc .. " lists " .. name .. " as a HARD dependency")
                 realprint("         Bags must load and work with that addon absent. Move it to")
                 realprint("         OptionalDeps.")
+            end
+        end
+
+        -- N1: the honest hard dependency. Missing = the silent-no-bags defect is back.
+        local hardOk = true
+        for _, name in ipairs(REQUIRED_HARD_DEPS) do
+            if not hard[name] then
+                idFails, hardOk = idFails + 1, false
+                realprint("  [FAIL] " .. toc .. " does not list " .. name .. " on ## Dependencies")
+                realprint("         Bags cannot draw a single window without it (Frame.Ensure")
+                realprint("         returns nil with no _G.DaseekiUI) yet it takes over the nine")
+                realprint("         Blizzard bag globals -- so a user without it loses ALL bags.")
+                realprint("         Declare it hard; do NOT put it back on OptionalDeps.")
+            end
+            if optional[name] then
+                idFails, hardOk = idFails + 1, false
+                realprint("  [FAIL] " .. toc .. " lists " .. name .. " on BOTH Dependencies and")
+                realprint("         OptionalDeps. It is required (release verification N1); one")
+                realprint("         line must own that fact. Remove it from OptionalDeps.")
+            end
+        end
+        if hardOk then
+            realprint("  [ok] " .. toc .. " Dependencies carries " ..
+                      table.concat(REQUIRED_HARD_DEPS, ", ") .. ", and OptionalDeps does not")
+        end
+    end
+end
+
+-- N1 (CurseForge half): the packager relation must agree with the .toc. Without it the
+-- site happily hands a user Bags on its own, which is exactly the state the hard
+-- dependency exists to prevent.
+do
+    local pkg = readFile(P(".pkgmeta"))
+    if not pkg then
+        idFails = idFails + 1
+        realprint("  [FAIL] .pkgmeta is missing -- the packager cannot build a release")
+    else
+        for key, slug in pairs(REQUIRED_PKGMETA_RELATIONS) do
+            -- The list under `key:` runs until the next non-indented directive.
+            -- "-" is a Lua pattern quantifier, so the key has to be escaped before use.
+            local keyPat = "^" .. key:gsub("%p", "%%%0") .. "%s*:"
+            local found, inBlock = false, false
+            for line in pkg:gmatch("[^\r\n]+") do
+                local stripped = line:gsub("%s+$", "")
+                if stripped:match(keyPat) then
+                    inBlock = true
+                elseif inBlock then
+                    local item = stripped:match("^%s+%-%s*(%S+)")
+                    if item then
+                        if item:lower() == slug then found = true end
+                    elseif not stripped:match("^%s*#") and stripped:match("%S") then
+                        inBlock = false
+                    end
+                end
+            end
+            if found then
+                realprint("  [ok] .pkgmeta " .. key .. " carries " .. slug ..
+                          " (CurseForge relation matches the toc)")
+            else
+                idFails = idFails + 1
+                realprint("  [FAIL] .pkgmeta has no `" .. key .. ": - " .. slug .. "` entry")
+                realprint("         The .toc says Daseeki-Core is required; CurseForge would not.")
+                realprint("         BigWigsMods/packager reads that key as a list of project")
+                realprint("         SLUGS and uploads it as the requiredDependency relation.")
             end
         end
     end
@@ -1005,6 +1087,178 @@ ns:RegisterSelfTest("cutover-orchestration", function(verbose)
 
     for _, f in ipairs(fails) do ns:Print("  FAIL cutover-orchestration :: " .. f) end
     if #fails == 0 and verbose then ns:Print("  PASS cutover-orchestration") end
+    return #fails == 0
+end)
+
+----------------------------------------------------------------------
+-- CORE-ABSENT LOGIN SUITE  (added 2026-08-03, release verification N1)
+--
+-- Every other suite in this file runs HEADLESS: no _G.CreateFrame, so Frame.OnLogin's UI
+-- wiring no-ops and the question this suite asks cannot even be posed. The defect N1
+-- found needs the opposite stub set -- the game's CreateFrame PRESENT (so we are really
+-- in-game) and Daseeki-Core ABSENT (so _G.DaseekiUI is nil):
+--
+--   * Frame.Ensure() returns nil without DaseekiUI  -> no window can EVER be built
+--   * Frame.HookBagToggles() replaced all NINE Blizzard bag globals unconditionally
+--
+-- so the owner pressed their bag key and got nothing at all, from either addon, with no
+-- message. Core is a hard "## Dependencies" now (asserted by the toc identity gate), which
+-- should make this unreachable -- but a dependency can be force-loaded or merely disabled,
+-- so ui_frame.lua keeps a guard and this suite is its regression test.
+--
+-- Both directions are asserted: Core absent => hook SKIPPED, Blizzard globals identical,
+-- exactly one notice; Core present => hook INSTALLED, all nine replaced. A guard that
+-- always skips would be just as broken as one that never does.
+----------------------------------------------------------------------
+local BLIZZ_BAG_GLOBALS = {
+    "ToggleBackpack", "ToggleAllBags", "ToggleBag",
+    "OpenAllBags", "OpenBackpack", "OpenBag",
+    "CloseAllBags", "CloseBackpack", "CloseBag",
+}
+
+ns:RegisterSelfTest("core-absent-login", function(verbose)
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local Frame = ns.Frame
+    if not Frame then
+        ns:Print("  FAIL core-absent-login :: ns.Frame is nil (ui_frame.lua did not load)")
+        return false
+    end
+
+    -- ── stub set: a frame factory good enough for the login wiring ────────────────
+    local function newFrame()
+        local f = {}
+        setmetatable(f, { __index = function(t, k)
+            local v = rawget(t, "__m_" .. k)
+            if v then return v end
+            local fn = function() return nil end
+            rawset(t, "__m_" .. k, fn)
+            return fn
+        end })
+        return f
+    end
+
+    -- Everything we touch, saved for restore. Later suites (and the ui_frame suite's own
+    -- headless OnLogin) must not see any of this. Saved into ORDERED slots rather than a
+    -- name->value map on purpose: in this harness nearly every one of these globals is
+    -- legitimately nil, and a nil value simply vanishes from a table (pairs would skip
+    -- it), which would leave the stubs installed for every suite that runs after us.
+    local STUBBED_GLOBALS = { "CreateFrame", "DaseekiUI", "UIParent", "UISpecialFrames",
+                              "hooksecurefunc", "C_Timer", "InCombatLockdown" }
+    local savedGlobal = {}
+    for i, n in ipairs(STUBBED_GLOBALS) do savedGlobal[i] = _G[n] end
+    local savedBag = {}
+    for i, n in ipairs(BLIZZ_BAG_GLOBALS) do savedBag[i] = _G[n] end
+    local savedHooked, savedOrig      = Frame._hooked, Frame._orig
+    local savedStrip, savedNoticed    = Frame._stripEvt, Frame._coreMissingNoticed
+    local savedPrint                  = ns.Print
+
+    local function restore()
+        for i, n in ipairs(STUBBED_GLOBALS)  do _G[n] = savedGlobal[i] end
+        for i, n in ipairs(BLIZZ_BAG_GLOBALS) do _G[n] = savedBag[i] end
+        Frame._hooked, Frame._orig = savedHooked, savedOrig
+        Frame._stripEvt, Frame._coreMissingNoticed = savedStrip, savedNoticed
+        ns.Print = savedPrint
+    end
+
+    _G.CreateFrame      = function() return newFrame() end
+    _G.UIParent         = newFrame()
+    _G.UISpecialFrames  = {}
+    _G.hooksecurefunc   = function() end
+    _G.C_Timer          = { After = function() end }
+    _G.InCombatLockdown = function() return false end
+
+    -- Sentinel Blizzard bag globals: distinct closures, so "was it replaced?" is an
+    -- identity comparison and "did Blizzard's own function run?" is observable.
+    local blizzRan = {}
+    for _, n in ipairs(BLIZZ_BAG_GLOBALS) do
+        _G[n] = function() blizzRan[#blizzRan + 1] = n end
+    end
+    local sentinel = {}
+    for _, n in ipairs(BLIZZ_BAG_GLOBALS) do sentinel[n] = _G[n] end
+
+    -- Capture what the addon says to the owner.
+    local notices = {}
+    ns.Print = function(_, ...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        notices[#notices + 1] = table.concat(parts, "\t")
+    end
+
+    -- ── 1. CORE ABSENT ────────────────────────────────────────────────────────────
+    _G.DaseekiUI = nil
+    Frame._hooked, Frame._coreMissingNoticed, Frame._stripEvt = false, false, nil
+
+    ck(Frame.Ensure() == nil,
+       "PREMISE: Frame.Ensure() returns nil without DaseekiUI -- no window can be built")
+
+    local okLogin, errLogin = pcall(Frame.OnLogin)
+    ck(okLogin, "Frame.OnLogin runs in-game with Core absent (" .. tostring(errLogin) .. ")")
+
+    local replaced = {}
+    for _, n in ipairs(BLIZZ_BAG_GLOBALS) do
+        if _G[n] ~= sentinel[n] then replaced[#replaced + 1] = n end
+    end
+    ck(#replaced == 0,
+       "THE FIX: Blizzard's bag globals are LEFT ALONE with Core absent (replaced: " ..
+       (#replaced > 0 and table.concat(replaced, ", ") or "none") .. ")")
+    ck(Frame._hooked == false, "…HookBagToggles never ran, so nothing was captured either")
+
+    ck(#notices == 1, "exactly one notice printed (got " .. #notices .. ")")
+    ck(notices[1] == Frame.CORE_MISSING_NOTICE,
+       "…and it is the plain-language Core notice, verbatim (got " ..
+       tostring(notices[1]) .. ")")
+    ck(Frame.CORE_MISSING_NOTICE:find("Daseeki%-Core") ~= nil and
+       Frame.CORE_MISSING_NOTICE:find("Blizzard") ~= nil,
+       "…the notice names the missing addon AND says the standard bags are in use")
+
+    -- The whole point: the owner's bag key still opens the Blizzard backpack.
+    blizzRan = {}
+    local okT = pcall(_G.ToggleBackpack)
+    ck(okT and blizzRan[1] == "ToggleBackpack",
+       "the bag key still reaches Blizzard's own ToggleBackpack (the owner has bags)")
+
+    -- Idempotent: a /reload-storm must not spam chat.
+    pcall(Frame.OnLogin)
+    ck(#notices == 1, "a second login does not repeat the notice (got " .. #notices .. ")")
+
+    -- ── 2. CORE PRESENT (the guard is not a permanent off-switch) ─────────────────
+    Frame._hooked, Frame._coreMissingNoticed, Frame._stripEvt = false, false, nil
+    for _, n in ipairs(BLIZZ_BAG_GLOBALS) do _G[n] = sentinel[n] end
+    -- EnsureBagToggleHook only asks whether DaseekiUI EXISTS; it never builds the window,
+    -- so an opaque marker table is a faithful stand-in for Daseeki-Core here.
+    _G.DaseekiUI = { __harnessStub = true }
+
+    ck(Frame.EnsureBagToggleHook() == true, "with Core present the hook reports installed")
+    local stillBlizz = {}
+    for _, n in ipairs(BLIZZ_BAG_GLOBALS) do
+        if _G[n] == sentinel[n] then stillBlizz[#stillBlizz + 1] = n end
+    end
+    ck(#stillBlizz == 0,
+       "…and all " .. #BLIZZ_BAG_GLOBALS .. " Blizzard bag globals are ours again (missed: " ..
+       (#stillBlizz > 0 and table.concat(stillBlizz, ", ") or "none") .. ")")
+    ck(type(Frame._orig) == "table" and Frame._orig.ToggleBackpack == sentinel.ToggleBackpack,
+       "…with the originals captured for restore")
+    ck(#notices == 1, "…and nothing extra printed on the healthy path")
+
+    -- ── 3. HEADLESS stays silent ──────────────────────────────────────────────────
+    -- No CreateFrame means no bag globals to protect and no chat to print to; the other
+    -- suites drive OnLogin in exactly that state and must not accumulate chat noise.
+    Frame._hooked, Frame._coreMissingNoticed = false, false
+    _G.CreateFrame, _G.DaseekiUI = nil, nil
+    ck(Frame.EnsureBagToggleHook() == false, "headless: the hook reports not installed")
+    ck(#notices == 1, "headless: and prints nothing (got " .. #notices .. " notices total)")
+
+    restore()
+
+    if verbose then
+        ns:Print(string.format("  core-absent: %d bag global(s) protected, notice=%q",
+            #BLIZZ_BAG_GLOBALS, Frame.CORE_MISSING_NOTICE))
+    end
+
+    for _, f in ipairs(fails) do ns:Print("  FAIL core-absent-login :: " .. f) end
+    if #fails == 0 and verbose then ns:Print("  PASS core-absent-login") end
     return #fails == 0
 end)
 
