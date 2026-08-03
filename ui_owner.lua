@@ -690,27 +690,47 @@ end
 -- left in place here only because ui_frame.lua is another agent's file this pass.
 -- =====================================================================
 
--- Live per-character money descriptors from the store. Carries everything the 1.x row
--- needs: identity for the 12px icon, `source` for the own/other-account partition, and
--- the favorite flag that exempts a character from the 5-row cap.
+-- Live per-character money descriptors. Carries everything the 1.x row needs: identity
+-- for the 12px icon, `source` for the own/other-account partition, and the favorite
+-- flag that exempts a character from the 5-row cap.
+--
+-- SOURCE (W2, Nexus Inventory bridge): the owner universe comes from ns.Nexus.Owners()
+-- when the Daseeki-Nexus Inventory store is present and populated — Bags' own owners
+-- plus that store's SUMMARY owners, merged newest-wins per character (see nexus.lua's
+-- precedence header). That is precisely the "Other Accounts" group this tooltip renders,
+-- since Owner.IsOtherAccount partitions on source == "summary". With no Nexus, or with
+-- the bridge inactive for any reason, the accessor hands back Store.data.owners itself
+-- and this function behaves exactly as it did standalone. Type-guarded, and the
+-- Store.ForEachOwner path is kept as the fallback so a missing bridge cannot blank the
+-- money tooltip.
 function Owner.MoneyChars()
     local out = {}
     local favs = favoritesMap(false)
+    local function add(key, o)
+        out[#out + 1] = {
+            key      = key,
+            name     = o.name or "?",
+            class    = o.class,
+            account  = o.account or "",
+            source   = o.source or "summary",
+            faction  = o.faction,
+            race     = o.race,
+            sex      = o.sex,
+            copper   = o.money or 0,
+            favorite = Owner.IsFavoriteIn(favs, key),
+        }
+    end
+    if ns.Nexus and ns.Nexus.Owners then
+        local view = ns.Nexus.Owners()
+        if type(view) == "table" then
+            for key, o in pairs(view) do
+                if type(o) == "table" then add(key, o) end
+            end
+            return out
+        end
+    end
     if Store and Store.ForEachOwner then
-        Store.ForEachOwner(function(key, o)
-            out[#out + 1] = {
-                key      = key,
-                name     = o.name or "?",
-                class    = o.class,
-                account  = o.account or "",
-                source   = o.source or "summary",
-                faction  = o.faction,
-                race     = o.race,
-                sex      = o.sex,
-                copper   = o.money or 0,
-                favorite = Owner.IsFavoriteIn(favs, key),
-            }
-        end)
+        Store.ForEachOwner(add)
     end
     return out
 end
@@ -1216,6 +1236,79 @@ local function testMoneyFormatting(fails)
     ck(Owner.FormatCoins(nil) == "0c", "nil copper is safe")
 end
 
+-- W2 (Nexus Inventory bridge): the money tooltip's owner universe.
+-- Nexus PRESENT -> its owners appear under "Other Accounts" and in the Total.
+-- Nexus ABSENT  -> the tooltip is byte-for-byte the standalone one.
+local function testNexusMoneySourcing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local G = 10000
+    local savedNexus, savedData, savedDB = _G.DaseekiNexusData, Store.data, Store.db
+
+    local function invalidate() if ns.Nexus then ns.Nexus.Invalidate() end end
+    local function kinds(rows)
+        local t = {} for i, r in ipairs(rows) do t[i] = r.kind end return table.concat(t, ",")
+    end
+    local function rowFor(rows, name)
+        for _, r in ipairs(rows) do if r.kind == "char" and r.name == name then return r end end
+    end
+    local function totalOf(rows)
+        for _, r in ipairs(rows) do if r.kind == "total" then return r.copper end end
+    end
+
+    Store.db   = {}
+    Store.data = { owners = {
+        ["Me-R"]  = { nameRealm = "Me-R", name = "Me", class = "MAGE", account = "",
+                      source = "full", faction = "Horde", money = 100 * G, ts = 1700000000,
+                      containers = {}, equip = {}, itemCounts = {} },
+        ["Old-R"] = { nameRealm = "Old-R", name = "Old", class = "ROGUE", account = "",
+                      source = "summary", faction = "Horde", money = 5 * G, ts = 1700001000,
+                      containers = {}, equip = {}, itemCounts = {} },
+    } }
+
+    -- 1) STANDALONE: no Nexus at all.
+    _G.DaseekiNexusData = nil
+    invalidate()
+    local rows = Owner.BuildMoneyReport(Owner.MoneyChars())
+    ck(rowFor(rows, "Me") ~= nil and rowFor(rows, "Old") ~= nil, "standalone: both stored owners render")
+    ck(rowFor(rows, "Peer") == nil, "standalone: nothing invented")
+    ck(totalOf(rows) == 105 * G, "standalone: total is the store's own money")
+    ck(kinds(rows):find("section"), "standalone: the summary owner still makes an Other Accounts section")
+
+    -- 2) BRIDGED: Nexus adds a peer AND carries a fresher copy of the stale summary.
+    _G.DaseekiNexusData = { inventory = { schema = 1, owners = {
+        ["Peer-R"] = { rev = 2, updatedAt = 1700009000,
+                       data = { key = "Peer-R", class = "WARLOCK", faction = "Horde",
+                                money = 50 * G, itemCounts = {}, ts = 1700008000 } },
+        ["Old-R"]  = { rev = 9, updatedAt = 1700009000,
+                       data = { key = "Old-R", class = "ROGUE", faction = "Horde",
+                                money = 60 * G, itemCounts = {}, ts = 1700008000 } },
+        ["Me-R"]   = { rev = 9, updatedAt = 1700009000,
+                       data = { key = "Me-R", class = "MAGE", faction = "Horde",
+                                money = 1, itemCounts = {}, ts = 1700009999 } },
+    } } }
+    invalidate()
+    local bridged = Owner.BuildMoneyReport(Owner.MoneyChars())
+    ck(rowFor(bridged, "Peer") ~= nil, "bridged: the Nexus-only character appears")
+    ck(rowFor(bridged, "Peer").source == "summary", "bridged: it partitions into Other Accounts")
+    ck(rowFor(bridged, "Old").copper == 60 * G, "bridged: the fresher Nexus copy replaces the stale summary")
+    ck(rowFor(bridged, "Me").copper == 100 * G,
+        "bridged: the LOCAL full character keeps its own money even against a newer Nexus entry")
+    ck(totalOf(bridged) == (100 + 60 + 50) * G, "bridged: each character counted exactly once")
+
+    -- 3) The store was never written by any of it.
+    ck(Store.data.owners["Peer-R"] == nil, "the Nexus owner was not persisted into the Bags store")
+    ck(Store.data.owners["Old-R"].money == 5 * G, "the Bags record itself is untouched on disk")
+
+    -- 4) Removing Nexus restores the standalone tooltip exactly.
+    _G.DaseekiNexusData = nil
+    invalidate()
+    ck(totalOf(Owner.BuildMoneyReport(Owner.MoneyChars())) == 105 * G,
+        "removing Nexus returns the standalone total immediately")
+
+    _G.DaseekiNexusData, Store.data, Store.db = savedNexus, savedData, savedDB
+    invalidate()
+end
+
 function Owner.RunSelfTests(verbose)
     local suites = {
         { name = "freshness + badge",   fn = testFreshnessAndBadge },
@@ -1228,6 +1321,7 @@ function Owner.RunSelfTests(verbose)
         { name = "money: cap + favorites", fn = testMoneyCapAndFavorites },
         { name = "money: totals math",  fn = testMoneyTotals },
         { name = "money: row format",   fn = testMoneyFormatting },
+        { name = "money: nexus sourcing", fn = testNexusMoneySourcing },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

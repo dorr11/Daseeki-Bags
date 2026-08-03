@@ -366,11 +366,27 @@ realprint("")
 --  2. VERSION (gate C.12; audit NW-8, which found the shipped toc reading 1.1.4 while
 --     the released tag was v1.1.5). The 2.0 tocs must agree with each other and with
 --     core.lua's ns.VERSION.
+--
+--  3. OPTIONALDEPS (added with the W2 Nexus bridge). Daseeki-Nexus must stay on the
+--     OptionalDeps line. It is NOT a dependency -- nexus.lua is fully type-guarded and
+--     Bags runs standalone without it -- it is a LOAD-ORDER statement: it is what makes
+--     the client load Daseeki-Nexus first when present, so DaseekiNexusData is attached
+--     before our ADDON_LOADED runs Store.Init -> Migrate.Migrate and the mesh-import
+--     deferral decision can actually see the Nexus store. Drop the name and the bridge
+--     still works for the tooltips (they read at hover time) but the deferral silently
+--     stops deciding correctly on the first login of every session. Daseeki-Core is
+--     checked alongside it for the same reason it was always there (DaseekiUI tokens).
+--
+--     A HARD "## Dependencies:" line naming either addon would be a defect, not a
+--     stricter version of this: it would stop Bags loading at all when the other addon
+--     is absent. Guarded below.
 ----------------------------------------------------------------------
 local REQUIRED_SV_2X = {
     "DaseekiBags2DB", "DaseekiBags2Data",
     "DaseekiBagsAccount", "DaseekiBagsSets", "DaseekiBagsMesh",
 }
+local REQUIRED_OPTIONAL_DEPS = { "Daseeki-Core", "Daseeki-Nexus" }
+local FORBIDDEN_HARD_DEPS    = { "Daseeki-Core", "Daseeki-Nexus" }
 local TOCS_2X = { "Daseeki-Bags2.toc", "v2.toc" }
 
 local function tocDirective(src, key)
@@ -404,6 +420,40 @@ for _, toc in ipairs(TOCS_2X) do
             realprint("         2 releases after cutover (rollback net + migration retry).")
         else
             realprint("  [ok] " .. toc .. " declares all " .. #REQUIRED_SV_2X .. " globals")
+        end
+
+        -- Nexus-bridge load-order guarantee (see the gate header, point 3).
+        local optional = {}
+        for name in (tocDirective(src, "OptionalDeps") or ""):gmatch("[^,%s]+") do
+            optional[name] = true
+        end
+        local missingOpt = {}
+        for _, name in ipairs(REQUIRED_OPTIONAL_DEPS) do
+            if not optional[name] then missingOpt[#missingOpt + 1] = name end
+        end
+        if #missingOpt > 0 then
+            idFails = idFails + 1
+            realprint("  [FAIL] " .. toc .. " OptionalDeps is missing: " .. table.concat(missingOpt, ", "))
+            realprint("         OptionalDeps is the ONLY thing that makes the client load that")
+            realprint("         addon BEFORE this one. Without Daseeki-Nexus on the line, its")
+            realprint("         SavedVariables are not attached when our ADDON_LOADED runs the")
+            realprint("         migration, so the mesh-import deferral decides on a store it")
+            realprint("         cannot see yet. Add the name back; do NOT promote it to")
+            realprint("         Dependencies (that would stop Bags loading without Nexus).")
+        else
+            realprint("  [ok] " .. toc .. " OptionalDeps carries " .. table.concat(REQUIRED_OPTIONAL_DEPS, ", "))
+        end
+
+        local hard = {}
+        for name in (tocDirective(src, "Dependencies") or ""):gmatch("[^,%s]+") do hard[name] = true end
+        for name in (tocDirective(src, "RequiredDeps") or ""):gmatch("[^,%s]+") do hard[name] = true end
+        for _, name in ipairs(FORBIDDEN_HARD_DEPS) do
+            if hard[name] then
+                idFails = idFails + 1
+                realprint("  [FAIL] " .. toc .. " lists " .. name .. " as a HARD dependency")
+                realprint("         Bags must load and work with that addon absent. Move it to")
+                realprint("         OptionalDeps.")
+            end
         end
     end
 end
@@ -543,7 +593,7 @@ end
 -- safe (CreateFrame / SlashCmdList / geterrorhandler are all guarded).
 -- Load order mirrors v2.toc: W1 engine, then borders before ui_items (buttons
 -- attach borders at paint), then ui_frame last (it consumes ns.Items).
-local TOC_ORDER = { "core.lua", "store.lua", "capture.lua", "migrate.lua",
+local TOC_ORDER = { "core.lua", "store.lua", "nexus.lua", "capture.lua", "migrate.lua",
                     "migrate_settings.lua",
                     "borders.lua", "ui_items.lua", "ui_frame.lua",
                     "ui_owner.lua", "ui_bank.lua",
@@ -621,8 +671,8 @@ end
 -- which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
-    "borders", "capture", "core", "features", "migrate", "migrate_settings", "options",
-    "rules2", "search", "sort", "store",
+    "borders", "capture", "core", "features", "migrate", "migrate_settings", "nexus",
+    "options", "rules2", "search", "sort", "store",
     "ui_bank", "ui_find", "ui_frame", "ui_items", "ui_owner",
 }
 

@@ -36,6 +36,20 @@
 -- SELF-HEAL: a DB that already carries a sticky marker from the pre-fix build (or any
 -- other route to marker-set-but-nothing-imported) is repaired at startup — see
 -- Migrate.SelfHeal, which re-runs the import forcibly and says so loudly.
+--
+-- MESH-IMPORT DEFERRAL (Nexus Inventory module, W2). When the Daseeki-Nexus Inventory
+-- store is ACTIVE (see nexus.lua), it — not Bags — is the system of record for REMOTE
+-- owners, so step 2 below (DaseekiBagsMesh -> summary owners) is skipped and Bags
+-- reads those characters through the bridge instead of holding its own copies. Step 1
+-- is untouched: THIS account's characters keep their full per-slot detail from
+-- DaseekiBagsAccount, converted and owned by Bags exactly as before.
+--
+-- The deferral is threaded through as `opts.deferMesh` rather than probed inside these
+-- functions, so every one of them stays pure and the harness can drive both directions
+-- deterministically. It also flows into CountSourceChars, and therefore into SelfHeal:
+-- a source census that counted deferred mesh records would make the self-heal fire on
+-- a run that is CORRECTLY importing nothing, burning its bounded attempts and printing
+-- a repair notice for a store that is not broken.
 
 local ADDON, ns = ...
 
@@ -180,8 +194,8 @@ end
 --   data       : the 2.0 cache DB (data.owners, data.migratedFrom1x)
 --   oldAccount : DaseekiBagsAccount (may be nil)
 --   oldMesh    : DaseekiBagsMesh (may be nil)
---   opts       : { selfAccount=<id>, force=<bool> }
--- Returns counts { skipped, owners, full, summary, containers, slots }.
+--   opts       : { selfAccount=<id>, force=<bool>, deferMesh=<bool> }
+-- Returns counts { skipped, owners, full, summary, containers, slots, meshDeferred }.
 ----------------------------------------------------------------------
 
 function Migrate.Run(data, oldAccount, oldMesh, opts)
@@ -193,8 +207,9 @@ function Migrate.Run(data, oldAccount, oldMesh, opts)
     end
 
     local selfAccount = opts.selfAccount or data.selfAccount or ""
+    local deferMesh   = opts.deferMesh and true or false
     local counts = { skipped = false, owners = 0, full = 0, summary = 0,
-                     containers = 0, slots = 0 }
+                     containers = 0, slots = 0, meshDeferred = deferMesh }
 
     -- 1) FULL characters (this account) — authoritative, keyed with selfAccount.
     if type(oldAccount) == "table" then
@@ -217,7 +232,14 @@ function Migrate.Run(data, oldAccount, oldMesh, opts)
     -- 2) SUMMARY characters (mesh) — only for owners not already FULL, so our
     --    own converted characters keep their per-slot data and are not
     --    downgraded to a summary.
-    if type(oldMesh) == "table" then
+    --
+    --    DEFERRED when the Nexus Inventory store is active: those same remote
+    --    characters live in the Nexus owners graph, which is then the system of
+    --    record for them, and nexus.lua serves them to the summary consumers with
+    --    a newest-wins merge. Importing our own second copy here would give the
+    --    money tooltip two sources for one character and put Bags in the business
+    --    of ageing remote data it no longer receives.
+    if type(oldMesh) == "table" and not deferMesh then
         for realm, chars in pairs(oldMesh) do
             if type(chars) == "table" then
                 for name, oldMeshChar in pairs(chars) do
@@ -260,21 +282,34 @@ end
 -- READ-ONLY. Used by the self-heal to tell "nothing to import" (a legitimately
 -- empty source; leave everything alone) apart from "something to import but the
 -- marker says we already did" (the sticky-marker anomaly).
+--
+-- `deferMesh` must match the flag Migrate.Run is being given, because the census
+-- answers "is there anything this pass WOULD import?". With the mesh deferred to the
+-- Nexus store, mesh records are not importable, and counting them would make the
+-- self-heal diagnose an anomaly in a store that is behaving exactly as designed.
+--
+-- The two sources are counted by explicit calls rather than by iterating a
+-- {oldAccount, oldMesh} literal: with oldAccount nil that literal is {[2]=oldMesh},
+-- whose ipairs stops at the hole and visits NOTHING — so a store whose only 1.x
+-- source is DaseekiBagsMesh censused as 0 and could never be self-healed.
 ----------------------------------------------------------------------
 
-function Migrate.CountSourceChars(oldAccount, oldMesh)
+local function countChars(src)
     local n = 0
-    for _, src in ipairs({ oldAccount, oldMesh }) do
-        if type(src) == "table" then
-            for _, chars in pairs(src) do
-                if type(chars) == "table" then
-                    for _, rec in pairs(chars) do
-                        if type(rec) == "table" then n = n + 1 end
-                    end
-                end
+    if type(src) ~= "table" then return n end
+    for _, chars in pairs(src) do
+        if type(chars) == "table" then
+            for _, rec in pairs(chars) do
+                if type(rec) == "table" then n = n + 1 end
             end
         end
     end
+    return n
+end
+
+function Migrate.CountSourceChars(oldAccount, oldMesh, deferMesh)
+    local n = countChars(oldAccount)
+    if not deferMesh then n = n + countChars(oldMesh) end
     return n
 end
 
@@ -296,8 +331,12 @@ end
 --
 --   data       : the 2.0 cache DB
 --   oldAccount / oldMesh : the 1.x globals (never written)
---   opts       : { selfAccount=<id>, quiet=<bool> }
+--   opts       : { selfAccount=<id>, quiet=<bool>, deferMesh=<bool> }
 -- Returns the forced-run counts, or nil when nothing needed healing.
+--
+-- deferMesh flows through UNCHANGED into both the census and the forced run, so a
+-- repair never re-imports what the Nexus store now owns — and, just as important,
+-- never diagnoses an anomaly that is only the deferral doing its job.
 ----------------------------------------------------------------------
 
 Migrate.MAX_SELFHEAL_ATTEMPTS = 3
@@ -308,8 +347,8 @@ function Migrate.SelfHeal(data, oldAccount, oldMesh, opts)
     if not data.migratedFrom1x then return nil end          -- normal path owns this
     if type(data.owners) == "table" and next(data.owners) ~= nil then return nil end
 
-    local available = Migrate.CountSourceChars(oldAccount, oldMesh)
-    if available == 0 then return nil end   -- nothing to import; marker is honest
+    local available = Migrate.CountSourceChars(oldAccount, oldMesh, opts.deferMesh)
+    if available == 0 then return nil end   -- nothing importable; marker is honest
 
     local attempts = tonumber(data.selfHealAttempts) or 0
     if attempts >= Migrate.MAX_SELFHEAL_ATTEMPTS then return nil end
@@ -323,7 +362,7 @@ function Migrate.SelfHeal(data, oldAccount, oldMesh, opts)
 
     local counts = Migrate.Run(data, oldAccount, oldMesh,
                                { selfAccount = opts.selfAccount or data.selfAccount or "",
-                                 force = true })
+                                 force = true, deferMesh = opts.deferMesh })
     counts.selfHealed = true
     counts.sourceChars = available
 
@@ -342,11 +381,17 @@ end
 ----------------------------------------------------------------------
 -- Live wrapper: read the 1.x globals and migrate into the attached store.
 -- Runs once at login (after Store.Init); a no-op if already migrated.
+--
+-- The Nexus bridge is probed HERE, once, at the migration moment — not cached at
+-- load and not consulted inside the pure passes. ns.Nexus ships with this addon, but
+-- the call is still guarded the house way: an absent or half-loaded bridge simply
+-- reads as "not deferring", which is the pre-bridge behaviour.
 ----------------------------------------------------------------------
 
 function Migrate.Migrate()
     if not Store.data then return { skipped = true } end
-    local opts = { selfAccount = Store.data.selfAccount or "" }
+    local deferMesh = (ns.Nexus and ns.Nexus.DeferMeshImport and ns.Nexus.DeferMeshImport()) and true or false
+    local opts = { selfAccount = Store.data.selfAccount or "", deferMesh = deferMesh }
     local counts = Migrate.Run(Store.data, _G.DaseekiBagsAccount, _G.DaseekiBagsMesh, opts)
 
     -- A skipped run means the marker was already set. That is normal on every login
@@ -559,6 +604,86 @@ local function testSelfHeal(fails)
     ck(okPrint, "the loud repair notice prints without error")
 end
 
+-- W2 (Nexus bridge): the mesh-import deferral, and the proof that it does not
+-- disturb the cutover-continuity contract it sits next to.
+local function testMeshDeferral(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local defer = { selfAccount = "acctSELF", deferMesh = true }
+    local normal = { selfAccount = "acctSELF" }
+
+    -- 1) THE DEFERRAL. Local characters still convert in full; the mesh summaries
+    --    are left to the Nexus store.
+    local data = Store._defaultData()
+    local r = Migrate.Run(data, sampleAccount(), sampleMesh(), defer)
+    ck(r.skipped == false, "a deferred run still executes")
+    ck(r.meshDeferred == true, "the run reports the deferral")
+    ck(r.full == 1, "LOCAL characters still convert with full detail")
+    ck(r.summary == 0, "no mesh summaries imported while Nexus owns them")
+    ck(r.owners == 1, "one owner total")
+    ck(data.owners["Shalk-Whitemane"] == nil, "the remote character is NOT in the Bags store")
+    local pu = data.owners["Puuchoco-Whitemane"]
+    ck(pu ~= nil and pu.source == "full", "the local character is present and full")
+    ck(pu.containers[0] and pu.containers[-1], "...with its bags and bank intact")
+    ck(pu.money == 39000, "...and its money")
+    ck(data.migratedFrom1x == true, "a deferred run that converted an owner still latches the marker")
+
+    -- 2) The NON-deferred run is unchanged (regression guard on the default path).
+    local data2 = Store._defaultData()
+    local r2 = Migrate.Run(data2, sampleAccount(), sampleMesh(), normal)
+    ck(r2.meshDeferred == false, "the default path reports no deferral")
+    ck(r2.summary == 1 and data2.owners["Shalk-Whitemane"] ~= nil,
+        "without Nexus the mesh summary is imported exactly as before")
+
+    -- 3) MARKER DISCIPLINE survives the deferral: a mesh-ONLY source with the mesh
+    --    deferred converts nothing, so the marker must stay clear and the import must
+    --    still land if Nexus later goes away.
+    local data3 = Store._defaultData()
+    local r3 = Migrate.Run(data3, nil, sampleMesh(), defer)
+    ck(r3.owners == 0, "mesh-only source + deferral converts nothing")
+    ck(r3.markerSet == false and data3.migratedFrom1x == false,
+        "...and therefore leaves the marker UNSET (AT-RISK-1c holds)")
+    local r3b = Migrate.Run(data3, nil, sampleMesh(), normal)
+    ck(r3b.summary == 2 and data3.migratedFrom1x == true,
+        "...so removing Nexus later still imports the mesh and latches then")
+
+    -- 4) SELF-HEAL still works with the deferral on, and is not misfired BY it.
+    local quiet = { selfAccount = "acctSELF", quiet = true, deferMesh = true }
+
+    --    (a) census: deferred mesh records are not "available to import".
+    ck(Migrate.CountSourceChars(sampleAccount(), sampleMesh(), false) == 3,
+        "census counts both sources when nothing is deferred")
+    ck(Migrate.CountSourceChars(sampleAccount(), sampleMesh(), true) == 1,
+        "census counts only the local source when the mesh is deferred")
+    ck(Migrate.CountSourceChars(nil, sampleMesh(), false) == 2,
+        "census sees a mesh-only source (no ipairs hole)")
+    ck(Migrate.CountSourceChars(nil, sampleMesh(), true) == 0,
+        "...and reports nothing importable when that mesh is deferred")
+
+    --    (b) the real anomaly still heals, and heals WITHOUT re-importing the mesh.
+    local sticky = Store._defaultData()
+    sticky.migratedFrom1x = true
+    local healed = Migrate.SelfHeal(sticky, sampleAccount(), sampleMesh(), quiet)
+    ck(healed ~= nil, "self-heal still fires under the deferral")
+    ck(healed.sourceChars == 1, "census reported only the importable (local) records")
+    ck(healed.owners == 1 and healed.full == 1 and healed.summary == 0,
+        "the repair restored the local character and left the mesh to Nexus")
+    ck(sticky.owners["Puuchoco-Whitemane"].money == 39000, "the repaired character kept its money")
+    ck(sticky.selfHealAttempts == 1, "attempt counted exactly once")
+
+    --    (c) THE MISFIRE GUARD: marker set, store empty, and the ONLY 1.x source is a
+    --        mesh the Nexus store now owns. Nothing is broken — the store is empty
+    --        because Bags correctly imported nothing — so the repair must NOT fire,
+    --        must not print, and must not spend an attempt.
+    local honest = Store._defaultData()
+    honest.migratedFrom1x = true
+    ck(Migrate.SelfHeal(honest, nil, sampleMesh(), quiet) == nil,
+        "a deferred mesh-only source is not an anomaly")
+    ck(honest.selfHealAttempts == nil, "...and costs no self-heal attempt")
+    --        ...while the same state WITHOUT the deferral is still the real anomaly.
+    ck(Migrate.SelfHeal(honest, nil, sampleMesh(), { selfAccount = "x", quiet = true }) ~= nil,
+        "the same state without the deferral still heals")
+end
+
 function Migrate.RunSelfTests(verbose)
     local suites = {
         { name = "parse item ref",   fn = testParse },
@@ -566,6 +691,7 @@ function Migrate.RunSelfTests(verbose)
         { name = "end-to-end + idempotency", fn = testEndToEndAndIdempotency },
         { name = "empty source leaves marker unset", fn = testEmptySourceLeavesMarkerUnset },
         { name = "sticky-marker self-heal", fn = testSelfHeal },
+        { name = "nexus mesh-import deferral", fn = testMeshDeferral },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

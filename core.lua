@@ -176,6 +176,9 @@ local function dispatch(msg)
         elseif sub == "money" then
             if ns.Frame and ns.Frame.DebugMoney then ns.Frame.DebugMoney()
             else ns:Print("money diagnostic unavailable") end
+        elseif sub == "nexus" then
+            if ns.Nexus and ns.Nexus.Debug then ns.Nexus.Debug()
+            else ns:Print("Nexus bridge diagnostic unavailable") end
         else
             ns:Print("unknown debug command: " .. sub)
         end
@@ -187,6 +190,7 @@ local function dispatch(msg)
         ns:Print("  /bags combined|split - switch layout")
         ns:Print("  /bags debug selftest - run self-tests")
         ns:Print("  /bags debug strip|toolbar|money - diagnose the open window")
+        ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
     else
         ns:Print("unknown command '" .. cmd .. "'. Try /bags help.")
     end

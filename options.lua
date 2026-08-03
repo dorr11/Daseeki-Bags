@@ -326,7 +326,12 @@ function Options.BuildCategories(flow)
     local UI = _G.DaseekiUI
     local Rules = ns.Rules
     local sec = flow:AddSection("Categories")
-    sec:Hint("Group items into labelled sections in the combined view. Categories start fresh in 2.0 (1.x custom rules are not imported). Split layout is unaffected.")
+    -- Truth check (W2): this hint used to say 1.x custom rules were NOT imported.
+    -- migrate_settings.lua converts every convertible 1.x custom rule into a category
+    -- at the migration moment, and deliberately leaves this master toggle OFF, so the
+    -- accurate statement is "imported, waiting behind this switch". Rules that use
+    -- filters a saved-search category cannot express are reported in chat and skipped.
+    sec:Hint("Group items into labelled sections in the combined view. Your 1.x custom rules were imported here as categories, waiting behind this switch (rules a search cannot express were skipped). Split layout is unaffected.")
 
     -- Master toggle: group vs flat grid. Re-grids live.
     register(sec:Checkbox({

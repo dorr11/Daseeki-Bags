@@ -4,7 +4,7 @@
 ## Category: Bags & Inventory
 ## X-License: MIT
 ## X-Curse-Project-ID: 1592410
-## OptionalDeps: Daseeki-Core
+## OptionalDeps: Daseeki-Core, Daseeki-Nexus
 ## Interface: 11507, 11508, 11509
 ## Version: 2.0.0
 ## SavedVariables: DaseekiBags2DB, DaseekiBags2Data, DaseekiBagsAccount, DaseekiBagsSets, DaseekiBagsMesh
@@ -37,6 +37,18 @@
 ##
 core.lua
 store.lua
+# nexus.lua: the SOFT-REQUIRED Daseeki-Nexus Inventory bridge. Bags sources its SUMMARY
+# owners (the money tooltip's "Other Accounts" section and the cross-character tooltip
+# counts) from the Nexus owners graph when that module is present and populated, and
+# defers migrate.lua's DaseekiBagsMesh import to it. ZERO hard dependency: every call is
+# type-guarded and falls back to Bags' own store, so the addon is unchanged without
+# Nexus. Daseeki-Nexus is on the OptionalDeps line above for LOAD ORDER only -- so its
+# SavedVariables are attached before our ADDON_LOADED runs Store.Init -> Migrate.Migrate
+# and the deferral decision can see them. We never declare its globals here: declaring
+# another addon's SavedVariables would make both addons write the same file.
+# Loads after store.lua (it builds store-shaped owner records); every consumer resolves
+# ns.Nexus at call time, so its position relative to them is free.
+nexus.lua
 capture.lua
 migrate.lua
 # migrate_settings.lua: the 1.x SETTINGS + custom-rules pass (audit NW-1), run at

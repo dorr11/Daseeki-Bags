@@ -51,11 +51,36 @@ local function selfKey()
 end
 
 ----------------------------------------------------------------------
+-- The owners universe the cross-character counts read.
+--
+-- With Daseeki-Nexus present and its Inventory module holding data, nexus.lua
+-- returns a merged view: Bags' own owners plus the Nexus store's SUMMARY owners,
+-- newest-wins per character. Without it — or with any bridge guard unmet — this is
+-- Store.data.owners itself, the same table this file read before the bridge existed.
+-- Type-guarded so a missing/half-loaded bridge degrades to standalone-local.
+----------------------------------------------------------------------
+
+local function ownersView()
+    if ns.Nexus and ns.Nexus.Owners then
+        local view = ns.Nexus.Owners()
+        if type(view) == "table" then return view end
+    end
+    local data = Store and Store.data
+    return (type(data) == "table" and type(data.owners) == "table") and data.owners or nil
+end
+Features._OwnersView = ownersView   -- exposed for the self-tests / debugging
+
+----------------------------------------------------------------------
 -- ════════════ GAP #1 (audit §7.1) — cross-character tooltip counts ═══════════
 --
 -- PURE core: count an itemID across every stored owner, honoring per-container
 -- identity so a full owner gets an exact carried-vs-bank split while a summary
 -- (remote/mesh) owner reports only its aggregate. Gated live by showItemCounts.
+--
+-- "Every stored owner" is ownersView() above: the Nexus-merged universe when the
+-- bridge is active, Bags' own store otherwise. The PURE core is unchanged either
+-- way — a Nexus-sourced owner is just another summary record, and summary records
+-- are exactly what this function has always folded in via owner.itemCounts.
 ----------------------------------------------------------------------
 
 -- Count `itemID` within a single owner. Full owners (per-slot containers) return
@@ -170,10 +195,10 @@ local function appendCounts(tt)
     if not link then return end
     local itemID = _G.GetItemInfoInstant and _G.GetItemInfoInstant(link)
     if not itemID then return end
-    local data = Store and Store.data
-    if not data or type(data.owners) ~= "table" then return end
+    local owners = ownersView()
+    if not owners then return end
 
-    local lines = Features.BuildCountLines(data.owners, itemID, selfKey())
+    local lines = Features.BuildCountLines(owners, itemID, selfKey())
     if #lines == 0 then return end
     tt.__dbCountsShown = true
 
@@ -487,12 +512,59 @@ local function testNameExtraction(fails)
     ck(okCall, "OnAltClickLink is a safe no-op headless")
 end
 
+-- W2 (Nexus Inventory bridge): where the cross-character counts get their owners.
+local function testNexusCountSourcing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedNexus, savedData = _G.DaseekiNexusData, Store.data
+    local function invalidate() if ns.Nexus then ns.Nexus.Invalidate() end end
+
+    Store.data = { owners = {
+        ["Me-R"] = { nameRealm = "Me-R", name = "Me", class = "MAGE", account = "",
+                     source = "full", ts = 1700000000,
+                     containers = { [0] = { slots = { [1] = { id = 100, count = 5 } } } },
+                     equip = {}, itemCounts = { [100] = 5 } },
+    } }
+
+    -- Standalone: the accessor hands back the store's OWN table (no copy at all).
+    _G.DaseekiNexusData = nil
+    invalidate()
+    local view = Features._OwnersView()
+    ck(view == Store.data.owners, "no Nexus -> counts read Store.data.owners itself")
+    ck(#Features.BuildCountLines(view, 100, "Me-R") == 1, "standalone: one holder")
+
+    -- Bridged: a Nexus summary owner contributes its aggregate count.
+    _G.DaseekiNexusData = { inventory = { schema = 1, owners = {
+        ["Remote-R"] = { rev = 3, updatedAt = 1700000900,
+                         data = { key = "Remote-R", class = "PRIEST", money = 42,
+                                  itemCounts = { [100] = 7 }, ts = 1700000800 } },
+    } } }
+    invalidate()
+    local bridged = Features._OwnersView()
+    ck(bridged ~= Store.data.owners, "with Nexus -> a merged view")
+    local lines = Features.BuildCountLines(bridged, 100, "Me-R")
+    ck(#lines == 2, "the Nexus-sourced character appears in the tooltip counts")
+    ck(lines[1].isSelf and lines[1].name == "Me", "the viewer still sorts first")
+    local remote
+    for _, ln in ipairs(lines) do if ln.name == "Remote" then remote = ln end end
+    ck(remote ~= nil and remote.total == 7 and remote.exact == false,
+        "a Nexus owner reports its aggregate, with no carried/bank split")
+    ck(Features.SumCountLines(lines) == 12, "grand total 5 (local) + 7 (Nexus)")
+    ck(Store.data.owners["Remote-R"] == nil, "nothing was written into the Bags store")
+
+    -- appendCounts must stay a safe no-op headless with the bridge active.
+    ck(pcall(Features._appendCounts, {}), "appendCounts is inert on a tooltip-less table")
+
+    _G.DaseekiNexusData, Store.data = savedNexus, savedData
+    invalidate()
+end
+
 function Features.RunSelfTests(verbose)
     local suites = {
         { name = "count lines",       fn = testCountLines },
         { name = "display matrix",    fn = testDisplayMatrix },
         { name = "defaults additive", fn = testDefaultsAdditive },
         { name = "name extraction",   fn = testNameExtraction },
+        { name = "nexus count sourcing", fn = testNexusCountSourcing },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
