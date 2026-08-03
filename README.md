@@ -29,7 +29,7 @@ the 2.0 cutover; tag `v1.1.5` is the last release that shipped it.
 
 ## Credits
 
-1.x was built on top of vendored libraries originally from Jaliborc (João Cardoso) and Tuller's bag addons — see `LICENSE`. 2.0 is an independent rewrite and vendors no third-party code.
+1.x was built on top of vendored libraries originally from Jaliborc (João Cardoso) and Tuller's bag addons; their MIT notice ships with the last release that contained that code — tag `v1.1.5`. 2.0 is an independent rewrite, vendors no third-party code, and is licensed All Rights Reserved (see `LICENSE`).
 
 ## Development
 

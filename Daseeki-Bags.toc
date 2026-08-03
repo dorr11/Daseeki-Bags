@@ -2,7 +2,7 @@
 ## Notes: A single-window bag interface for WoW Classic Era. Requires Daseeki-Core.
 ## Author: Daseeki
 ## Category: Bags & Inventory
-## X-License: MIT
+## X-License: All Rights Reserved
 ## X-Curse-Project-ID: 1592410
 ## Dependencies: Daseeki-Core
 ## OptionalDeps: Daseeki-Nexus

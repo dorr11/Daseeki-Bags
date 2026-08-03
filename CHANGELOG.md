@@ -270,6 +270,7 @@ entirely optional.
 - No new settings, and nothing you had configured changed: the on/off toggle, the
   minimum-quality floor, and the quest-gold-over-red-over-rarity order are all as they were.
   Search dimming is unchanged too — a dimmed glowing slot still recedes as one piece.
+- Changed: Daseeki Bags is now licensed **All Rights Reserved** rather than MIT, matching the rest of the suite; 2.0 is an independent rewrite that vendors no third-party code, and the 1.x vendored-library attribution stays with tag `v1.1.5`, the last release that shipped it.
 
 ## 1.1.5
 - Maintenance release; no user-facing changes. (This entry was missing: the tag shipped without one.)
