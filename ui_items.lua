@@ -1189,10 +1189,12 @@ local function paintPip(tex, host, art)
 end
 
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
--- combat-deferred layout): quiet inset well + round new-item wax dot + quest bang glyph +
--- round set pip. All are non-secure children; nothing here (or at runtime) is a protected
--- op on the button. Also installs the global defensive re-kill hooks (once) and restyles
--- the kept click feedback to a quiet wash.
+-- combat-deferred layout). After the CELL-PARITY round that is TWO regions — the round
+-- new-item wax dot and the quest bang glyph — plus a binding of the template's own count
+-- numeral so the dim cascade can reach it. There is no well, no hairline and no set pip:
+-- 1.x draws none of them, and the icon region is the whole cell substrate. All children are
+-- non-secure; nothing here (or at runtime) is a protected op on the button. Also installs
+-- the global defensive re-kill hooks (once) and restyles the kept click feedback.
 local function ensureDress(button)
     if button._dsDressed or not _G.CreateFrame then return end
 
