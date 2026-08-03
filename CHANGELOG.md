@@ -1,6 +1,65 @@
 # Changelog
 
-## Unreleased
+## 2.0.0
+
+**Daseeki Bags has been rebuilt from scratch — and everything you had comes with you.**
+This is the same addon, in the same folder, with the same name: you install it over 1.x
+the way you install any other update. There is nothing to export, nothing to re-enter,
+and nothing to set up again. The first time you log in, Bags 2 reads your old saved data
+and brings it across, once, automatically.
+
+### What carries over
+
+- **Every character's bags, bank, keyring and gold** — including alts you have not logged
+  in on for months, and characters on your *other* accounts that reached you through 1.x's
+  cross-account sync. They are in the character list on the first login, with the same
+  contents and the same gold totals.
+- **Your settings.** Column count, slot size, spacing, whether your bags draw as one grid
+  or split per bag, the money bar, cross-character tooltip counts, quality colouring, the
+  money-tooltip options, your empty-slot artwork and opacity, your slot edge, and every
+  auto-open interaction you had switched *off* (banker, merchant, mail, auction house,
+  trade, crafting) stay switched off.
+- **Your keybindings.** The keys you bound to *Toggle Bags* and *Toggle Bank* in 1.x keep
+  working, untouched. You do not need to re-bind anything. (Bags 2 also adds a third
+  action, *Find item across characters*, which starts unbound.)
+- **Your sort locks.** The slots you right-click-locked in 1.x so sorting would never move
+  them are read out of the old data and re-applied, per character, exactly where they were.
+- **Your chat commands.** `/dbg` and `/Daseeki-Bags` still work and still open the bags, so
+  any macro you built on them keeps working. `/bags` (short `/dbags`) is the new spelling,
+  and `/bags help` lists everything. `/dbg mesh` now tells you where cross-account sync
+  went: it is Daseeki Nexus's Inventory module, and your 1.x mesh characters were imported.
+- **Your custom rules**, as far as they can be expressed. A 2.0 category is a saved search,
+  so 1.x rules that were searches become categories automatically; rules that ran custom
+  Lua cannot become a search and are reported rather than silently dropped — your 1.x copy
+  of them is never touched either way.
+
+### What does *not* carry over
+
+- **Skins.** 1.x could be re-skinned by other addons; 2.0 draws itself in the shared Daseeki
+  look. There is no setting to carry.
+- **A handful of 1.x appearance knobs with no 2.0 equivalent** (frame strata/alpha, per-frame
+  named profiles, the individual glow switches). Where 2.0 expresses the same idea a
+  different way, it keeps its own control rather than guessing at a conversion.
+- **The equipment-set glow is deliberately left off**, even if 1.x had it on. On Classic Era
+  1.x could only ever draw that cue with ItemRack installed, so a stored "on" recorded a
+  switch you never touched, not a look you chose. Turn it on under Item borders if you want it.
+
+### If anything looks wrong
+
+- **The import runs once and knows it.** If it ever finds itself marked done while your
+  character list is empty, it repairs itself on the next login and tells you so in chat.
+- **Your 1.x data is not deleted, moved, or rewritten.** Bags 2 only *reads* it. It stays in
+  your saved variables file exactly as 1.x left it.
+- **You can go back.** Reinstalling Daseeki Bags 1.1.5 over 2.0 finds its own saved data
+  right where it left it and starts up as if nothing happened — you would lose only what
+  you changed inside 2.0. This is supported **for at least two releases** (through 2.2.0);
+  after that the 1.x data may be retired and downgrading becomes a fresh start.
+- **One-time housekeeping:** if you had installed the *Daseeki Bags 2 (BETA)* folder
+  alongside 1.x during testing, delete it. Everything moved into the normal Daseeki Bags
+  folder, and leaving the beta folder in place will make the game complain about duplicate
+  keybindings.
+
+### The window itself
 
 - **Switch characters from the header now: click the name at the top of the window.**
   The character name in the title bar has a small **dropdown arrow** after it, and clicking
@@ -196,6 +255,9 @@
 - No new settings, and nothing you had configured changed: the on/off toggle, the
   minimum-quality floor, and the quest-gold-over-red-over-rarity order are all as they were.
   Search dimming is unchanged too — a dimmed glowing slot still recedes as one piece.
+
+## 1.1.5
+- Maintenance release; no user-facing changes. (This entry was missing: the tag shipped without one.)
 
 ## 1.1.4
 - Fixed item/keyring changes not propagating when both accounts were already online when a session started — API-poll discovery now also sends the item manifest, not just gold.
