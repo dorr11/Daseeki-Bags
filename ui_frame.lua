@@ -809,6 +809,18 @@ function Frame.ComputeContentSize(owner, layout, opts)
     local gap     = opts.gap        or Frame.Gap()
     local bandW   = Frame.GridDims(0, columns, bs, gap).width  -- full-band width
 
+    -- SUMMARY VIEW (2.0.2): a Nexus-only character has no containers to lay out, so the
+    -- content band is the summary panel — a caption plus one row per distinct item,
+    -- clamped and scrolling past that (ns.Find.SummaryHeight). The WIDTH stays the grid
+    -- band so flipping between a full character and a synced one does not resize the
+    -- window sideways. Sized here rather than in the frame layer so the geometry is pure
+    -- and harness-locked like every other branch.
+    if opts.summaryRows then
+        local h = (ns.Find and ns.Find.SummaryHeight and ns.Find.SummaryHeight(opts.summaryRows))
+                  or 60
+        return { width = bandW, height = h }
+    end
+
     -- Category sections (W4.5): when a prebuilt section list is supplied, size from
     -- it — each section is a microLabel header band + its own grid, stacked. Empty
     -- sections are already omitted by the builder (collapse). Takes precedence over
@@ -984,8 +996,24 @@ function Frame.ViewedOwnerKey()
     return Store.MakeNameRealm(name, realm)
 end
 
+-- 2.0.2: resolved through the NEXUS-MERGED view, not Store.data.owners directly, so a
+-- character that exists only in the Nexus graph resolves to a real (read-only, summary)
+-- record instead of nil — that is what lets the selector list it and this window render
+-- its gold and its item summary. ns.Owner.ResolveOwner owns the precedence; it is
+-- resolved at CALL time and fully guarded, and with the bridge inactive it returns the
+-- store's own record, so the standalone path is unchanged.
+--
+-- Safety note: this can never hand back a DIFFERENT record for SELF. The merge keeps a
+-- "full" local owner unconditionally (Nexus.MergeOwners rule 2) and passes local records
+-- through by reference, and self is always full — so Items.IsLive and every write path
+-- still see the one writable store record.
 function Frame.ViewedOwner()
-    return Store.GetOwner(Frame.ViewedOwnerKey())
+    local key = Frame.ViewedOwnerKey()
+    if ns.Owner and ns.Owner.ResolveOwner then
+        local o = ns.Owner.ResolveOwner(key)
+        if o then return o end
+    end
+    return Store.GetOwner(key)
 end
 
 -- The self identity key (used to detect "am I viewing an alt?").
@@ -1639,6 +1667,11 @@ function Frame.Ensure()
         -- asked for, and the safety one: the mode suspends normal item interaction, so
         -- it must never be able to outlive the window that explains it.
         Frame.SetLockMode(false)
+        -- ...and so must the CHARACTER MENU (2.0.2, owner-reported): the flyout is
+        -- parented to UIParent so it can hang outside this window, which is exactly why
+        -- hiding this window did not take it with it. Escape left a floating menu with
+        -- nothing behind it. Guarded — ui_owner is optional to this file.
+        if ns.Owner and ns.Owner.CloseAllMenus then ns.Owner.CloseAllMenus() end
     end)
 
 
@@ -2203,6 +2236,45 @@ function Frame.Rebuild()
     end
 
     Frame.RebuildStrip()
+
+    -- ── SUMMARY VIEW (2.0.2) ─────────────────────────────────────────────────────
+    -- A character that exists only in the Nexus graph has gold and an aggregate item
+    -- map but NO containers, so the grid path would paint an empty window and say
+    -- nothing. Swap the whole content band for the shared summary panel instead.
+    -- Gated on ns.Owner.IsSummaryView, i.e. on the Nexus provenance marker — with the
+    -- bridge absent or disabled nothing is marked and this branch never runs, which is
+    -- the "exactly today's behaviour" contract.
+    local summaryOwner = (ns.Owner and ns.Owner.IsSummaryView and ns.Owner.IsSummaryView(owner))
+                         and owner or nil
+    if summaryOwner then
+        if not win._summary and ns.Find and ns.Find.CreateSummaryPanel then
+            win._summary = ns.Find.CreateSummaryPanel(win.content)
+        end
+        local nRows = 0
+        if win._summary then
+            win._summary:ClearAllPoints()
+            win._summary:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, 0)
+            win._summary:SetPoint("RIGHT", win.content, "RIGHT", 0, 0)
+            -- BY NAME, and not persisted. The pure model offers "count" too and the
+            -- suite pins it, but the live view uses name for Find's reason: item names
+            -- resolve asynchronously through GetItemInfo, so a count-ordered list
+            -- reshuffles under the cursor as they land. Making it a setting would mean a
+            -- new SavedVariables key, and 2.0.2's SV budget is `sortLog` and nothing else.
+            nRows = win._summary:SetSummary(summaryOwner, { sortBy = "name" }) or 0
+            win._summary:Show()
+        end
+        opts.summaryRows = nRows
+        -- The grid, its section headers and the bag strip have nothing to show here.
+        if ns.Items and ns.Items.CreateGroup then releaseGroupsFrom(win, 1) end
+        releaseSectionHeadersFrom(win, 1)
+        local content = Frame.ComputeContentSize(owner, layout, opts)
+        win.content:SetSize(math.max(content.width, 1), math.max(content.height, 1))
+        local sz = Frame.ComputeWindowSize(owner, layout, opts)
+        win:SetSize(sz.width, sz.height)
+        return
+    elseif win._summary then
+        win._summary:Hide()
+    end
 
     -- W4.5: in combined mode with categories on, bucket the combined entry list into
     -- category sections up front. SPLIT is unaffected. When the engine yields sections
@@ -3764,6 +3836,78 @@ local function testLockModeExits(fails)
     ns.Print, _G.C_Container = savedPrint, savedCC
 end
 
+-- 2.0.2: the SUMMARY VIEW branch of the window sizing, plus the two wirings the branch
+-- depends on (owner resolution through the merged view, and the menu-close hook).
+local function testSummaryViewSizing(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local opts = { columns = 12, buttonSize = 37, gap = 4 }
+    local bandW = Frame.GridDims(0, 12, 37, 4).width
+    local owner = { nameRealm = "Rin-R", name = "Rin", source = "summary", nexus = true,
+                    containers = {}, equip = {}, itemCounts = { [1] = 2 }, money = 4242 }
+
+    -- WITHOUT the summary hint the branch does not run at all: an owner with no
+    -- containers sizes as the (empty) grid it always did.
+    local grid = Frame.ComputeContentSize(owner, "combined", opts)
+    ck(grid.width == bandW, "the grid branch keeps the full band width")
+
+    -- WITH it, the content band becomes the summary panel — same width, panel height.
+    for _, n in ipairs({ 0, 1, 6, 40, 400 }) do
+        local o = { columns = 12, buttonSize = 37, gap = 4, summaryRows = n }
+        local c = Frame.ComputeContentSize(owner, "combined", o)
+        ck(c.width == bandW, "n=" .. n .. ": the summary band keeps the grid width " ..
+            "(so flipping owners never resizes the window sideways)")
+        ck(c.height > 0, "n=" .. n .. ": never a zero-height content frame")
+        if ns.Find and ns.Find.SummaryHeight then
+            ck(c.height == ns.Find.SummaryHeight(n),
+                "n=" .. n .. ": the height IS ns.Find.SummaryHeight (one geometry, one home)")
+        end
+        -- The whole window still sizes above its chrome.
+        local sz = Frame.ComputeWindowSize(owner, "combined", o)
+        ck(sz.width == bandW + Frame.PAD * 2, "n=" .. n .. ": window width is band + padding")
+        ck(sz.height > c.height + Frame.TITLE_H, "n=" .. n .. ": window height clears the chrome")
+    end
+
+    -- A bigger list is a taller window, up to the panel clamp.
+    local small = Frame.ComputeWindowSize(owner, "combined",
+        { columns = 12, buttonSize = 37, gap = 4, summaryRows = 2 })
+    local big = Frame.ComputeWindowSize(owner, "combined",
+        { columns = 12, buttonSize = 37, gap = 4, summaryRows = 12 })
+    ck(big.height > small.height, "more summary rows means a taller window")
+
+    -- OWNER RESOLUTION: the window renders whatever the selector row means, which since
+    -- 2.0.2 is the merged view. Driven through the real ns.Owner path against a live
+    -- Nexus store so the wiring — not just the sizing — is pinned.
+    do
+        local savedNexus, savedData = _G.DaseekiNexusData, Store.data
+        local savedView = Frame._viewKey
+        Store.data = { selfAccount = "", owners = {} }
+        _G.DaseekiNexusData = { inventory = { schema = 1, owners = {
+            ["Rin-R"] = { rev = 1, updatedAt = 10, data = { key = "Rin-R", money = 4242,
+                                                            itemCounts = { [1] = 2 }, ts = 10 } },
+        } } }
+        if ns.Nexus then ns.Nexus.Invalidate() end
+        Frame._viewKey = "Rin-R"
+        local resolved = Frame.ViewedOwner()
+        ck(resolved ~= nil, "a Nexus-only character resolves to a real record, not nil")
+        ck(resolved and resolved.money == 4242, "…so the money bar has a number to show")
+        ck(ns.Owner and ns.Owner.IsSummaryView(resolved) == true,
+            "…and the window takes the SUMMARY VIEW branch for it")
+        -- Bridge gone => back to nil, i.e. exactly the 2.0.1 behaviour.
+        _G.DaseekiNexusData = nil
+        if ns.Nexus then ns.Nexus.Invalidate() end
+        ck(Frame.ViewedOwner() == nil, "with Nexus absent the same key resolves to nothing again")
+        Frame._viewKey = savedView
+        _G.DaseekiNexusData, Store.data = savedNexus, savedData
+        if ns.Nexus then ns.Nexus.Invalidate() end
+    end
+
+    -- MENU LIFECYCLE (2.0.2, owner-reported): this window's OnHide closes the character
+    -- flyout. The flyout is parented to UIParent, so nothing else would.
+    ck(ns.Owner and type(ns.Owner.CloseAllMenus) == "function",
+        "the close-every-menu verb this window's OnHide calls is published")
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "1.0 anatomy",         fn = testParityAnatomy },
@@ -3789,6 +3933,7 @@ function Frame.RunSelfTests(verbose)
         { name = "footer roster",        fn = testFooterRoster },
         { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
         { name = "lock-mode exit routes",  fn = testLockModeExits },
+        { name = "summary view sizing",    fn = testSummaryViewSizing },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

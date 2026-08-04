@@ -106,10 +106,37 @@ end
 ----------------------------------------------------------------------
 
 -- True only when `key` is a real, non-self owner (so it may be removed from the cache).
-function Owner.CanRemove(key, selfKey)
+--
+-- 2.0.2 adds the third arm, `nexusSourced`. The remove ✕ deletes a record from
+-- DaseekiBags2Data — and a row the merged view sourced from the NEXUS graph does not
+-- live there, so the delete either does nothing or removes a shadowed local copy and
+-- the row comes straight back on the next merge. That is a control that lies. Hiding it
+-- beats offering it (the provenance problem flagged when the selector was first cut):
+-- the record's home is Nexus, and Nexus is where it is deleted.
+function Owner.CanRemove(key, selfKey, nexusSourced)
     if type(key) ~= "string" or key == "" then return false end
     if selfKey ~= nil and key == selfKey then return false end   -- never the live self
+    if nexusSourced then return false end                        -- 2.0.2: not ours to delete
     return true
+end
+
+-- Is this owner record one the NEXUS bridge produced? `nexus` is the view-only
+-- provenance marker Nexus.ToOwnerRecord stamps; it is never written to disk, so a false
+-- here is also the answer for every store-sourced owner and for a Nexus-absent client.
+function Owner.IsNexusSourced(owner)
+    return (type(owner) == "table" and owner.nexus == true) and true or false
+end
+
+-- Does this owner render as the SUMMARY VIEW rather than a bag grid?
+--
+-- Gated on the Nexus provenance marker, NOT on "has no containers", and deliberately:
+-- Bags' OWN store can hold summary owners (1.x mesh imports), and those have shown an
+-- empty grid since 2.0.0. With Nexus absent or disabled nothing is marked, so nothing
+-- changes — which is the "Nexus absent => exactly today's behaviour" contract, enforced
+-- by construction rather than by a settings check.
+function Owner.IsSummaryView(owner)
+    if not Owner.IsNexusSourced(owner) then return false end
+    return (owner.source or "summary") ~= "full"
 end
 
 -- Favorites are a per-settings preference (DaseekiBags2DB.ownerFavorites = { [key]=true }),
@@ -127,18 +154,29 @@ end
 --   favorites   = optional { [key]=true } — favorited owners sort to the TOP (below self)
 -- Returns an array of descriptors, ordered self → favorites → own-account → cross-account,
 -- then name ascending within each group:
---   { key, name, class, account, source, isSelf, isOwnAccount, isFavorite, ageSeconds, hasBank, rank }
+--   { key, name, class, account, source, isSelf, isOwnAccount, isFavorite, ageSeconds,
+--     hasBank, rank, nexus, summaryView, canRemove }
+--
+-- 2.0.2: `owners` is now the MERGED view (see Owner.LiveList), so Nexus-only characters
+-- appear here with their SUMMARY tag, class colour and age exactly like any other row.
+-- Three fields carry what a row may DO with the record:
+--   nexus       — the row came out of the Nexus graph (view-only provenance)
+--   summaryView — selecting it opens the summary view, not a bag grid
+--   canRemove   — the ✕ is offered (never for self, never for a Nexus-sourced row)
+-- A malformed entry (non-string key, non-table record) is skipped rather than rendered.
 function Owner.BuildOwnerList(owners, selfKey, selfAccount, now, favorites)
     now = now or (Store.Now and Store.Now()) or 0
     local list = {}
     if type(owners) ~= "table" then return list end
     for key, o in pairs(owners) do
+      if type(key) == "string" and key ~= "" and type(o) == "table" then
         local isSelf = (selfKey ~= nil and key == selfKey)
         local acct   = o.account or ""
         local isOwn  = (not isSelf) and acct ~= "" and selfAccount ~= nil
                        and selfAccount ~= "" and acct == selfAccount
         local isFav  = (not isSelf) and Owner.IsFavoriteIn(favorites, key)
         local age    = (o.ts and o.ts > 0) and (now - o.ts) or nil
+        local isNexus = Owner.IsNexusSourced(o)
         -- rank: self(0) < favorite(1) < own-account(2) < cross-account/summary(3). A favorite
         -- outranks its normal group so starring any owner lifts it just under self.
         local rank
@@ -150,7 +188,11 @@ function Owner.BuildOwnerList(owners, selfKey, selfAccount, now, favorites)
             isFavorite = isFav and true or false,
             ageSeconds = age, hasBank = Owner.HasBankData(o),
             rank = rank,
+            nexus = isNexus,
+            summaryView = Owner.IsSummaryView(o),
+            canRemove = Owner.CanRemove(key, selfKey, isNexus),
         }
+      end
     end
     table.sort(list, function(a, b)
         if a.rank ~= b.rank then return a.rank < b.rank end
@@ -254,6 +296,96 @@ function Owner.MenuHeight(rowCount)
     local content = n * (M.ROW_H + M.ROW_GAP) + M.ROW_GAP
     if content <= Owner.MENU_MAX_H then return content, false, 0 end
     return Owner.MENU_MAX_H, true, content - Owner.MENU_MAX_H
+end
+
+-- =====================================================================
+-- PURE: THE SUMMARY VIEW MODEL  (2.0.2, owner ask 2b)
+--
+-- Selecting a Nexus-only character used to land on an empty grid, because there are no
+-- containers to draw. There IS data — just not slot data — so the window shows what the
+-- record actually holds: the character's gold (the money bar already reads owner.money)
+-- and an aggregate item list, in Find-window rows.
+--
+-- ── THE PAYLOAD FACT, and what it forbids ────────────────────────────────────
+-- Daseeki-Nexus builds `itemCounts` as ONE merged aggregate — inventory.lua
+-- BuildPayload folds ScanCarried + ScanEquipped + the persisted `parts.bank` and
+-- `parts.mail` counts through AggregateCounts into a single [itemID] = count map. The
+-- frozen wire contract carries no per-container, per-slot or bags-vs-bank breakdown at
+-- ALL, and cannot: the cold components are stored as counts, not layouts.
+--
+-- So the summary view states ONE number per item and says where it came from in words.
+-- It does NOT invent a bags/bank split, and the BANK preview of such a character shows
+-- the SAME list under a caption that says so, rather than an empty bank that would read
+-- as "this character has nothing in the bank" — which the data cannot support either.
+--
+-- Rows are Find-window shaped ({ itemID, itemName, quality, icon, count }) so ui_find's
+-- row machinery renders them unchanged.
+-- =====================================================================
+
+-- Sort orders offered by the view. "name" is the default for the same reason Find sorts
+-- by name: item names resolve asynchronously through GetItemInfo, and a count-ordered
+-- list reshuffles under the cursor as they land.
+Owner.SUMMARY_SORTS = { "name", "count" }
+
+-- owner    = a summary owner record (itemCounts map; no containers)
+-- resolver = { instant = <GetItemInfoInstant>, info = <GetItemInfo> } (ui_find's shape)
+-- opts     = { sortBy = "name" | "count" }
+-- Returns an array of { itemID, itemName, quality, icon, count }.
+function Owner.SummaryRows(owner, resolver, opts)
+    opts = opts or {}
+    local rows = {}
+    if type(owner) ~= "table" or type(owner.itemCounts) ~= "table" then return rows end
+    for id, n in pairs(owner.itemCounts) do
+        id, n = tonumber(id), tonumber(n)
+        if id and n and id > 0 and n > 0 then
+            local name, quality, icon
+            if resolver then
+                if resolver.instant then local _, _, _, _, ic = resolver.instant(id); icon = ic end
+                if resolver.info then local nm, _, q = resolver.info(id); name, quality = nm, q end
+            end
+            rows[#rows + 1] = { itemID = id, itemName = name or ("item:" .. id),
+                                quality = quality, icon = icon, count = n }
+        end
+    end
+    local byCount = (opts.sortBy == "count")
+    table.sort(rows, function(a, b)
+        if byCount and a.count ~= b.count then return a.count > b.count end
+        local an, bn = tostring(a.itemName):lower(), tostring(b.itemName):lower()
+        if an ~= bn then return an < bn end
+        return a.itemID < b.itemID
+    end)
+    return rows
+end
+
+-- The standing caption above the list. `opts.bank` adds the bags/bank sentence, because
+-- that is the surface where the absent split is a question the user is actually asking.
+--   "summary — synced via Daseeki Nexus, updated 3d ago"
+--   "summary — synced via Daseeki Nexus, updated 3d ago. Bags and bank are not
+--    separated in synced data, so this is everything Rin is carrying and storing."
+function Owner.SummaryCaption(owner, now, opts)
+    opts = opts or {}
+    now = now or (Store.Now and Store.Now()) or 0
+    local ts  = (type(owner) == "table") and tonumber(owner.ts) or nil
+    local age = (ts and ts > 0) and (now - ts) or nil
+    local when
+    if not age or age < 0 then when = "no update recorded"
+    elseif age < 60    then when = "updated just now"
+    elseif age < 3600  then when = string.format("updated %dm ago", math.floor(age / 60))
+    elseif age < 86400 then when = string.format("updated %dh ago", math.floor(age / 3600))
+    else                    when = string.format("updated %dd ago", math.floor(age / 86400)) end
+    local line = "summary \194\183 synced via Daseeki Nexus, " .. when
+    if opts.bank then
+        local who = (type(owner) == "table" and owner.name) or "this character"
+        line = line .. ". Bags and bank are not separated in synced data, so this is "
+                    .. "everything " .. who .. " is carrying and storing."
+    end
+    return line
+end
+
+-- The empty-state line for a summary owner whose payload carried no items at all.
+function Owner.SummaryEmptyText(owner)
+    local who = (type(owner) == "table" and owner.name) or "This character"
+    return who .. "'s synced summary carries no items yet."
 end
 
 ----------------------------------------------------------------------
@@ -539,7 +671,11 @@ end
 -- Remove a cached owner, guarded so the live self can NEVER be deleted. Also drops any
 -- favorite/viewed state pointing at it. Returns true when a removal happened.
 function Owner.RemoveOwner(key)
-    if not Owner.CanRemove(key, Owner.SelfKey()) then return false end
+    -- 2.0.2: the Nexus arm is enforced HERE as well as in the row, so a caller that
+    -- bypasses the menu (a macro, a future options page) cannot delete a shadowed local
+    -- copy of a record whose home is the Nexus graph and leave the two stores disagreeing.
+    local nexusSourced = Owner.IsNexusSourced(Owner.ResolveOwner(key))
+    if not Owner.CanRemove(key, Owner.SelfKey(), nexusSourced) then return false end
     if not (Store and Store.RemoveOwner and Store.GetOwner and Store.GetOwner(key)) then return false end
     Store.RemoveOwner(key)
     local fav = favoritesMap(false)
@@ -552,12 +688,39 @@ function Owner.RemoveOwner(key)
     return true
 end
 
--- Build the descriptor list live from the store.
+-- The owner universe the selector lists.
+--
+-- 2.0.2: the NEXUS-MERGED view when the bridge is live (Bags' own owners plus the Nexus
+-- store's cross-account characters, newest-wins), the store's own table otherwise —
+-- Nexus.Owners() returns that very table when inactive, so with Nexus absent or disabled
+-- this is byte-for-byte the 2.0.1 call. Same pattern ui_find.Refresh already uses; the
+-- type guard means a stripped or half-loaded bridge falls back rather than erroring.
+function Owner.MergedOwners()
+    local data = Store and Store.data
+    local owners = (data and data.owners) or {}
+    if ns.Nexus and ns.Nexus.Owners then
+        local view = ns.Nexus.Owners()
+        if type(view) == "table" then return view end
+    end
+    return owners
+end
+
+-- Resolve one owner key through the same universe the selector lists, so the windows and
+-- the menu can never disagree about which record a row means. Merged view first: when the
+-- bridge refreshed a stale local summary, the fresher Nexus copy is the one the row shows.
+function Owner.ResolveOwner(key)
+    if type(key) ~= "string" or key == "" then return nil end
+    local merged = Owner.MergedOwners()
+    local o = merged and merged[key]
+    if o then return o end
+    return Store and Store.GetOwner and Store.GetOwner(key) or nil
+end
+
+-- Build the descriptor list live.
 function Owner.LiveList()
     local data = Store and Store.data
-    local owners = data and data.owners or {}
-    return Owner.BuildOwnerList(owners, Owner.SelfKey(), data and data.selfAccount, Store.Now(),
-        favoritesMap(false))
+    return Owner.BuildOwnerList(Owner.MergedOwners(), Owner.SelfKey(),
+        data and data.selfAccount, Store.Now(), favoritesMap(false))
 end
 
 -- Plain confirm before deleting a cached owner (audit 5.5). Uses the FrameXML StaticPopup
@@ -721,6 +884,18 @@ function Owner.CreateSelector(parent, opts)
         popup:SetScript("OnHide", function() closer:Hide() end)
     end
 
+    -- MENU LIFECYCLE (2.0.2, owner-reported). The flyout is parented to UIParent — it has
+    -- to be, so it can hang outside the window's rect and sit at TOOLTIP strata — which
+    -- means hiding the WINDOW does not hide it. Escape closed the bags window and left a
+    -- floating character menu on screen with nothing behind it.
+    --
+    -- The selector widget itself IS a child of the window's title bar, so it receives
+    -- OnHide when any ancestor hides; that is the hook. It was an empty function
+    -- ("retained; refresh is explicit"), which is exactly the gap. Closing the menu from
+    -- here covers every way a window can go away — Escape, the X, /bags, a reload, the
+    -- bank session ending — without either window having to know the menu exists.
+    frame:SetScript("OnHide", function(self) Owner.SelectorOnHide(self) end)
+
     -- Pool one register row. Every column is anchored to the row's LEFT at a fixed
     -- offset with a fixed width (ITEM 6) — the old anchor CHAIN is what let the columns
     -- pile onto each other. Offsets/widths come from Owner.MenuLayout at populate time.
@@ -869,6 +1044,13 @@ function Owner.CreateSelector(parent, opts)
 
             -- Favorite star: the FILLED glyph in gold when favorite, the OUTLINE in muted
             -- ink when not. Hidden on the self row.
+            --
+            -- 2.0.2: the two controls are now decided SEPARATELY. The star works on a
+            -- Nexus-only row — favourites are a Bags-side preference keyed by the same
+            -- "Name-Realm" string (DaseekiBags2DB.ownerFavorites), so ours to store and it
+            -- sticks. The ✕ does not: it deletes from DaseekiBags2Data, where a
+            -- Nexus-sourced row does not live, so the row would return on the next merge.
+            -- `d.canRemove` carries that call from the pure model (Owner.CanRemove).
             if d.isSelf then
                 row._star:Hide(); row._del:Hide()
             else
@@ -884,15 +1066,21 @@ function Owner.CreateSelector(parent, opts)
                     Owner.ToggleFavorite(d.key)
                     populate()   -- re-sort (favorite rises to the top)
                 end)
-                -- Delete ✕ → plain confirm, then remove the cached owner (self is never here).
-                row._del:Show()
-                row._delFS:SetTextColor(UI.Color("muted"))
-                row._del:SetScript("OnClick", function()
-                    confirmRemoveOwner(d.key, d.name, function()
-                        populate()
-                        if Owner.RefreshAll then Owner.RefreshAll() end
+                -- Delete ✕ → plain confirm, then remove the cached owner (self is never
+                -- here, and neither is a Nexus-sourced row — see the note above).
+                if d.canRemove then
+                    row._del:Show()
+                    row._delFS:SetTextColor(UI.Color("muted"))
+                    row._del:SetScript("OnClick", function()
+                        confirmRemoveOwner(d.key, d.name, function()
+                            populate()
+                            if Owner.RefreshAll then Owner.RefreshAll() end
+                        end)
                     end)
-                end)
+                else
+                    row._del:Hide()
+                    row._del:SetScript("OnClick", nil)
+                end
             end
 
             row:Show()
@@ -937,7 +1125,9 @@ function Owner.CreateSelector(parent, opts)
     function frame:Refresh()
         if not (self._name and self._pip) then return end
         local key = viewedKey()
-        local o = Store and Store.GetOwner and Store.GetOwner(key)
+        -- 2.0.2: resolve through the MERGED view so a Nexus-only character's face reads
+        -- its name and class colour instead of falling back to the raw key.
+        local o = Owner.ResolveOwner(key)
         local selfKey = Owner.SelfKey()
         local isSelf = (key == selfKey)
         self._name:SetText((o and o.name) or (key and Store.SplitNameRealm(key)) or "Bags")
@@ -949,7 +1139,6 @@ function Owner.CreateSelector(parent, opts)
     -- Track selectors so a view change refreshes every attached one (both windows).
     Owner._selectors = Owner._selectors or setmetatable({}, { __mode = "k" })
     Owner._selectors[frame] = true
-    frame:SetScript("OnHide", function() end)   -- retained; refresh is explicit
     return frame
 end
 
@@ -959,6 +1148,30 @@ function Owner.RefreshAll()
     for sel in pairs(Owner._selectors) do
         if sel.Refresh then sel:Refresh() end
     end
+end
+
+-- Close every open character menu (2.0.2). The per-selector OnHide above is the primary
+-- guarantee; this is the EXPLICIT one the windows call from their own OnHide, so the
+-- behaviour does not depend on WoW's ancestor-hide propagation reaching a widget that a
+-- future round might reparent. Both windows call it, both are guarded, and a selector
+-- with no menu built yet is a no-op.
+--
+-- Escape: the windows are in UISpecialFrames, so Escape hides the window, which runs its
+-- OnHide, which lands here — window and menu go together. The menu is deliberately NOT
+-- registered in UISpecialFrames itself: it has no global name (there is one popup per
+-- selector, so a name would have to be generated), and FrameXML's CloseSpecialWindows
+-- hides EVERY shown registered frame in one pass rather than just the topmost, so
+-- registering it could not have produced "menu first, window on the next Escape" anyway.
+function Owner.CloseAllMenus()
+    if not Owner._selectors then return end
+    for sel in pairs(Owner._selectors) do
+        if sel.CloseMenu then sel:CloseMenu() end
+    end
+end
+
+-- The OnHide body, named so the harness can drive it without a client.
+function Owner.SelectorOnHide(frame)
+    if frame and frame.CloseMenu then frame:CloseMenu() end
 end
 
 -- =====================================================================
@@ -1399,6 +1612,241 @@ local function testFavoritesSort(fails)
     ck(selfFav[1].key == "Zed-R" and selfFav[1].isFavorite == false, "self ignores a favorite flag")
 end
 
+-- =====================================================================
+-- 2.0.2 — NEXUS-ONLY CHARACTERS IN THE SELECTOR
+--
+-- The earlier scope cut kept the selector on Bags' own store, so a character that lives
+-- only in the Nexus graph was simply absent. It is listed now, with its SUMMARY tag,
+-- class colour and age like any other row; what changes is what the row may DO.
+-- =====================================================================
+
+-- A Nexus-sourced summary owner, exactly as Nexus.ToOwnerRecord produces it (source
+-- "summary", the view-only `nexus = true` marker, aggregate itemCounts, no containers).
+local function nexusOwner(name, extra)
+    local o = { nameRealm = name .. "-R", name = name, class = "MAGE", account = "",
+                source = "summary", ts = 1700000000, money = 4242,
+                containers = {}, equip = {},
+                itemCounts = { [6948] = 1, [4306] = 40 }, nexus = true }
+    for k, v in pairs(extra or {}) do o[k] = v end
+    return o
+end
+
+local function testNexusRosterRows(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------ PRESENT
+    local owners = {
+        ["Zed-R"] = { name = "Zed", class = "MAGE", account = "acctA", source = "full",
+                      ts = 1700000000, containers = { [0] = {} } },
+        ["Mesh-R"] = { name = "Mesh", class = "ROGUE", account = "", source = "summary",
+                       ts = 1699000000, containers = {}, itemCounts = { [1] = 2 } },
+        ["Rin-R"]  = nexusOwner("Rin"),
+    }
+    local now = 1700000000 + 3 * 86400
+    local list = Owner.BuildOwnerList(owners, "Zed-R", "acctA", now)
+    ck(#list == 3, "the Nexus-only character is LISTED (got " .. #list .. " rows)")
+
+    local byKey = {}
+    for _, d in ipairs(list) do byKey[d.key] = d end
+    local rin = byKey["Rin-R"]
+    ck(rin ~= nil, "…under its own key")
+    if rin then
+        ck(rin.source == "summary", "…tagged SUMMARY")
+        ck(Owner.SourceBadge(rin.source) == "Summary", "…which renders as the Summary badge")
+        ck(rin.class == "MAGE", "…carrying its class (so the row is class-coloured)")
+        ck(rin.ageSeconds == 3 * 86400, "…and its age from the record's ts")
+        ck(Owner.AgeLabel(rin.ageSeconds, false) == "3d", "…rendering as the compressed 3d")
+        ck(rin.nexus == true, "…marked Nexus-sourced")
+        ck(rin.summaryView == true, "…and it opens the SUMMARY VIEW, not a grid")
+        ck(rin.canRemove == false, "…with the remove ✕ HIDDEN (a Bags delete cannot stick)")
+        ck(rin.hasBank == false, "…and no bank data (a summary has no containers)")
+    end
+    -- A Bags-STORE summary owner is untouched: still removable, still the empty grid.
+    local mesh = byKey["Mesh-R"]
+    ck(mesh and mesh.canRemove == true, "a Bags-store summary owner keeps its remove ✕")
+    ck(mesh and mesh.summaryView == false,
+        "…and does NOT get the summary view (that is Nexus-marked records only)")
+    ck(byKey["Zed-R"].canRemove == false, "the live self is still never removable")
+
+    ------------------------------------------------------------------ FAVORITES
+    -- Favourites are a BAGS-side preference keyed by "Name-Realm"
+    -- (DaseekiBags2DB.ownerFavorites), so they are ours to store and they stick on a
+    -- Nexus-only row — which is why the star stays while the ✕ goes.
+    local favList = Owner.BuildOwnerList(owners, "Zed-R", "acctA", now, { ["Rin-R"] = true })
+    ck(favList[1].key == "Zed-R", "self still first")
+    ck(favList[2].key == "Rin-R" and favList[2].rank == 1,
+        "a favourited Nexus-only character rises to just under self")
+    ck(favList[2].isFavorite == true, "…and is marked as a favourite")
+    ck(favList[2].canRemove == false, "…while its ✕ stays hidden")
+    ck(Owner.IsFavoriteIn({ ["Rin-R"] = true }, "Rin-R") == true,
+        "the favourite map is keyed by the same Name-Realm string the Nexus graph uses")
+
+    ------------------------------------------------------------------ ABSENT
+    -- Nexus absent/disabled: nothing is marked, so nothing changes. Same fixture with
+    -- the provenance marker stripped is the 2.0.1 roster, row for row.
+    local plain = {
+        ["Zed-R"]  = owners["Zed-R"],
+        ["Mesh-R"] = owners["Mesh-R"],
+        -- `false`, not nil: pairs() cannot carry a nil override, and false is exactly
+        -- what an unmarked record reads as to IsNexusSourced (`== true`).
+        ["Rin-R"]  = nexusOwner("Rin", { nexus = false }),
+    }
+    local plainList = Owner.BuildOwnerList(plain, "Zed-R", "acctA", now)
+    ck(#plainList == 3, "…the same rows are listed")
+    for _, d in ipairs(plainList) do
+        ck(d.summaryView == false, d.key .. ": no summary view with the bridge absent")
+        ck(d.nexus == false, d.key .. ": nothing is marked Nexus-sourced")
+        if not d.isSelf then ck(d.canRemove == true, d.key .. ": the ✕ is offered again") end
+    end
+
+    ------------------------------------------------------------------ MALFORMED
+    local junk = {
+        [42]      = nexusOwner("Numeric"),          -- non-string key
+        [""]      = nexusOwner("Empty"),            -- empty key
+        ["Bad-R"] = "not a table",                  -- non-table record
+        ["Ok-R"]  = nexusOwner("Ok"),
+    }
+    local jl = Owner.BuildOwnerList(junk, "Zed-R", "acctA", now)
+    ck(#jl == 1 and jl[1].key == "Ok-R",
+        "malformed graph entries are skipped, the good one survives (got " .. #jl .. ")")
+    ck(pcall(Owner.BuildOwnerList, "nope", "Zed-R", "acctA", now),
+        "a non-table owners map is an empty list, not an error")
+    -- A record with no name/class/ts still renders rather than erroring.
+    local bare = Owner.BuildOwnerList({ ["Bare-R"] = { nexus = true, source = "summary" } },
+                                      "Zed-R", "acctA", now)
+    ck(#bare == 1 and bare[1].name == "Bare-R", "a nameless record falls back to its key")
+    ck(bare[1].ageSeconds == nil, "…and a missing ts reads as no age")
+
+    ------------------------------------------------------------------ the pure guards
+    ck(Owner.IsNexusSourced(nexusOwner("X")) == true, "IsNexusSourced reads the marker")
+    ck(Owner.IsNexusSourced({ source = "summary" }) == false, "…and only the marker")
+    ck(Owner.IsNexusSourced(nil) == false, "…nil is not Nexus-sourced")
+    ck(Owner.IsSummaryView(nexusOwner("X", { source = "full" })) == false,
+        "a FULL record never opens the summary view, marker or not")
+    ck(Owner.CanRemove("A-R", "Self-R", true) == false, "CanRemove: a Nexus row is not deletable")
+    ck(Owner.CanRemove("A-R", "Self-R", false) == true, "CanRemove: a store row still is")
+end
+
+-- The SUMMARY VIEW model: rows, ordering, caption, and the payload fact it must not
+-- overstate (Nexus itemCounts are ONE merged bags+bank+mail+equipped aggregate).
+local function testSummaryViewModel(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local NAMES = { [11] = "Zephyr Cloak", [12] = "Arcane Powder", [13] = "Black Lotus" }
+    local resolver = {
+        instant = function(id) return NAMES[id], nil, nil, "", 5000 + id end,
+        info    = function(id) return NAMES[id], nil, (id % 5), 0 end,
+    }
+    local owner = nexusOwner("Rin", { itemCounts = { [11] = 1, [12] = 40, [13] = 3 } })
+
+    ------------------------------------------------------------------ rows
+    local rows = Owner.SummaryRows(owner, resolver)
+    ck(#rows == 3, "one row per distinct item (got " .. #rows .. ")")
+    ck(rows[1].itemName == "Arcane Powder" and rows[2].itemName == "Black Lotus"
+        and rows[3].itemName == "Zephyr Cloak", "default order is item name ASCENDING")
+    ck(rows[1].count == 40, "…carrying the aggregate count")
+    ck(rows[1].icon == 5012, "…the icon from the resolver")
+    ck(rows[1].quality == 2, "…and the quality")
+    ck(rows[1].itemID == 12, "…and the item id, so the row can anchor a tooltip")
+
+    local byCount = Owner.SummaryRows(owner, resolver, { sortBy = "count" })
+    ck(byCount[1].count == 40 and byCount[3].count == 1, "sortBy=count orders by count DESC")
+    ck(#Owner.SUMMARY_SORTS == 2, "both orders are declared")
+
+    ------------------------------------------------------------------ junk + empties
+    ck(#Owner.SummaryRows(nil, resolver) == 0, "a nil owner has no rows")
+    ck(#Owner.SummaryRows({}, resolver) == 0, "an owner with no itemCounts has no rows")
+    local dirty = Owner.SummaryRows(nexusOwner("D", {
+        itemCounts = { [0] = 5, [7] = -1, ["x"] = 2, [9] = 3 } }), resolver)
+    ck(#dirty == 1 and dirty[1].itemID == 9,
+        "itemID 0, negative counts and non-numeric keys are dropped (got " .. #dirty .. ")")
+    local noRes = Owner.SummaryRows(owner, nil)
+    ck(#noRes == 3 and noRes[1].itemName:find("item:", 1, true) == 1,
+        "with no resolver the rows still render, named by id")
+
+    ------------------------------------------------------------------ caption
+    local now = 1700000000 + 3 * 86400
+    local cap = Owner.SummaryCaption(owner, now)
+    ck(cap:find("summary", 1, true) ~= nil, "the caption says it is a summary: " .. cap)
+    ck(cap:find("Daseeki Nexus", 1, true) ~= nil, "…names the source")
+    ck(cap:find("updated 3d ago", 1, true) ~= nil, "…and how old it is")
+    ck(Owner.SummaryCaption(owner, 1700000000 + 30):find("just now") ~= nil, "<1m reads just now")
+    ck(Owner.SummaryCaption(owner, 1700000000 + 600):find("updated 10m ago") ~= nil, "minutes")
+    ck(Owner.SummaryCaption(owner, 1700000000 + 7200):find("updated 2h ago") ~= nil, "hours")
+    ck(Owner.SummaryCaption({ nexus = true }, now):find("no update recorded") ~= nil,
+        "a record with no ts says so rather than inventing an age")
+
+    -- THE PAYLOAD FACT. Nexus builds itemCounts as one merged aggregate (inventory.lua
+    -- BuildPayload -> AggregateCounts over carried + equipped + parts.bank + parts.mail),
+    -- so there is no bags/bank split to render. The BANK caption must SAY that rather
+    -- than let an unqualified list imply a bank breakdown that does not exist.
+    local bankCap = Owner.SummaryCaption(owner, now, { bank = true })
+    ck(bankCap:find("not separated", 1, true) ~= nil,
+        "the bank caption states that bags and bank are not separated: " .. bankCap)
+    ck(bankCap:find("Rin", 1, true) ~= nil, "…and names the character")
+    ck(#bankCap > #cap, "…and is the longer of the two captions")
+
+    ------------------------------------------------------------------ empty state
+    local empty = Owner.SummaryEmptyText(nexusOwner("Rin", { itemCounts = {} }))
+    ck(empty:find("Rin", 1, true) ~= nil and empty:find("no items", 1, true) ~= nil,
+        "an item-less summary gets a named empty state: " .. empty)
+    ck(type(Owner.SummaryEmptyText(nil)) == "string", "…and a nil owner does not error")
+end
+
+-- MENU LIFECYCLE (2.0.2, owner-reported): the character flyout is parented to UIParent so
+-- it can hang outside the window, which is exactly why hiding the window did not hide it —
+-- Escape closed the bags window and left a floating menu behind. Both halves of the fix
+-- are driven here with fake selectors, since the frame layer needs a client.
+local function testMenuLifecycle(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved = Owner._selectors
+    local closed = {}
+    local function fakeSelector(name)
+        return { _name = name, shown = true,
+                 CloseMenu = function(self) self.shown = false; closed[#closed + 1] = self._name end }
+    end
+    Owner._selectors = {}
+    local a, b = fakeSelector("inventory"), fakeSelector("bank")
+    Owner._selectors[a] = true
+    Owner._selectors[b] = true
+
+    -- 1) the window's OnHide route: every open menu closes.
+    Owner.CloseAllMenus()
+    ck(a.shown == false and b.shown == false, "CloseAllMenus closes every attached menu")
+    ck(#closed == 2, "…exactly once each")
+
+    -- 2) the per-selector OnHide route: the widget is a child of the title bar, so an
+    --    ancestor hide reaches it even if a window forgets to call CloseAllMenus.
+    local c = fakeSelector("solo")
+    Owner.SelectorOnHide(c)
+    ck(c.shown == false, "a selector's OnHide closes its own menu")
+
+    -- 3) never errors on a selector that has not built a menu yet (the common case: the
+    --    window is hidden at login before the flyout is ever opened).
+    Owner._selectors = { [{ }] = true }
+    ck(pcall(Owner.CloseAllMenus), "CloseAllMenus tolerates a selector with no menu built")
+    ck(pcall(Owner.SelectorOnHide, nil), "SelectorOnHide tolerates a nil frame")
+    ck(pcall(Owner.SelectorOnHide, {}), "…and a frame with no CloseMenu")
+
+    -- 4) idempotent: hiding twice (window OnHide + the widget's own OnHide both firing)
+    --    must not double-anything.
+    Owner._selectors = {}
+    local d = fakeSelector("twice")
+    Owner._selectors[d] = true
+    closed = {}
+    Owner.CloseAllMenus(); Owner.SelectorOnHide(d); Owner.CloseAllMenus()
+    ck(d.shown == false, "the menu stays closed")
+    ck(#closed == 3, "…and repeated closes are harmless (no rebuild, no error)")
+
+    -- 5) the WINDOWS are wired to it. This is the regression that shipped: the hook
+    --    existed as an empty function, so the route was there and did nothing.
+    ck(type(Owner.CloseAllMenus) == "function", "the windows have a published close verb")
+    ck(type(Owner.SelectorOnHide) == "function", "…and the selector's OnHide body is named")
+
+    Owner._selectors = saved
+end
+
 ----------------------------------------------------------------------
 -- Money tooltip (1.x playerMoney.lua parity) — defect #3
 ----------------------------------------------------------------------
@@ -1701,6 +2149,184 @@ local function testNexusMoneySourcing(fails)
     invalidate()
 end
 
+-- =====================================================================
+-- THE ROSTER MERGE, END TO END (2.0.2) — and its MUTATION GATE.
+--
+-- The selector's universe is Nexus.Owners(), so what the menu lists is the merge's
+-- output. These assertions drive the LIVE path (Owner.LiveList against a real Nexus
+-- store on _G) rather than the pure builder, because the bug the earlier scope cut left
+-- was in the SOURCING, not in the ordering: the builder was always right about the rows
+-- it was handed, and it was handed the wrong table.
+--
+-- Shared body so testRosterMergeMutants can run exactly these checks against broken
+-- merges (same pattern as sort.lua's userLockAssertions).
+-- =====================================================================
+local function rosterAssertions()
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedNexus, savedData, savedDB = _G.DaseekiNexusData, Store.data, Store.db
+    local function invalidate() if ns.Nexus then ns.Nexus.Invalidate() end end
+
+    local selfKey = Owner.SelfKey()
+    Store.db   = {}
+    Store.data = { selfAccount = "acctA", owners = {
+        [selfKey]  = { nameRealm = selfKey, name = "Tester", class = "WARLOCK",
+                       account = "acctA", source = "full", money = 100, ts = 1700000000,
+                       containers = { [0] = {} }, equip = {}, itemCounts = {} },
+        ["Old-R"]  = { nameRealm = "Old-R", name = "Old", class = "ROGUE", account = "",
+                       source = "summary", money = 5, ts = 1700001000,
+                       containers = {}, equip = {}, itemCounts = { [1] = 1 } },
+    } }
+
+    local function byKey(list)
+        local t = {} for _, d in ipairs(list) do t[d.key] = d end return t
+    end
+
+    ------------------------------------------------------------------ Nexus PRESENT
+    _G.DaseekiNexusData = { inventory = { schema = 1, owners = {
+        ["Rin-R"] = { rev = 2, updatedAt = 1700009000,
+                      data = { key = "Rin-R", class = "MAGE", money = 4242,
+                               itemCounts = { [6948] = 1, [4306] = 40 }, ts = 1700008000 } },
+        ["Old-R"] = { rev = 9, updatedAt = 1700009000,
+                      data = { key = "Old-R", class = "ROGUE", money = 60,
+                               itemCounts = { [1] = 7 }, ts = 1700008000 } },
+        [selfKey] = { rev = 9, updatedAt = 1700009000,
+                      data = { key = selfKey, class = "WARLOCK", money = 1,
+                               itemCounts = {}, ts = 1700009999 } },
+    } } }
+    invalidate()
+
+    local rows = byKey(Owner.LiveList())
+    ck(rows["Rin-R"] ~= nil, "the Nexus-only character is in the selector's list")
+    if rows["Rin-R"] then
+        ck(rows["Rin-R"].source == "summary", "…with the SUMMARY tag")
+        ck(rows["Rin-R"].class == "MAGE", "…and its class, for the row colour")
+        ck(rows["Rin-R"].summaryView == true, "…opening the summary view")
+        ck(rows["Rin-R"].canRemove == false, "…with no remove ✕")
+    end
+    ck(rows[selfKey] ~= nil and rows[selfKey].isSelf, "self is still listed, and still self")
+    ck(rows[selfKey].summaryView == false,
+        "the LOCAL full self never becomes a summary view, however fresh the Nexus copy")
+    ck(rows[selfKey].canRemove == false, "…and is still not removable")
+    ck(rows["Old-R"] ~= nil and rows["Old-R"].summaryView == true,
+        "a stale local summary REFRESHED by Nexus follows the fresher record")
+
+    -- Resolution agrees with the list: the window renders the same record the row means.
+    local rin = Owner.ResolveOwner("Rin-R")
+    ck(rin ~= nil and rin.money == 4242, "ResolveOwner finds the Nexus-only record")
+    ck(rin and Owner.IsSummaryView(rin), "…and it is a summary view")
+    ck(Owner.ResolveOwner(selfKey) == Store.data.owners[selfKey],
+        "…while SELF still resolves to the one writable store record (by reference)")
+
+    -- Nothing reached disk, and the ✕ refuses even when called directly.
+    ck(Store.data.owners["Rin-R"] == nil, "the Nexus-only owner was NOT written into the store")
+    ck(Owner.RemoveOwner("Rin-R") == false, "RemoveOwner refuses a Nexus-sourced key")
+    ck(Store.data.owners["Old-R"] ~= nil, "…and refuses the shadowed local copy too")
+    ck(Owner.RemoveOwner("Old-R") == false,
+        "…because deleting it would not remove the row the merge puts back")
+
+    -- The favourite star still works on a Nexus-only row (Bags-side pref, same key).
+    ck(Owner.ToggleFavorite("Rin-R") == true, "a Nexus-only character can be favourited")
+    ck(Owner.IsFavorite("Rin-R") == true, "…and it persists in DaseekiBags2DB.ownerFavorites")
+    ck(Store.db.ownerFavorites and Store.db.ownerFavorites["Rin-R"] == true,
+        "…under the same Name-Realm key the Nexus graph uses")
+    local favRows = byKey(Owner.LiveList())
+    ck(favRows["Rin-R"] and favRows["Rin-R"].rank == 1, "…and it rises to just under self")
+    ck(Owner.ToggleFavorite("Rin-R") == false, "…and un-favouriting works too")
+
+    ------------------------------------------------------------------ Nexus ABSENT
+    _G.DaseekiNexusData = nil
+    invalidate()
+    local off = byKey(Owner.LiveList())
+    ck(off["Rin-R"] == nil, "with Nexus absent the Nexus-only character is gone again")
+    ck(off["Old-R"] ~= nil, "…the store's own summary owner is still listed")
+    ck(off["Old-R"].summaryView == false, "…rendering the 2.0.1 empty grid, not a summary")
+    ck(off["Old-R"].canRemove == true, "…and its remove ✕ is back")
+    ck(Owner.MergedOwners() == Store.data.owners,
+        "…and the selector reads the store's own table, with no copy")
+
+    ------------------------------------------------------------------ MALFORMED graph
+    _G.DaseekiNexusData = { inventory = { schema = 1, owners = {
+        ["Half-R"] = { rev = 1 },                       -- no data payload
+        ["Junk-R"] = "not a table",
+        [77]       = { rev = 1, data = { money = 5 } }, -- non-string key
+        ["Good-R"] = { rev = 1, updatedAt = 5, data = { key = "Good-R", money = 9,
+                                                        itemCounts = {}, ts = 5 } },
+    } } }
+    invalidate()
+    local m = byKey(Owner.LiveList())
+    ck(m["Good-R"] ~= nil, "a malformed graph still yields its good rows")
+    ck(m["Half-R"] == nil and m["Junk-R"] == nil, "…and none of the broken ones")
+    ck(m[selfKey] ~= nil, "…and never loses the local owners")
+
+    _G.DaseekiNexusData, Store.data, Store.db = savedNexus, savedData, savedDB
+    invalidate()
+    return fails
+end
+
+local function testRosterMergeMutants(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The roster merge is Nexus.MergeOwners plus the two provenance predicates the rows
+    -- read off its output. Every plausible way to get it wrong is one of these.
+    local realMerge  = ns.Nexus and ns.Nexus.MergeOwners
+    local realSource = Owner.IsNexusSourced
+    local realView   = Owner.IsSummaryView
+    if not realMerge then
+        ck(false, "the Nexus bridge is absent, so the roster merge cannot be gated")
+        return
+    end
+
+    local mutants = {
+        { name = "the merge drops the Nexus side (the old scope cut)",
+          apply = function()
+              ns.Nexus.MergeOwners = function(localOwners)
+                  local out = {}
+                  for k, v in pairs(localOwners or {}) do out[k] = v end
+                  return out, { local_ = 0, added = 0, refreshed = 0, keptLocal = 0, keptFull = 0 }
+              end
+          end },
+        { name = "the merge lets a Nexus summary shadow a local FULL owner",
+          apply = function()
+              ns.Nexus.MergeOwners = function(localOwners, nexusOwners)
+                  local out = {}
+                  for k, v in pairs(localOwners or {}) do out[k] = v end
+                  for k, e in pairs(nexusOwners or {}) do
+                      if type(k) == "string" then
+                          local rec = ns.Nexus.ToOwnerRecord(k, e)
+                          if rec then out[k] = rec end
+                      end
+                  end
+                  return out, { local_ = 0, added = 0, refreshed = 0, keptLocal = 0, keptFull = 0 }
+              end
+          end },
+        { name = "provenance is never marked (rows look store-owned)",
+          apply = function() Owner.IsNexusSourced = function() return false end end },
+        { name = "provenance is marked on EVERYTHING (local rows lose their ✕)",
+          apply = function() Owner.IsNexusSourced = function() return true end end },
+        { name = "every summary owner gets the summary view (Nexus-absent behaviour changes)",
+          apply = function()
+              Owner.IsSummaryView = function(o)
+                  return (type(o) == "table" and (o.source or "summary") ~= "full") and true or false
+              end
+          end },
+    }
+
+    for _, mut in ipairs(mutants) do
+        mut.apply()
+        local ok, res = pcall(rosterAssertions)
+        ns.Nexus.MergeOwners = realMerge
+        Owner.IsNexusSourced = realSource
+        Owner.IsSummaryView  = realView
+        local killed = (not ok) or (#res > 0)
+        ck(killed, "mutant SURVIVED the roster assertions: " .. mut.name)
+    end
+
+    ck(ns.Nexus.MergeOwners == realMerge and Owner.IsNexusSourced == realSource
+        and Owner.IsSummaryView == realView, "the real merge and predicates were restored")
+    ck(#rosterAssertions() == 0, "the real roster merge passes the assertions it kills with")
+end
+
 function Owner.RunSelfTests(verbose)
     local suites = {
         { name = "freshness + badge",   fn = testFreshnessAndBadge },
@@ -1716,6 +2342,10 @@ function Owner.RunSelfTests(verbose)
         { name = "money: totals math",  fn = testMoneyTotals },
         { name = "money: row format",   fn = testMoneyFormatting },
         { name = "money: nexus sourcing", fn = testNexusMoneySourcing },
+        { name = "roster: nexus-only rows", fn = testNexusRosterRows },
+        { name = "roster: merge mutation gate", fn = testRosterMergeMutants },
+        { name = "summary view model",  fn = testSummaryViewModel },
+        { name = "menu lifecycle",      fn = testMenuLifecycle },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

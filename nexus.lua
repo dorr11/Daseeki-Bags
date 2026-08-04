@@ -47,16 +47,20 @@
 -- "Fall back" means literally returning the same table Bags used before this file
 -- existed, so the standalone path allocates nothing and behaves identically.
 --
--- ── SCOPE (deliberate boundaries, W2) ─────────────────────────────────────────
---   * BRIDGED: the money tooltip (ui_owner.MoneyChars) and the cross-character
+-- ── SCOPE (deliberate boundaries) ─────────────────────────────────────────────
+--   * BRIDGED (W2): the money tooltip (ui_owner.MoneyChars) and the cross-character
 --     tooltip counts (features.appendCounts). Both are pure summary consumers.
---   * NOT bridged: the OWNER SELECTOR. Its rows offer two affordances a Nexus-only
---     owner cannot honour — browse (a summary has no per-slot containers) and
---     delete (Owner.RemoveOwner nils an entry in DaseekiBags2Data, so a Nexus-only
---     row would silently reappear). It keeps listing Bags' own store.
---   * NOT bridged: the FIND window. Find.Search only visits owner.containers, so a
---     summary owner — Nexus-sourced or Bags-sourced — contributes nothing to it by
---     construction. Wiring it would cost a merge per keystroke for zero rows.
+--   * BRIDGED (display round): the FIND window. Find.Search grew an itemCounts branch,
+--     so a summary owner does contribute rows; ui_find reads Nexus.Owners().
+--   * BRIDGED (2.0.2): the OWNER SELECTOR — the earlier scope cut, reversed on the
+--     owner's ask. The two affordances a Nexus-only row cannot honour are answered
+--     rather than avoided: BROWSE resolves to a read-only SUMMARY VIEW (gold + an
+--     aggregate item list) instead of an empty grid, and DELETE is HIDDEN, because
+--     Owner.RemoveOwner nils an entry in DaseekiBags2Data and the row would simply
+--     come back from the Nexus graph on the next merge. The favourite STAR is kept:
+--     favourites are a Bags-side preference keyed by "Name-Realm"
+--     (DaseekiBags2DB.ownerFavorites), so it is ours to store and it sticks.
+--     NOTHING here is ever written into the Bags store — the merged view stays a view.
 --
 -- Clean-room: the Nexus shape above was read from OUR OWN Daseeki-Nexus repo. No
 -- third-party addon source was opened.

@@ -18,7 +18,7 @@ local ADDON, ns = ...
 
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Bags"
-ns.VERSION  = "2.0.1"
+ns.VERSION  = "2.0.2"
 ns.CHAT_TAG = "|cffc9a24dDaseeki Bags|r"
 
 ----------------------------------------------------------------------
@@ -201,6 +201,13 @@ local function dispatch(msg)
         else
             ns:Print("unknown debug command: " .. sub)
         end
+    elseif cmd == "sortlog" then
+        -- 2.0.2a: the sort telemetry ring buffer. A TOP-LEVEL subcommand, not one under
+        -- `debug`, because the owner asked for it by name as `/dbg sortlog` — and every
+        -- command string in ns.SLASH_COMMANDS reaches this one dispatcher, so /bags,
+        -- /dbags, /dbg and /Daseeki-Bags all answer it identically.
+        if ns.Sort and ns.Sort.PrintLog then ns.Sort.PrintLog(rest)
+        else ns:Print("the sort engine is not loaded, so there is no sort log") end
     elseif cmd == "mesh" then
         -- 1.x's cross-account sync commands (/dbg mesh, mesh send, mesh clear). The
         -- feature moved to Daseeki-Nexus; say so once, here, where it is missed.
@@ -213,6 +220,7 @@ local function dispatch(msg)
         ns:Print("  /bags bank          - show/hide the bank window")
         ns:Print("  /bags find <name>   - find an item across every character")
         ns:Print("  /bags combined|split - switch layout")
+        ns:Print("  /bags sortlog [clear] - the last 50 sort runs, newest first")
         ns:Print("  /bags debug selftest - run self-tests")
         ns:Print("  /bags debug strip|toolbar|money - diagnose the open window")
         ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
@@ -410,6 +418,22 @@ local function testSlashRoster(fails)
     ns.Print = realPrint
     ck(#said == 1 and said[1]:lower():find("nexus", 1, true) ~= nil,
        "/dbg mesh points at Daseeki Nexus instead of failing as unknown")
+
+    -- 2.0.2a: `sortlog` is a TOP-LEVEL subcommand on the same dispatcher, so it answers
+    -- on all four command strings. Pinned here because it is the coordinator's read
+    -- surface for the telemetry ring — losing the route makes the data unreachable
+    -- in-game even though it is still on disk.
+    local logged = {}
+    ns.Print = function(_, ...) logged[#logged + 1] = table.concat({ ... }, " ") end
+    ns.SlashDispatch("sortlog")
+    ns.SlashDispatch("sortlog clear")
+    ns.Print = realPrint
+    ck(#logged >= 2, "/bags sortlog and /bags sortlog clear both answer")
+    local anyUnknown = false
+    for _, l in ipairs(logged) do
+        if l:lower():find("unknown command", 1, true) then anyUnknown = true end
+    end
+    ck(not anyUnknown, "…and neither falls through to 'unknown command'")
 end
 
 function ns.CoreRunSelfTests(verbose)

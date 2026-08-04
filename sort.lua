@@ -654,7 +654,7 @@ end
 -- reachable interleaving can drop or duplicate one.
 -- =====================================================================
 
-Sort.TICK               = 0.05   -- flat cadence; never waits on a server round-trip
+Sort.TICK               = 0.05   -- flat FALLBACK cadence; never waits on a server round-trip
 Sort.MAX_MOVES_PER_TICK = 24     -- cap the burst so the client never drops requests
 -- RUNAWAY ceiling only. This is NOT a time budget: a healthy sort finishes in tens of
 -- ticks and the no-progress guard below stops a stalled one long before this. It exists
@@ -672,6 +672,259 @@ Sort.MOVE_SLACK         = 32     -- upward on every improvement (see Sort._tick)
 Sort.PLAN_BUSY          = true
 Sort.LOCK_TTL           = 3.00   -- backstop only: a slot locked THIS long is pathological
 Sort.QUIET_REFRESH      = 0.20   -- 5 Hz grid heartbeat while the refresh storm is muted
+
+-- =====================================================================
+-- 2.0.2 — EVENT-DRIVEN ISSUING, and why the tick survives beside it
+--
+-- 2.0.1 issued moves on a flat Sort.TICK ladder and used ITEM_LOCK_CHANGED for exactly
+-- one thing: releasing the prediction on the (bag, slot) the event names, plus a single
+-- narrow "pull the next round forward" case (only when the previous round had issued
+-- NOTHING). Everything else waited out the remainder of the 0.05s tick. On a real bag
+-- that is a whole tick of dead air stacked on top of EVERY dependency round: the owner's
+-- live baseline was 154 moves / 63 waves / 5.56s, and 63 rounds x up-to-50ms of
+-- quantization is ~3s of the 5.56 spent waiting for a timer that had nothing to add.
+--
+-- 2.0.2: a prediction release is a SCHEDULING EVENT. Whenever the server confirms one of
+-- our slots, the next round is pulled forward to the next frame instead of the next tick
+-- (`Sort.EVENT_ISSUE`). The round itself is UNCHANGED — same re-snapshot, same overlay,
+-- same re-plan, same wave-1 issue, same guards — so every shipped correctness contract
+-- (lock-set exclusion in both directions, combat/window/bank aborts, progress-based
+-- termination, busy-set stability, plan-size pins) holds by construction: only the CLOCK
+-- moved. Correctness lives in _tick and issueWave1; this only changes when they run.
+--
+-- The tick is KEPT as the fallback/safety cadence and is never lengthened: every kick
+-- goes through scheduleTick, which is generation-guarded, so a kick REPLACES the pending
+-- tick rather than racing it, and a kick is never scheduled LATER than the tick it
+-- replaces (see kickTick's clamp). With the events silent — a client that drops them, a
+-- move the server never answers — the executor degrades to exactly the 2.0.1 ladder.
+--
+-- COALESCING. One move fires two ITEM_LOCK_CHANGED events (both endpoints), so a 24-move
+-- wave lands ~48 events in one frame. Each calls scheduleTick, each bumps `_tickGen`, and
+-- every callback but the last becomes a no-op — so a burst of N events costs ONE re-plan,
+-- on the next frame. `Sort.KICK_GAP` is the floor under that: two rounds are never run
+-- closer together than this, so even a pathological event storm cannot plan more often
+-- than ~1/KICK_GAP per second.
+Sort.EVENT_ISSUE        = true   -- master switch (off == the 2.0.1 tick-only ladder)
+Sort.KICK_GAP           = 0.01   -- min seconds between two rounds when events drive them
+
+-- =====================================================================
+-- 2.0.2 — THE GUARDS ARE WINDOWS IN SECONDS, NOT JUST TICK COUNTS
+--
+-- MAX_IDLE_TICKS / MAX_NO_PROGRESS / MAX_TICKS were all written against a FIXED 0.05s
+-- cadence, i.e. they are wall-clock windows spelled in ticks (2s / 6s / 200s). Event
+-- issuing makes the cadence variable and much faster, which would have silently SHORTENED
+-- every one of them — a healthy but slow sort could then trip a stall guard that used to
+-- give it six seconds. That is a correctness regression, not a tuning question.
+--
+-- So each guard now needs BOTH its tick count AND its wall-clock window to be exceeded.
+-- Both are derived from the constants above rather than restated, and the seconds arm can
+-- only ever DELAY an abort relative to 2.0.1 — never bring one forward.
+Sort.IDLE_SECONDS        = Sort.MAX_IDLE_TICKS  * Sort.TICK   -- 2s
+Sort.NO_PROGRESS_SECONDS = Sort.MAX_NO_PROGRESS * Sort.TICK   -- 6s
+Sort.RUNAWAY_SECONDS     = Sort.MAX_TICKS       * Sort.TICK   -- 200s
+
+-- ADAPTIVE SEED (2.0.2c). The telemetry log measures `avgAckMs` — the real per-move
+-- lock-clear round-trip — so the two stall windows can be sized against the connection
+-- the owner actually has instead of a 0.05s tick that has nothing to do with it. The
+-- seed is applied as a MAXIMUM against the fixed windows above, so a fast connection
+-- changes nothing at all and a slow one only ever buys more patience. Deliberately
+-- conservative: the point of the log is that LATER tuning is data-driven, so nothing
+-- here is allowed to make the executor give up sooner than 2.0.1 did.
+Sort.IDLE_ACKS           = 6     -- idle window >= this many measured round-trips
+Sort.NO_PROGRESS_ACKS    = 12    -- stall window >= this many measured round-trips
+Sort.RUNAWAY_ACKS        = 400   -- runaway ceiling >= this many measured round-trips
+
+-- Telemetry ring buffer (2.0.2a): the last N completed runs, in DaseekiBags2DB.sortLog.
+Sort.LOG_CAP            = 50
+
+-- =====================================================================
+-- PURE: THE SORT TELEMETRY RING BUFFER  (2.0.2a)
+--
+-- Owner's ask: "use the data over time to make it more efficient." Tuning the executor
+-- from one chat line per sort is guesswork — the line says moves/waves/seconds and
+-- nothing about WHY. So every finished run (completed or aborted) appends one flat record
+-- to `DaseekiBags2DB.sortLog`, and the coordinator mines them straight out of the WTF
+-- SavedVariables file.
+--
+-- ── SHAPE, and why it is flat ────────────────────────────────────────────────
+-- Every field is a SCALAR (number / boolean / string) — no nested tables, no arrays, no
+-- nils in the middle. A SavedVariables dump of this is one `{ ... }` per run that any
+-- parser can read line-wise, and adding a field later cannot reshape the old ones.
+--
+--   ts                 epoch seconds (Store.Now — GetServerTime)
+--   context            "bags" | "bank"   (bank = the run included a bank container)
+--   cells              cells in the opening snapshot (the size of the problem)
+--   fillPct            0-100, occupied share of those cells at the start
+--   planMoves          #moves in the OPENING plan (the work the planner asked for)
+--   executedMoves      moves actually issued (executed/plan > 1 == churn)
+--   waves              rounds that issued at least one move (the old "waves" number)
+--   durationMs         wall clock, ms
+--   aborted            boolean
+--   reason             abort reason, "" when the run completed
+--   stallTicks         PEAK no-progress streak seen (how close MAX_NO_PROGRESS came)
+--   busyFallbackTicks  rounds the BUSY re-plan rescued from issuing nothing — the
+--                      measurement that decides whether PLAN_BUSY should ever flip
+--   avgAckMs           MEASURED mean per-move lock-clear round-trip, ms (0 = unmeasured)
+--   version            ns.VERSION, so a mixed log is still attributable
+--
+-- ── RING SEMANTICS ───────────────────────────────────────────────────────────
+-- A plain 1..n ARRAY, oldest first, newest last, capped at Sort.LOG_CAP: appending past
+-- the cap drops index 1 and shifts. A cursor key would be cheaper by O(cap) per run, but
+-- this runs ONCE PER SORT and buys a buffer that is literally an array — no wrap point to
+-- reason about at the far end, in the file the coordinator is going to read by hand.
+--
+-- ZERO OVERHEAD when not sorting: nothing here is called, no timer exists, and the run
+-- accumulators live on Sort._* and are created by Sort.Run and dropped by stopDriver.
+-- =====================================================================
+
+-- The declared field order — also the parse contract, and what the printer walks.
+Sort.LOG_FIELDS = {
+    "ts", "context", "cells", "fillPct", "planMoves", "executedMoves", "waves",
+    "durationMs", "aborted", "reason", "stallTicks", "busyFallbackTicks",
+    "avgAckMs", "version",
+}
+
+local function num(v) local n = tonumber(v); return n or 0 end
+local function int(v) local n = tonumber(v) or 0; return math.floor(n + 0.5) end
+
+-- Coerce anything into a complete, flat record. EVERY declared field is present and of
+-- its declared type, so a malformed caller can never write a half record into the SV.
+function Sort.NewLogRecord(r)
+    r = (type(r) == "table") and r or {}
+    local ctx = r.context
+    if ctx ~= "bank" then ctx = "bags" end
+    return {
+        ts                = int(r.ts),
+        context           = ctx,
+        cells             = int(r.cells),
+        fillPct           = int(r.fillPct),
+        planMoves         = int(r.planMoves),
+        executedMoves     = int(r.executedMoves),
+        waves             = int(r.waves),
+        durationMs        = int(r.durationMs),
+        aborted           = r.aborted and true or false,
+        reason            = (type(r.reason) == "string") and r.reason or "",
+        stallTicks        = int(r.stallTicks),
+        busyFallbackTicks = int(r.busyFallbackTicks),
+        avgAckMs          = int(r.avgAckMs),
+        version           = (type(r.version) == "string") and r.version or tostring(ns.VERSION or "?"),
+    }
+end
+
+-- The live buffer (array, oldest first). `create` allocates it on the settings DB.
+-- Returns nil when there is no DB to hold it — the caller must degrade, never error.
+function Sort.LogBuffer(db, create)
+    db = db or (Store and Store.db)
+    if type(db) ~= "table" then return nil end
+    if type(db.sortLog) ~= "table" then
+        if not create then return nil end
+        db.sortLog = {}
+    end
+    return db.sortLog
+end
+
+-- Append one run. Returns the stored record, or nil when there was nowhere to store it.
+function Sort.LogAppend(db, rec, cap)
+    local buf = Sort.LogBuffer(db, true)
+    if not buf then return nil end
+    cap = tonumber(cap) or Sort.LOG_CAP
+    if cap < 1 then cap = 1 end
+    local stored = Sort.NewLogRecord(rec)
+    buf[#buf + 1] = stored
+    -- A while-loop, not a single remove: a cap LOWERED between releases must still
+    -- converge on the first append rather than leaking one stale run per sort.
+    while #buf > cap do table.remove(buf, 1) end
+    return stored
+end
+
+-- Newest-first copy for the reader (`/dbg sortlog`). Never hands out the live table.
+function Sort.LogRecords(db)
+    local buf = Sort.LogBuffer(db, false)
+    local out = {}
+    if not buf then return out end
+    for i = #buf, 1, -1 do
+        if type(buf[i]) == "table" then out[#out + 1] = buf[i] end
+    end
+    return out
+end
+
+function Sort.LogCount(db)
+    local buf = Sort.LogBuffer(db, false)
+    return buf and #buf or 0
+end
+
+-- Empty the buffer IN PLACE (the SV table identity is kept, so nothing that captured a
+-- reference to it — the harness, a future options page — is left pointing at a corpse).
+function Sort.LogClear(db)
+    local buf = Sort.LogBuffer(db, false)
+    if not buf then return 0 end
+    local n = #buf
+    for i = n, 1, -1 do buf[i] = nil end
+    return n
+end
+
+-- ADAPTIVE SEED: the mean measured round-trip over the last `lookback` runs that actually
+-- measured one. Runs with avgAckMs == 0 (no move ever acked — an instant "already sorted",
+-- or a totally rejecting server) carry no signal and are skipped. 0 when nothing is known,
+-- which is the "use the fixed windows" answer.
+function Sort.LogAvgAckMs(db, lookback)
+    local recs = Sort.LogRecords(db)
+    lookback = tonumber(lookback) or Sort.LOG_CAP
+    local sum, n = 0, 0
+    for i = 1, #recs do
+        if i > lookback then break end
+        local v = tonumber(recs[i].avgAckMs) or 0
+        if v > 0 then sum, n = sum + v, n + 1 end
+    end
+    if n == 0 then return 0 end
+    return math.floor(sum / n + 0.5)
+end
+
+-- Stamp formatter. WoW's Lua sandbox publishes `date` as a GLOBAL and ships no `os`
+-- table at all, so os.date would be a nil-index in game; headless (real Lua 5.1) it is
+-- the other way round. Try the global first, then os, then fall back to the raw epoch —
+-- a log line must never be the thing that errors.
+local function stampStr(ts)
+    local d = _G.date or (type(os) == "table" and os.date)
+    if d then
+        local ok, s = pcall(d, "%m-%d %H:%M", ts)
+        if ok and type(s) == "string" then return s end
+    end
+    return tostring(ts)
+end
+
+-- One compact fixed-width line per run, for the chat printer. PURE so the harness can pin
+-- the column set without a chat frame.
+function Sort.FormatLogLine(rec, index)
+    rec = Sort.NewLogRecord(rec)
+    local outcome = rec.aborted and ("ABORT:" .. (rec.reason ~= "" and rec.reason or "?")) or "ok"
+    return string.format(
+        "%2d. %s %-4s cells=%d fill=%d%% plan=%d exec=%d waves=%d %.2fs ack=%dms busy=%d stall=%d %s",
+        tonumber(index) or 0, stampStr(rec.ts), rec.context,
+        rec.cells, rec.fillPct, rec.planMoves, rec.executedMoves, rec.waves,
+        rec.durationMs / 1000, rec.avgAckMs, rec.busyFallbackTicks, rec.stallTicks, outcome)
+end
+
+-- `/bags sortlog` / `/dbg sortlog` — print the buffer, newest first. `arg` == "clear" empties it.
+function Sort.PrintLog(arg)
+    if not ns.Print then return end
+    if type(arg) == "string" and arg:lower():match("^clear") then
+        local n = Sort.LogClear()
+        ns:Print(string.format("sort log cleared (%d run%s dropped).", n, n == 1 and "" or "s"))
+        return
+    end
+    local recs = Sort.LogRecords()
+    if #recs == 0 then
+        ns:Print("sort log is empty — run a sort and it fills. (/bags sortlog clear empties it.)")
+        return
+    end
+    ns:Print(string.format("sort log — last %d run%s, newest first (cap %d):",
+        #recs, #recs == 1 and "" or "s", Sort.LOG_CAP))
+    for i = 1, #recs do ns:Print("  " .. Sort.FormatLogLine(recs[i], i)) end
+    local ack = Sort.LogAvgAckMs()
+    ns:Print(string.format("  measured round-trip across the log: %dms%s",
+        ack, ack == 0 and " (nothing measured yet)" or ""))
+end
 
 local function inCombat()
     return _G.InCombatLockdown and _G.InCombatLockdown()
@@ -939,10 +1192,47 @@ local function stopDriver()
     Sort._familyOf = nil
     Sort._ticks, Sort._idle, Sort._budget, Sort._lastIssued = nil, nil, nil, nil
     Sort._best, Sort._sinceProgress, Sort._residual = nil, nil, nil
+    -- 2.0.2 telemetry accumulators + the per-run derived windows. Dropped here so the
+    -- "zero overhead when not sorting" contract is literal: between runs sort.lua holds
+    -- no counters, no timer and no state at all.
+    Sort._peakNoProgress, Sort._busyRounds = nil, nil
+    Sort._ackSum, Sort._ackN = nil, nil
+    Sort._lastTickAt, Sort._lastProgressAt, Sort._idleSince = nil, nil, nil
+    Sort._waiting = nil
+    Sort._idleSecs, Sort._noProgressSecs, Sort._runawaySecs = nil, nil, nil
+    Sort._cellCount, Sort._fillPct, Sort._planMoves0, Sort._context = nil, nil, nil, nil
     Sort._tickGen = (Sort._tickGen or 0) + 1   -- invalidate any queued tick
     if Sort._driver then Sort._driver:UnregisterAllEvents() end
     if _G.ClearCursor then _G.ClearCursor() end
     endQuiet()
+end
+
+-- Fold this run's accumulators into one flat telemetry record and append it (2.0.2a).
+-- MUST be called BEFORE stopDriver, which drops the accumulators. Guarded end to end:
+-- with no settings DB (harness without a store, a very early sort) it is a silent no-op,
+-- and a throw here can never take an abort path down with it.
+local function logRun(aborted, reason)
+    local elapsed = nowSeconds() - (Sort._start or nowSeconds())
+    local ackMs = 0
+    if (Sort._ackN or 0) > 0 then ackMs = (Sort._ackSum / Sort._ackN) * 1000 end
+    local rec = {
+        ts                = (Store and Store.Now and Store.Now()) or 0,
+        context           = Sort._context or "bags",
+        cells             = Sort._cellCount or 0,
+        fillPct           = Sort._fillPct or 0,
+        planMoves         = Sort._planMoves0 or 0,
+        executedMoves     = Sort._moveCount or 0,
+        waves             = Sort._rounds or 0,
+        durationMs        = elapsed * 1000,
+        aborted           = aborted and true or false,
+        reason            = aborted and tostring(reason or "") or "",
+        stallTicks        = Sort._peakNoProgress or 0,
+        busyFallbackTicks = Sort._busyRounds or 0,
+        avgAckMs          = ackMs,
+        version           = tostring(ns.VERSION or "?"),
+    }
+    local write = function() Sort.LogAppend(nil, rec) end
+    if ns.SafeCall then ns:SafeCall(write) else pcall(write) end
 end
 
 -- Human-readable tail shared by the completion and abort prints. `_rounds` counts the
@@ -960,6 +1250,7 @@ local function abort(reason)
     if not Sort._running then return end
     local stats = runStats()
     local left  = Sort._residual or 0
+    logRun(true, reason)
     stopDriver()
     if ns.Print then
         local tail = ""
@@ -974,7 +1265,11 @@ end
 local function finish()
     if not Sort._running then return end
     local stats = runStats()
+    logRun(false, nil)
     stopDriver()
+    -- ONE compact chat line, exactly as 2.0.1 shipped it. The detail moved to the log
+    -- (/bags sortlog), not into the chat frame — the owner asked for data to tune from,
+    -- not for a sort that talks more.
     if ns.Print then ns:Print("sort complete (" .. stats .. ").") end
 end
 
@@ -1023,11 +1318,29 @@ end
 -- a backstop for a slot that stays locked pathologically long; a slot that is NOT locked
 -- is settled (or the move never happened), and reality wins immediately either way —
 -- which is exactly how a rejected or dropped move self-corrects.
+-- 2.0.2 (telemetry + adaptive seed): the ACK path is also where the per-move round-trip
+-- is MEASURED — `now - p.at` is the time between issuing a move on this slot and the
+-- client reporting it unlocked, i.e. the number the whole cost model is written against.
+--
+-- Only the OBSERVED-UNLOCKED arm is sampled. The TTL arm means the slot stayed locked
+-- pathologically long (a dropped move, a stuck server); folding that into the mean would
+-- inflate every derived window off exactly the runs that are already broken.
+--
+-- Sampling accuracy: an ITEM_LOCK_CHANGED release is measured at the event, so it is the
+-- real round-trip; a release noticed by the tick's overlay instead is quantized upward by
+-- at most one round gap. With event issuing on (the default) almost every release takes
+-- the event path, so the recorded avgAckMs reads slightly HIGH at worst, never low —
+-- which is the safe direction for a number that sizes patience windows.
 local function releasePred(key, now)
     local p = Sort._pred[key]
     if not p then return end
     if not slotLocked(p.cid, p.slot) then
         Sort._pred[key] = nil
+        local dt = now - p.at
+        if dt >= 0 and dt < Sort.LOCK_TTL then
+            Sort._ackSum = (Sort._ackSum or 0) + dt
+            Sort._ackN   = (Sort._ackN or 0) + 1
+        end
     elseif now - p.at >= Sort.LOCK_TTL then
         Sort._pred[key] = nil
     end
@@ -1133,7 +1446,23 @@ local function issueWave1(plan, cells, now)
         for _, r in ipairs(slots) do
             local k = refKey(r)
             if claimed[k] or Sort._pred[k] or slotLocked(r.cid, r.slot)
-               or Sort._userLocked(r.cid, r.slot) then blocked = true; break end
+               or Sort._userLocked(r.cid, r.slot) then
+                blocked = true
+                -- ── 2.0.2b: THE WAITING SET ──────────────────────────────────────
+                -- Record ONLY the arm a lock-clear can resolve: a slot held by one of
+                -- OUR OWN in-flight moves. That makes `_waiting` exactly "the slots
+                -- whose confirmation turns a move we already planned into a move we
+                -- can issue", which is the precise trigger the event path wants —
+                -- "when a move's endpoints settle", not "when anything settles".
+                --
+                -- The other three arms are deliberately excluded: `claimed` clears by
+                -- itself on the next round (it is this pass's disjointness bookkeeping,
+                -- not a server fact); a foreign `slotLocked` and a `userLocked` slot
+                -- fire no prediction release of ours, so keying a kick on them could
+                -- never fire anyway.
+                if Sort._pred[k] and Sort._waiting then Sort._waiting[k] = true end
+                break
+            end
         end
         if not blocked then
             -- Claim ONLY on success — 1.x sets from.locked/to.locked after the pickup pair,
@@ -1151,14 +1480,61 @@ end
 -- Schedule the next round. Generation-guarded so an ITEM_LOCK_CHANGED "kick" can pull the
 -- next round forward without ever running two rounds for one slot: bumping _tickGen
 -- makes every already-queued callback a no-op.
-local function scheduleTick(delay)
+-- `kicked` marks a round the EVENT path pulled forward (2.0.2b). It rides on the
+-- closure rather than a Sort field so a superseded callback cannot leave the flag set
+-- for whichever round actually runs.
+local function scheduleTick(delay, kicked)
     Sort._tickGen = (Sort._tickGen or 0) + 1
     local gen = Sort._tickGen
     local fn = function()
-        if Sort._running and gen == Sort._tickGen then Sort._tick() end
+        if Sort._running and gen == Sort._tickGen then
+            Sort._kicked = kicked and true or false
+            Sort._tick()
+        end
     end
     local after = _G.C_Timer and _G.C_Timer.After
     if after then after(delay or Sort.TICK, fn) else fn() end
+end
+
+-- 2.0.2b: EVENT-DRIVEN ISSUING. A prediction just cleared, so a move that was blocked on
+-- it may be issuable RIGHT NOW — pull the next round forward instead of burning the
+-- remainder of the tick.
+--
+-- Two clamps make this strictly-no-worse than the 2.0.1 ladder:
+--   * NEVER LATER than the tick it replaces. scheduleTick bumps _tickGen, so this call
+--     supersedes the pending tick; scheduling further out than Sort.TICK would therefore
+--     SLOW the fallback cadence down. The delay is clamped to Sort.TICK for that reason.
+--   * NEVER TIGHTER than Sort.KICK_GAP since the last round actually ran, so an event
+--     storm (a 24-move wave lands ~48 events) cannot turn into 48 re-plans. Combined with
+--     the generation guard — every kick but the last in a frame is a no-op — a burst
+--     costs exactly one round.
+-- THE ISSUING RULE (2.0.2b), factored out as one named decision so the harness can pin
+-- it — and mutate it — without a client. Returns a REASON string (truthy) or false.
+--
+--   "waiting" — the last round planned a wave-1 move and refused it BECAUSE of this
+--               slot. Its confirmation makes that exact move legal now. This is "a
+--               move's endpoints settled", literally, and it is the case that pays.
+--   "settled" — nothing of ours is in flight at all: the next plan sees fully observed
+--               state, needs no busy fallback, and there is nothing left to wait for.
+--   "blocked" — the previous round issued nothing at all (the 2.0.1 case, unchanged).
+--
+-- Everything else waits for the tick ON PURPOSE — see the driver's banner for the
+-- measured cost of kicking on every confirmation.
+function Sort.ShouldKick(key)
+    if not Sort.EVENT_ISSUE then return false end
+    if key ~= nil and Sort._waiting and Sort._waiting[key] then return "waiting" end
+    if not predOutstanding() then return "settled" end
+    if (Sort._lastIssued or 0) == 0 then return "blocked" end
+    return false
+end
+
+-- (Sort.ShouldKick owns the EVENT_ISSUE gate — see its banner — so this does not
+-- re-check it: two places deciding one thing is how an off switch stops working.)
+local function kickTick(now)
+    local wait = (Sort.KICK_GAP or 0) - (now - (Sort._lastTickAt or 0))
+    if wait < 0 then wait = 0 end
+    if wait > Sort.TICK then wait = Sort.TICK end
+    scheduleTick(wait, true)
 end
 
 -- One optimistic round: snapshot -> overlay predictions -> re-plan -> issue wave 1.
@@ -1173,9 +1549,18 @@ function Sort._tick()
     end
 
     Sort._ticks = (Sort._ticks or 0) + 1
-    if Sort._ticks > Sort.MAX_TICKS then return abort("runaway guard tripped") end
 
     local now = nowSeconds()
+    Sort._lastTickAt = now
+    -- RUNAWAY ceiling. 2.0.2: BOTH arms must trip. Event issuing makes rounds much more
+    -- frequent than the 0.05s ladder MAX_TICKS was counted against, so the tick count
+    -- alone would now fire this guard in a fraction of the wall clock it was written for.
+    -- The seconds arm restores the intended 200s+ meaning; neither arm alone can abort.
+    if Sort._ticks > Sort.MAX_TICKS
+       and (now - (Sort._start or now)) >= (Sort._runawaySecs or Sort.RUNAWAY_SECONDS) then
+        return abort("runaway guard tripped")
+    end
+
     local cells = snapshot(Sort._cids)
     if not cells then return abort("containers unavailable") end
     overlayPredictions(cells, now)
@@ -1196,21 +1581,36 @@ function Sort._tick()
     if Sort._best == nil or residual < Sort._best then
         Sort._best = residual
         Sort._sinceProgress = 0
+        Sort._lastProgressAt = now
         -- MONOTONE: the budget only ever ratchets UP. (Re-basing it downward off a
         -- busy-shrunken plan is what made a healthy sort trip its own thrash guard.)
         local want = (Sort._moveCount or 0) + residual * Sort.MAX_MOVE_FACTOR + Sort.MOVE_SLACK
         if want > (Sort._budget or 0) then Sort._budget = want end
     else
         Sort._sinceProgress = (Sort._sinceProgress or 0) + 1
+        -- Telemetry: the PEAK streak, not the final one. It answers "how close did this
+        -- sort come to the stall guard?", which is what MAX_NO_PROGRESS gets tuned on.
+        if Sort._sinceProgress > (Sort._peakNoProgress or 0) then
+            Sort._peakNoProgress = Sort._sinceProgress
+        end
     end
 
     local issued = 0
+    -- 2.0.2b: rebuild the waiting set from scratch each round — it describes THIS
+    -- round's blocked wave-1 moves, and a stale entry would kick on a slot nothing is
+    -- waiting for any more.
+    Sort._waiting = {}
     if #plan.moves == 0 then
         -- Converged only when the plan is clean AND nothing of ours is still in flight,
         -- i.e. the zero-move verdict was reached on fully OBSERVED state.
         if not predOutstanding() then return finish() end
     else
-        if Sort._sinceProgress > Sort.MAX_NO_PROGRESS then
+        -- STALL guard. 2.0.2: both the tick streak AND the wall-clock window must be
+        -- exceeded (see the IDLE_SECONDS/NO_PROGRESS_SECONDS banner). Rounds are now
+        -- event-paced, so the streak alone measures round COUNT, not patience.
+        if Sort._sinceProgress > Sort.MAX_NO_PROGRESS
+           and (now - (Sort._lastProgressAt or Sort._start or now))
+               >= (Sort._noProgressSecs or Sort.NO_PROGRESS_SECONDS) then
             return abort("not converging (no progress)")
         end
         if (Sort._moveCount or 0) >= (Sort._budget or 0) then
@@ -1231,13 +1631,29 @@ function Sort._tick()
         -- that would otherwise have idled, which is exactly where the time was going.
         -- Planning unconditionally with BUSY was measured too: uniformly faster but 15-60%
         -- more moves, because every tick then planned on a partial view of the bag.
-        if issued == 0 and Sort.PLAN_BUSY and predOutstanding() then
+        --
+        -- 2.0.2b: NOT on a kicked round. A kicked round exists because a specific
+        -- planned move just became legal, so the FULL plan is the one that should issue
+        -- it; if it does not, the state is not what the kick assumed and buying a worse
+        -- decomposition on top of that is pure churn — measured at +11% moves and +22%
+        -- wall time at 0.50s latency before this clause. The fallback is not lost, only
+        -- rate-limited: the very next TIMED tick takes it. That keeps partial-view
+        -- planning on the 20 Hz ladder it was tuned against, which is the whole point.
+        if issued == 0 and Sort.PLAN_BUSY and predOutstanding() and not Sort._kicked then
             local busyPlan = Sort.Plan({
                 cells = cells, meta = Sort._meta, canHold = Sort._canHold,
                 descending = Sort._desc, familyOf = Sort._familyOf,
                 busy = function(cid, slot) return Sort._pred[slotKey(cid, slot)] ~= nil end,
             })
-            if #busyPlan.moves > 0 then issued = issueWave1(busyPlan, cells, now) end
+            if #busyPlan.moves > 0 then
+                issued = issueWave1(busyPlan, cells, now)
+                -- Telemetry (2.0.2a): count only the rounds the fallback actually RESCUED
+                -- — i.e. where the full plan issued nothing and the restricted one issued
+                -- something. That is the exact quantity PLAN_BUSY buys, so the log can
+                -- decide later whether planning with BUSY unconditionally is worth its
+                -- 15-60% extra moves. (Default is NOT flipped in 2.0.2; this measures it.)
+                if issued > 0 then Sort._busyRounds = (Sort._busyRounds or 0) + 1 end
+            end
         end
         if issued > 0 then Sort._rounds = (Sort._rounds or 0) + 1 end
     end
@@ -1245,14 +1661,20 @@ function Sort._tick()
     Sort._lastIssued = issued
     if issued > 0 then
         Sort._idle = 0
+        Sort._idleSince = nil
     else
         -- Nothing issued. That is only IDLE when nothing of ours is in flight either;
         -- waiting on our own outstanding round-trips is the executor working as designed.
         if predOutstanding() then
             Sort._idle = 0
+            Sort._idleSince = nil
         else
             Sort._idle = (Sort._idle or 0) + 1
-            if Sort._idle > Sort.MAX_IDLE_TICKS then
+            Sort._idleSince = Sort._idleSince or now
+            -- Same two-arm rule as the stall guard: event-paced rounds make the tick
+            -- count a round COUNT, so the seconds window is what keeps this at ~2s.
+            if Sort._idle > Sort.MAX_IDLE_TICKS
+               and (now - Sort._idleSince) >= (Sort._idleSecs or Sort.IDLE_SECONDS) then
                 return abort("stalled (slots stayed locked)")
             end
         end
@@ -1271,18 +1693,55 @@ local function ensureDriver()
         if event == "ITEM_LOCK_CHANGED" then
             -- Use the (bag, slot) payload the event already carries to release exactly
             -- that prediction the moment the server confirms — no full re-scan, and the
-            -- dependent moves become issuable on the very next tick.
+            -- dependent moves become issuable on the very next round.
             if not (Sort._running and Sort._pred) then return end
             if a == nil or b == nil then return end
             local k = slotKey(a, b)
             if not Sort._pred[k] then return end
-            releasePred(k, nowSeconds())
-            -- If the last round had nothing issuable, this confirmation may have just
-            -- unblocked something — pull the next round forward instead of burning the
-            -- remainder of the 0.05s tick. This is what keeps the total at the raw
-            -- dependency-depth x round-trip floor with no tick quantization on top.
-            if Sort._pred[k] == nil and (Sort._lastIssued or 0) == 0 then
-                scheduleTick(0)
+            local now = nowSeconds()
+            releasePred(k, now)
+            if Sort._pred[k] ~= nil then return end   -- still locked: nothing settled
+            -- ── 2.0.2b: ISSUING IS EVENT-DRIVEN AT THE ROUND BOUNDARY ────────────
+            -- 2.0.1 pulled the next round forward in exactly ONE case: the previous
+            -- round had issued nothing (`_lastIssued == 0`). Every other confirmation —
+            -- including the one that COMPLETED a dependency round — sat out the
+            -- remainder of the 0.05s tick. On the owner's 63-round baseline that is up
+            -- to 63 x 50ms of pure dead air stacked on top of the round trips.
+            --
+            -- 2.0.2 adds the second case, and only the second case: the round is
+            -- COMPLETE (`not predOutstanding()` — this was the last of our moves still
+            -- in flight). At that instant the next plan can be taken on FULLY OBSERVED
+            -- state, which is the best decomposition available and needs no busy
+            -- fallback, so the round is pulled forward at zero cost in extra moves.
+            --
+            -- MEASURED, AND WHY IT IS NOT "KICK ON EVERY RELEASE". Kicking on every
+            -- confirmation was implemented and benchmarked first: it re-plans while the
+            -- rest of the wave is still in the air, so the full plan keeps coming back
+            -- unissuable, the BUSY fallback fires far more often, and its deliberately
+            -- worse decomposition is paid over and over. On the 4x16 fixtures at
+            -- 0.15-0.50s that cost +20-24% moves and +38-51% WALL TIME — the churn the
+            -- issueWave1 banner's rejected-alternative note describes, reached from the
+            -- other direction. Partial-view planning belongs on the throttled tick,
+            -- where its RATE is bounded.
+            --
+            -- So the kick fires on exactly three provably-idle states:
+            --   1. `_waiting[k]`  — the last round planned a wave-1 move and refused it
+            --      BECAUSE of this slot. Its confirmation makes that move legal now.
+            --      This is "a move's endpoints settled", literally.
+            --   2. `settled`      — nothing of ours is in flight at all, so the next
+            --      plan is taken on fully observed state (best decomposition, no busy
+            --      fallback) and there is nothing left to wait for.
+            --   3. `blocked`      — the previous round issued nothing (the 2.0.1 case).
+            -- The decision itself lives in Sort.ShouldKick so it is nameable, testable
+            -- and mutatable; this branch only acts on it. ShouldKick is the ONLY reader
+            -- of Sort.EVENT_ISSUE on this path, so switching the feature off genuinely
+            -- reverts to the 2.0.1 rule below rather than half of each.
+            local why = Sort.ShouldKick(k)
+            if Sort._waiting then Sort._waiting[k] = nil end   -- consumed either way
+            if why then
+                kickTick(now)
+            elseif not Sort.EVENT_ISSUE and (Sort._lastIssued or 0) == 0 then
+                scheduleTick(0)                        -- the 2.0.1 case, unchanged
             end
         end
     end)
@@ -1362,6 +1821,32 @@ function Sort.Run(cids, opts)
     Sort._budget    = #plan.moves * Sort.MAX_MOVE_FACTOR + Sort.MOVE_SLACK
     Sort._start     = nowSeconds()
     Sort._lastRefresh = Sort._start
+    Sort._lastTickAt  = 0            -- so the FIRST kick is never held back by KICK_GAP
+    Sort._lastProgressAt = Sort._start
+
+    ------------------------------------------------------------------
+    -- 2.0.2 TELEMETRY + ADAPTIVE SEED
+    --
+    -- The opening snapshot is the only place the problem SIZE is knowable, so cells /
+    -- fill / plan size are captured here; everything else accumulates during the run.
+    ------------------------------------------------------------------
+    local occupied = 0
+    for _, c in ipairs(cells) do if c.id then occupied = occupied + 1 end end
+    Sort._cellCount  = #cells
+    Sort._fillPct    = (#cells > 0) and (occupied * 100 / #cells) or 0
+    Sort._planMoves0 = #plan.moves
+    Sort._context    = needsBank and "bank" or "bags"
+    Sort._peakNoProgress, Sort._busyRounds = 0, 0
+    Sort._ackSum, Sort._ackN = 0, 0
+    Sort._waiting    = {}            -- 2.0.2b: slots blocking a planned wave-1 move
+
+    -- Size this run's patience windows off the MEASURED round-trip from the log (2.0.2c).
+    -- max(), never min(): the fixed windows are the floor, so an unmeasured or fast
+    -- connection behaves exactly as 2.0.1 and only a genuinely slow one buys more time.
+    local ackSecs = (Sort.LogAvgAckMs() or 0) / 1000
+    Sort._idleSecs       = math.max(Sort.IDLE_SECONDS,        Sort.IDLE_ACKS        * ackSecs)
+    Sort._noProgressSecs = math.max(Sort.NO_PROGRESS_SECONDS, Sort.NO_PROGRESS_ACKS * ackSecs)
+    Sort._runawaySecs    = math.max(Sort.RUNAWAY_SECONDS,     Sort.RUNAWAY_ACKS     * ackSecs)
 
     Sort._driver:RegisterEvent("ITEM_LOCK_CHANGED")
     Sort._driver:RegisterEvent("PLAYER_REGEN_DISABLED")
@@ -2436,6 +2921,20 @@ local function makeSimulator(opts)
 
     function S:install()
         for _, g in ipairs(GLOBALS) do S.saved[g] = _G[g] end
+        -- ── 2.0.2: DROP THE CACHED EVENT DRIVER ──────────────────────────────────
+        -- ensureDriver() creates Sort._driver ONCE and keeps it forever (correct in
+        -- game: one client, one frame). Under the harness each simulator installs its
+        -- OWN _G.CreateFrame and keeps its own S.frames list, so a driver built inside
+        -- simulator #1 is invisible to simulator #2's S.fire — every sim after the
+        -- first ran with ITEM_LOCK_CHANGED effectively DISCONNECTED, and the whole
+        -- convergence suite was silently grading the tick-only path.
+        --
+        -- That was survivable while the event only released predictions early (the
+        -- tick's overlay does the same job a beat later). It is not survivable now
+        -- that issuing is event-driven: the suite would have graded a feature it never
+        -- ran. Nil it here so every sim builds a driver registered with ITSELF, and
+        -- again on restore so no live path can inherit a dead simulator frame.
+        Sort._driver = nil
         _G.C_Container = C_Container
         _G.C_Timer = { After = function(d, fn) S.after(d, fn) end }
         _G.GetTime = function() return S.clock end
@@ -2504,6 +3003,7 @@ local function makeSimulator(opts)
 
     function S:restore()
         for _, g in ipairs(GLOBALS) do _G[g] = S.saved[g] end
+        Sort._driver = nil   -- see S:install — never leak this sim's frame to a later one
     end
 
     ------------------------------------------------------------------
@@ -3318,6 +3818,382 @@ local function testProgressBasedAbort(fails)
     ck(Sort._running == false, "the stalled run tore itself down")
 end
 
+----------------------------------------------------------------------
+-- 2.0.2a — THE SORT TELEMETRY RING BUFFER
+--
+-- The coordinator reads these records straight out of the WTF SavedVariables file, so
+-- the SHAPE is a contract, not an implementation detail: every declared field present,
+-- every value a scalar, the array oldest-first, the cap honoured. Pure — no simulator.
+----------------------------------------------------------------------
+local function testSortLog(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------ record shape
+    local rec = Sort.NewLogRecord({
+        ts = 1700000000, context = "bank", cells = 120, fillPct = 91.4, planMoves = 132,
+        executedMoves = 180, waves = 98, durationMs = 6132.7, aborted = true,
+        reason = "entered combat", stallTicks = 32, busyFallbackTicks = 14,
+        avgAckMs = 560.2, version = "2.0.2",
+    })
+    for _, f in ipairs(Sort.LOG_FIELDS) do
+        ck(rec[f] ~= nil, "record carries declared field " .. f)
+        local t = type(rec[f])
+        ck(t == "number" or t == "string" or t == "boolean",
+            "field " .. f .. " is a SCALAR (got " .. t .. ") — the log must stay flat")
+    end
+    ck(rec.fillPct == 91 and rec.durationMs == 6133 and rec.avgAckMs == 560,
+        "fractional inputs are rounded to integers, not written as floats")
+    ck(rec.context == "bank" and rec.aborted == true and rec.reason == "entered combat",
+        "context / aborted / reason carried")
+    -- Field COUNT is pinned too: an undeclared extra key would reach the SV silently.
+    local n = 0
+    for _ in pairs(rec) do n = n + 1 end
+    ck(n == #Sort.LOG_FIELDS, string.format(
+        "a record holds exactly the %d declared fields (got %d)", #Sort.LOG_FIELDS, n))
+
+    ------------------------------------------------------------------ junk is inert
+    local junk = Sort.NewLogRecord(nil)
+    ck(junk.context == "bags", "an unknown context defaults to bags")
+    ck(junk.aborted == false and junk.reason == "", "a completed run stores reason \"\", never nil")
+    ck(junk.cells == 0 and junk.avgAckMs == 0, "absent numbers default to 0")
+    ck(Sort.NewLogRecord({ context = "wat", reason = 42 }).context == "bags",
+        "a garbage context falls back rather than reaching the file")
+    ck(Sort.NewLogRecord({ reason = 42 }).reason == "", "a non-string reason is dropped")
+
+    ------------------------------------------------------------------ additive SV
+    local db = { showMoney = true }
+    Sort.LogAppend(db, { ts = 1 })
+    local keys = {}
+    for k in pairs(db) do keys[#keys + 1] = k end
+    table.sort(keys)
+    ck(#keys == 2 and keys[1] == "showMoney" and keys[2] == "sortLog",
+        "the log writes exactly ONE new settings key, `sortLog` (got: " ..
+        table.concat(keys, ",") .. ")")
+    ck(db.showMoney == true, "…and touches nothing that was already there")
+    ck(Sort.LogBuffer({}, false) == nil, "no buffer is allocated for a plain read")
+    ck(Sort.LogBuffer(nil, true) ~= nil or true, "a nil db falls through to Store.db, never errors")
+
+    ------------------------------------------------------------------ append + wrap
+    local db2 = {}
+    for i = 1, 8 do Sort.LogAppend(db2, { ts = i, executedMoves = i }, 5) end
+    local buf = db2.sortLog
+    ck(#buf == 5, "the buffer is capped (got " .. #buf .. " of 5)")
+    ck(buf[1].ts == 4 and buf[5].ts == 8,
+        "it is a RING: oldest-first, the first 3 runs dropped (got " ..
+        buf[1].ts .. ".." .. buf[5].ts .. ")")
+    -- A cap LOWERED between releases must converge on the very next append.
+    Sort.LogAppend(db2, { ts = 99 }, 2)
+    ck(#db2.sortLog == 2 and db2.sortLog[2].ts == 99,
+        "a lowered cap converges in one append instead of leaking a run per sort")
+
+    ------------------------------------------------------------------ read order
+    local recs = Sort.LogRecords(db2)
+    ck(#recs == 2 and recs[1].ts == 99, "LogRecords hands back NEWEST first")
+    ck(recs ~= db2.sortLog, "…as a copy; the live SV table is never handed out")
+    ck(Sort.LogCount(db2) == 2, "LogCount agrees")
+    ck(#Sort.LogRecords({}) == 0, "reading a db with no log is an empty list, not nil")
+
+    ------------------------------------------------------------------ clear
+    local live = db2.sortLog
+    local dropped = Sort.LogClear(db2)
+    ck(dropped == 2, "clear reports how many runs it dropped")
+    ck(#db2.sortLog == 0, "…and the buffer is empty")
+    ck(db2.sortLog == live, "…IN PLACE: the SV table identity survives a clear")
+    ck(Sort.LogClear({}) == 0, "clearing an absent log is a no-op, not an error")
+
+    ------------------------------------------------------------------ adaptive seed
+    local db3 = {}
+    Sort.LogAppend(db3, { avgAckMs = 100 })
+    Sort.LogAppend(db3, { avgAckMs = 0 })      -- nothing measured: carries no signal
+    Sort.LogAppend(db3, { avgAckMs = 300 })
+    ck(Sort.LogAvgAckMs(db3) == 200,
+        "the seed averages only runs that MEASURED a round-trip (got " ..
+        Sort.LogAvgAckMs(db3) .. ")")
+    ck(Sort.LogAvgAckMs(db3, 1) == 300, "…and honours the lookback (newest first)")
+    ck(Sort.LogAvgAckMs({}) == 0, "an empty log seeds 0, i.e. use the fixed windows")
+
+    ------------------------------------------------------------------ derived windows
+    -- The 2.0.2c contract: the seed can only ever RAISE a window. Proven at the formula.
+    local function windows(ackMs)
+        local a = ackMs / 1000
+        return math.max(Sort.IDLE_SECONDS, Sort.IDLE_ACKS * a),
+               math.max(Sort.NO_PROGRESS_SECONDS, Sort.NO_PROGRESS_ACKS * a),
+               math.max(Sort.RUNAWAY_SECONDS, Sort.RUNAWAY_ACKS * a)
+    end
+    local i0, p0, r0 = windows(0)
+    ck(i0 == Sort.IDLE_SECONDS and p0 == Sort.NO_PROGRESS_SECONDS and r0 == Sort.RUNAWAY_SECONDS,
+        "with nothing measured the windows are exactly the fixed 2.0.1 ones")
+    local i1, p1, r1 = windows(1000)
+    ck(i1 >= i0 and p1 >= p0 and r1 >= r0,
+        "a measured round-trip can only ever LENGTHEN a window, never shorten one")
+    ck(p1 > p0, "…and a 1s round-trip genuinely does lengthen the stall window")
+    ck(Sort.IDLE_SECONDS == Sort.MAX_IDLE_TICKS * Sort.TICK
+       and Sort.NO_PROGRESS_SECONDS == Sort.MAX_NO_PROGRESS * Sort.TICK
+       and Sort.RUNAWAY_SECONDS == Sort.MAX_TICKS * Sort.TICK,
+        "the seconds windows are DERIVED from the tick constants, not restated")
+
+    ------------------------------------------------------------------ printed line
+    local line = Sort.FormatLogLine({ ts = 1700000000, context = "bank", cells = 120,
+        fillPct = 91, planMoves = 132, executedMoves = 180, waves = 98,
+        durationMs = 6133, avgAckMs = 560, busyFallbackTicks = 14, stallTicks = 32 }, 1)
+    for _, want in ipairs({ "bank", "cells=120", "fill=91%", "plan=132", "exec=180",
+                            "waves=98", "6.13s", "ack=560ms", "busy=14", "stall=32", "ok" }) do
+        ck(line:find(want, 1, true) ~= nil, "the printed line carries " .. want .. ": " .. line)
+    end
+    local bad = Sort.FormatLogLine({ aborted = true, reason = "bank closed" }, 2)
+    ck(bad:find("ABORT:bank closed", 1, true) ~= nil, "an aborted run prints its reason: " .. bad)
+    ck(pcall(Sort.FormatLogLine, nil, 1), "formatting a junk record never errors")
+end
+
+----------------------------------------------------------------------
+-- 2.0.2b — EVENT-DRIVEN ISSUING
+--
+-- The shared assertion body, so the MUTATION gate below can run exactly the checks the
+-- suite runs (mirrors userLockAssertions/testUserLockMutants). Returns a fails list.
+--
+-- Three properties, in the order they matter:
+--   1. A confirmation on a slot that BLOCKED a planned move pulls the next round
+--      forward immediately (this is the feature).
+--   2. A confirmation on a slot nothing is waiting for does NOT (this is the guard —
+--      kicking on everything was measured at +20-24% moves and +38-51% wall time).
+--   3. Under the simulator the executor still converges, conserves every item, reaches
+--      the planner's fixed point, and does not churn — with the event path LIVE.
+----------------------------------------------------------------------
+local function eventIssueAssertions()
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A sort with a real round in flight, so _pred / _waiting / the driver are all live.
+    local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                              latency = 0.40, seed = 20260803 })
+    seedRandomBags(S, newRng(4711), 8, 6)
+    S:install()
+    local ok, err = pcall(function()
+        withFakeUI(function()
+            Sort.Run({ 0, 1 })
+            ck(Sort._running, "the run started")
+            ck(predOutstanding(), "…with moves in flight after the first round")
+            ck(Sort._driver ~= nil and Sort._driver._script ~= nil,
+                "the event driver is bound to THIS simulator (see S:install)")
+
+            -- Pick an in-flight slot and pretend the last round refused a move on it.
+            local key, cid, slot
+            for k, p in pairs(Sort._pred) do key, cid, slot = k, p.cid, p.slot; break end
+            ck(key ~= nil, "found an in-flight slot to drive the event with")
+
+            local function fire(k, c, s)
+                S.locked[k] = nil                       -- the server just confirmed it
+                local before = #S.timers
+                local floor = S.clock + (Sort.KICK_GAP or 0)
+                Sort._driver._script(Sort._driver, "ITEM_LOCK_CHANGED", c, s)
+                for i = before + 1, #S.timers do
+                    if S.timers[i].at <= floor + 1e-9 then return true end
+                end
+                return false
+            end
+
+            ---------------------------------------------------- 1. the feature
+            Sort._waiting  = { [key] = true }
+            Sort._lastIssued = 99                       -- not the 2.0.1 "blocked" case
+            ck(predCount() >= 2, "…and more than one prediction, so this is not `settled`")
+            ck(fire(key, cid, slot),
+                "a confirmation on a WAITING slot pulls the next round forward immediately")
+
+            ---------------------------------------------------- 2. the guard
+            local key2, cid2, slot2
+            for k, p in pairs(Sort._pred) do key2, cid2, slot2 = k, p.cid, p.slot; break end
+            if key2 and predCount() >= 2 then
+                Sort._waiting  = {}                     -- nothing is waiting on it
+                Sort._lastIssued = 99
+                ck(not fire(key2, cid2, slot2),
+                    "a confirmation nothing was waiting on does NOT kick (churn guard)")
+            end
+
+            ---------------------------------------------------- 3. the off switch
+            -- EVENT_ISSUE off must genuinely revert to the 2.0.1 rule: even a WAITING
+            -- slot waits for the tick unless the previous round issued nothing.
+            local key3, cid3, slot3
+            for k, p in pairs(Sort._pred) do key3, cid3, slot3 = k, p.cid, p.slot; break end
+            if key3 and predCount() >= 2 then
+                local saved = Sort.EVENT_ISSUE
+                Sort.EVENT_ISSUE = false
+                Sort._waiting  = { [key3] = true }
+                Sort._lastIssued = 99
+                local kicked = fire(key3, cid3, slot3)
+                Sort.EVENT_ISSUE = saved
+                ck(not kicked, "with EVENT_ISSUE off a waiting slot does NOT kick")
+            end
+
+            S:pump(120)
+        end)
+    end)
+    if Sort._running then Sort._running = false end
+    S:restore()
+    if not ok then fails[#fails + 1] = "error: " .. tostring(err); return fails end
+
+    ---------------------------------------------------- 3. it still converges
+    for _, latency in ipairs({ 0.10, 0.35 }) do
+        for trial = 1, 2 do
+            local T = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 },
+                                               { cid = 2, size = 16 } },
+                                      latency = latency, jitter = latency * 0.4,
+                                      seed = 6100 + trial })
+            seedRandomBags(T, newRng(880 + trial), 10, 9)
+            local before = T:totals()
+            local plan0 = Sort.Plan({ cells = T:cells(), meta = simMetaFn })
+            local tally = runSortInSim(T, { 0, 1, 2 }, { limit = 120 })
+            local tag = string.format("event issue @ %.2fs trial %d", latency, trial)
+
+            ck(Sort._running == false, tag .. ": stopped")
+            local same, badId = sameTotals(before, T:totals())
+            ck(same, tag .. ": every item conserved (id " .. tostring(badId) .. ")")
+            ck(T.held == nil, tag .. ": cursor left empty")
+            ck(not T:anyLocked(), tag .. ": no slot left locked")
+            local re = Sort.Plan({ cells = T:cells(), meta = simMetaFn })
+            ck(#re.moves == 0, tag .. ": reached the planner's fixed point")
+            local completed, issued = false, 0
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort complete", 1, true) then completed = true end
+                local n = line:match("sort complete %((%d+) moves")
+                if n then issued = tonumber(n) end
+            end
+            ck(completed, tag .. ": completed rather than aborting")
+            -- CHURN PIN. The event path must not buy its speed with extra moves; this is
+            -- the assertion that kills a "kick on every confirmation" mutant, which was
+            -- measured at +20-24% moves on the same fixtures.
+            ck(issued <= #plan0.moves * 1.6 + 6, tag .. string.format(
+                ": issued %d moves for a %d-move plan (no churn)", issued, #plan0.moves))
+        end
+    end
+    return fails
+end
+
+local function testEventDrivenIssue(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ck(Sort.EVENT_ISSUE == true, "event-driven issuing ships ON")
+    ck(Sort.KICK_GAP >= 0 and Sort.KICK_GAP < Sort.TICK,
+        "the kick floor is tighter than the fallback tick (else the tick is the floor)")
+    for _, f in ipairs(eventIssueAssertions()) do fails[#fails + 1] = f end
+
+    ---------------------------------------------------------------- the tick survives
+    -- The safety cadence must still be there with the events silent: the executor has to
+    -- degrade to the 2.0.1 ladder, not stall, if a client stops delivering the event.
+    local realIssue = Sort.EVENT_ISSUE
+    Sort.EVENT_ISSUE = false
+    local okOff, resOff = pcall(function()
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                                  latency = 0.20, jitter = 0.05, seed = 990 })
+        seedRandomBags(S, newRng(4242), 8, 8)
+        local before = S:totals()
+        local tally = runSortInSim(S, { 0, 1 }, { limit = 120 })
+        local completed = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort complete", 1, true) then completed = true end
+        end
+        return completed and sameTotals(before, S:totals())
+            and #Sort.Plan({ cells = S:cells(), meta = simMetaFn }).moves == 0
+    end)
+    Sort.EVENT_ISSUE = realIssue
+    ck(okOff and resOff,
+        "with EVENT_ISSUE off the tick alone still converges (the fallback cadence is real)")
+    ck(Sort.EVENT_ISSUE == realIssue, "the shipping switch was restored")
+
+    ---------------------------------------------------------------- abort mid-flight
+    -- An event-driven run has rounds scheduled from the event handler as well as the
+    -- ticker; combat must still tear ALL of them down and strand nothing.
+    do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 },
+                                           { cid = 2, size = 16 } },
+                                  latency = 0.15, jitter = 0.05, seed = 20260804 })
+        seedRandomBags(S, newRng(1234), 10, 10)
+        local before = S:totals()
+        S:install()
+        local tally
+        local okA, errA = pcall(function()
+            tally = withFakeUI(function()
+                Sort.Run({ 0, 1, 2 })
+                S.after(0.22, function() S.combat = true; S.fire("PLAYER_REGEN_DISABLED") end)
+                S:pump(60)
+            end)
+        end)
+        if Sort._running then Sort._running = false end
+        S:restore()
+        ck(okA, "combat abort mid-flight did not error: " .. tostring(errA))
+        if okA then
+            ck(Sort._running == false, "combat aborted the event-driven run")
+            ck(S.held == nil, "…leaving the cursor empty")
+            ck(sameTotals(before, S:totals()), "…and every item conserved")
+            local stopped = false
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort stopped: entered combat", 1, true) then stopped = true end
+            end
+            ck(stopped, "…and it said so")
+            -- The pump above ran to t=60 AFTER the abort at 0.22, so any round that had
+            -- survived the teardown — kicked or ticked — would have restarted the run.
+            ck(not Sort._running, "no queued round survived the abort (generation guard held)")
+        end
+    end
+
+    ---------------------------------------------------------------- run telemetry
+    -- The record the executor actually writes, end to end through a real simulated run.
+    do
+        local savedDB = Store.db
+        local db = {}
+        Store.db = db
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                                  latency = 0.25, jitter = 0.05, seed = 5150 })
+        seedRandomBags(S, newRng(31415), 9, 8)
+        local okL = pcall(function() runSortInSim(S, { 0, 1 }, { limit = 120 }) end)
+        Store.db = savedDB
+        ck(okL, "a run with a live settings DB did not error")
+        local recs = Sort.LogRecords(db)
+        ck(#recs == 1, "one finished run appended exactly one record (got " .. #recs .. ")")
+        if recs[1] then
+            local r = recs[1]
+            ck(r.cells == 32, "…with the opening cell count (got " .. r.cells .. ")")
+            ck(r.fillPct > 0 and r.fillPct <= 100, "…a sane fill percentage (" .. r.fillPct .. ")")
+            ck(r.planMoves > 0 and r.executedMoves > 0, "…the plan and executed move counts")
+            ck(r.waves > 0 and r.durationMs > 0, "…waves and duration")
+            ck(r.context == "bags", "…the context")
+            ck(r.avgAckMs > 0, "…and a MEASURED round-trip (got " .. r.avgAckMs .. "ms)")
+            ck(math.abs(r.avgAckMs - 250) <= 120, string.format(
+                "…that tracks the simulated 250ms latency (got %dms)", r.avgAckMs))
+            ck(r.version == tostring(ns.VERSION), "…stamped with the build version")
+        end
+    end
+end
+
+-- MUTATION GATE for the issuing rule (2.0.2b). Sort.ShouldKick is the whole decision, so
+-- every plausible way to get it wrong is expressible as a replacement for it.
+local function testEventIssueMutants(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local real = Sort.ShouldKick
+    local mutants = {
+        { name = "never kicks (the feature is silently absent)",
+          fn = function() return false end },
+        { name = "kicks on EVERY confirmation (the measured +20-24% churn)",
+          fn = function() return "always" end },
+        { name = "ignores the waiting set (only the 2.0.1 blocked case survives)",
+          fn = function() return ((Sort._lastIssued or 0) == 0) and "blocked" or false end },
+        { name = "ignores EVENT_ISSUE (the off switch does nothing)",
+          fn = function(key)
+              if key ~= nil and Sort._waiting and Sort._waiting[key] then return "waiting" end
+              return false
+          end },
+    }
+    for _, mut in ipairs(mutants) do
+        Sort.ShouldKick = mut.fn
+        local ok, res = pcall(eventIssueAssertions)
+        Sort.ShouldKick = real
+        local killed = (not ok) or (#res > 0)
+        ck(killed, "mutant SURVIVED the event-issue assertions: " .. mut.name)
+    end
+    ck(Sort.ShouldKick == real, "the real issuing rule was restored after mutation")
+    ck(#eventIssueAssertions() == 0, "the real issuing rule passes the assertions it kills with")
+end
+
 function Sort.RunSelfTests(verbose)
     local suites = {
         { name = "merge pour (exhaustive)", fn = testMergePour },
@@ -3342,6 +4218,9 @@ function Sort.RunSelfTests(verbose)
         { name = "converge: guard-rails",    fn = testExecutorGuardRails },
         { name = "converge: sort locks + combat", fn = testExecutorUserLocks },
         { name = "converge: report + quiet",  fn = testExecutorReporting },
+        { name = "telemetry: sort log ring",  fn = testSortLog },
+        { name = "converge: event-driven issue", fn = testEventDrivenIssue },
+        { name = "converge: issuing mutation gate", fn = testEventIssueMutants },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -434,10 +434,19 @@ end
 -- native "…" truncation, and the two-point anchor is what makes the width real.
 local ICON_W, ICON_GAP, COUNT_W, ROW_PAD = 16, 5, 46, 2
 
-local function acquireRow(win, i)
-    local row = win._rows[i]
-    if row then return row end
-    row = _G.CreateFrame("Button", nil, win.content)
+-- ONE item row: [icon] name (quality-colored, ellipsizing) ............ xN
+--
+-- 2.0.2: lifted out of Find's own pool so the SUMMARY VIEW (a Nexus-only character's
+-- aggregate item list, rendered in the inventory and bank windows) draws the same row
+-- rather than a near-copy. `parent` is the caller's scroll child; the returned button
+-- carries _icon/_label/_count/_hl and the tooltip scripts, and the caller supplies
+-- _link before the row is shown. No Find state is touched, so the two consumers pool
+-- independently.
+function Find.CreateItemRow(parent)
+    if not _G.CreateFrame then return nil end
+    UI = UI or _G.DaseekiUI
+    if not UI then return nil end
+    local row = _G.CreateFrame("Button", nil, parent)
     row:SetHeight(Find.ROW_H)
     local hl = row:CreateTexture(nil, "BACKGROUND"); hl:SetAllPoints(); hl:Hide()
     UI.Skin(hl, function(self) self:SetColorTexture(UI.Color("brand", 0.18)) end)
@@ -470,8 +479,143 @@ local function acquireRow(win, i)
         end
     end)
     row:SetScript("OnLeave", function(self) self._hl:Hide(); if _G.GameTooltip then _G.GameTooltip:Hide() end end)
+    return row
+end
+
+local function acquireRow(win, i)
+    local row = win._rows[i]
+    if row then return row end
+    row = Find.CreateItemRow(win.content)
     win._rows[i] = row
     return row
+end
+
+-- Paint one item row from a { itemID, itemName, quality, icon, count } record. Shared by
+-- Find's aggregate rows and the summary view so the two can never drift apart.
+function Find.PaintItemRow(row, rec)
+    if not (row and rec) then return end
+    row._icon:SetTexture(rec.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
+    row._label:SetText(qualityHex(rec.quality) .. (rec.itemName or "?") .. "|r")
+    row._label:SetTextColor(1, 1, 1)   -- the embedded color escape carries the coloring
+    row._count:SetText("x" .. tostring(rec.count or rec.total or 0))
+    row._link = rec.itemID and ("item:" .. rec.itemID) or nil
+end
+
+-- =====================================================================
+-- THE SUMMARY PANEL  (2.0.2, owner ask 2b)
+--
+-- A caption line over a scrolling list of Find-shaped item rows. The inventory window
+-- swaps it in for the bag grid when the viewed character is Nexus-only, and the bank
+-- window shows the SAME panel (with the bags/bank caveat in its caption) for the
+-- right-click bank preview — because the Nexus payload carries ONE merged itemCounts
+-- map and no bags/bank split exists to render (see Owner.SummaryCaption's banner).
+--
+-- Lives here, not in ui_frame/ui_bank, so there is exactly one implementation and it
+-- reuses Find.CreateItemRow verbatim. Both hosts resolve it through ns.Find at CALL
+-- time, so ui_find.lua loading after them (as the .toc does) is fine.
+-- =====================================================================
+
+Find.SUMMARY_CAP_H  = 30    -- caption band (wraps to two lines in the bank's longer form)
+Find.SUMMARY_MIN_H  = 60
+Find.SUMMARY_MAX_H  = 340
+
+-- PURE: the panel's content height for `rowCount` rows, and its scroll overshoot.
+-- Returns height, scrollRange.
+function Find.SummaryHeight(rowCount)
+    local n = rowCount or 0
+    if n < 0 then n = 0 end
+    local wanted = Find.SUMMARY_CAP_H + math.max(n, 1) * Find.ROW_H
+    if wanted < Find.SUMMARY_MIN_H then return Find.SUMMARY_MIN_H, 0 end
+    if wanted > Find.SUMMARY_MAX_H then
+        return Find.SUMMARY_MAX_H, wanted - Find.SUMMARY_MAX_H
+    end
+    return wanted, 0
+end
+
+-- Build (or return) a summary panel parented to `parent`. The panel exposes
+-- :SetSummary(owner, opts) — opts = { bank = <bool>, sortBy = "name"|"count" } — which
+-- repaints the caption + rows and re-sizes itself. The caller anchors and shows it.
+function Find.CreateSummaryPanel(parent)
+    if not _G.CreateFrame then return nil end
+    UI = UI or _G.DaseekiUI
+    if not UI then return nil end
+
+    local panel = _G.CreateFrame("Frame", nil, parent)
+    panel:SetSize(1, Find.SUMMARY_MIN_H)
+
+    local cap = panel:CreateFontString(nil, "OVERLAY")
+    cap:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+    cap:SetPoint("TOPLEFT", panel, "TOPLEFT", 2, -2)
+    cap:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -2, -2)
+    cap:SetJustifyH("LEFT")
+    cap:SetHeight(Find.SUMMARY_CAP_H - 6)
+    UI.Skin(cap, function(self) self:SetTextColor(UI.Color("faint")) end)
+    panel._caption = cap
+
+    -- A ScrollFrame, so a long list clips to the panel instead of drawing through the
+    -- window's bottom border (the same defect ITEM 3 fixed in the Find window).
+    local list = _G.CreateFrame("ScrollFrame", nil, panel)
+    list:SetPoint("TOPLEFT", panel, "TOPLEFT", 0, -Find.SUMMARY_CAP_H)
+    list:SetPoint("BOTTOMRIGHT", panel, "BOTTOMRIGHT", 0, 0)
+    local content = _G.CreateFrame("Frame", nil, list)
+    content:SetSize(1, 1)
+    list:SetScrollChild(content)
+    list:EnableMouseWheel(true)
+    list:SetScript("OnMouseWheel", function(self, delta)
+        local range = self._range or 0
+        if range <= 0 then return end
+        local v = (self:GetVerticalScroll() or 0) - delta * Find.ROW_H
+        if v < 0 then v = 0 elseif v > range then v = range end
+        self:SetVerticalScroll(v)
+    end)
+    panel._list, panel._content, panel._rows = list, content, {}
+
+    local empty = content:CreateFontString(nil, "OVERLAY")
+    empty:SetFontObject(UI.fonts.muted)
+    empty:SetPoint("TOPLEFT", content, "TOPLEFT", 2, -2)
+    empty:SetPoint("RIGHT", content, "RIGHT", -2, 0)
+    empty:SetJustifyH("LEFT")
+    empty:Hide()
+    panel._empty = empty
+
+    function panel:SetSummary(owner, opts)
+        opts = opts or {}
+        local O = ns.Owner
+        if not (O and O.SummaryRows) then return end
+        self._caption:SetText(O.SummaryCaption(owner, nil, { bank = opts.bank }))
+        local rows = O.SummaryRows(owner, liveResolver(), { sortBy = opts.sortBy })
+        for _, r in ipairs(self._rows) do r:Hide() end
+        if #rows == 0 then
+            self._empty:SetText(O.SummaryEmptyText(owner))
+            self._empty:Show()
+        else
+            self._empty:Hide()
+            local y = 0
+            for i, rec in ipairs(rows) do
+                local row = self._rows[i]
+                if not row then
+                    row = Find.CreateItemRow(self._content)
+                    self._rows[i] = row
+                end
+                row:ClearAllPoints()
+                row:SetPoint("TOPLEFT", self._content, "TOPLEFT", 0, -y)
+                row:SetPoint("RIGHT", self._content, "RIGHT", 0, 0)
+                Find.PaintItemRow(row, rec)
+                row:Show()
+                y = y + Find.ROW_H
+            end
+        end
+        local h, range = Find.SummaryHeight(#rows)
+        self:SetHeight(h)
+        local vw = (self.GetWidth and self:GetWidth()) or 0
+        if not vw or vw <= 1 then vw = Find.WIN_W - 20 end
+        self._content:SetSize(vw, math.max(1, #rows * Find.ROW_H))
+        self._list._range = range
+        self._list:SetVerticalScroll(0)
+        return #rows
+    end
+
+    return panel
 end
 
 -- Run the search and repaint the result rows.
@@ -809,12 +953,54 @@ local function testFindWindowGeometry(fails)
     ck(Find.WIN_W >= 400, "window is wide enough for a long consumable name")
 end
 
+-- 2.0.2: the SUMMARY PANEL's geometry, and the shared row machinery it composes from.
+-- The panel is the content band of the inventory window (and of the bank preview) for a
+-- Nexus-only character, so its height IS that window's height — a pure function, pinned
+-- here beside the Find window's own sizing for the same reason.
+local function testSummaryPanelGeometry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The row machinery is SHARED with the summary view rather than reimplemented.
+    ck(type(Find.CreateItemRow) == "function", "the item-row factory is published")
+    ck(type(Find.PaintItemRow) == "function", "…and so is the painter both consumers use")
+    ck(type(Find.CreateSummaryPanel) == "function", "the summary panel factory is published")
+
+    -- Empty and tiny lists still get a real band — a zero-height content frame is the
+    -- zero-frame defect the window sizing rules exist to prevent.
+    local h0, r0 = Find.SummaryHeight(0)
+    ck(h0 >= Find.SUMMARY_MIN_H, "an empty summary still has a visible band (" .. h0 .. ")")
+    ck(r0 == 0, "…and nothing to scroll")
+    ck(Find.SummaryHeight(-5) == h0, "a negative count is treated as empty")
+    ck(Find.SummaryHeight(nil) == h0, "…and so is nil")
+
+    -- It grows with content, monotonically, until the clamp.
+    local prev = 0
+    for _, n in ipairs({ 1, 3, 8, 14 }) do
+        local h = Find.SummaryHeight(n)
+        ck(h >= prev, "height is monotone in the row count (n=" .. n .. ")")
+        ck(h <= Find.SUMMARY_MAX_H, "…and never past the clamp (n=" .. n .. ")")
+        prev = h
+    end
+
+    -- Past the clamp it scrolls rather than drawing through the window's bottom border.
+    local hBig, rBig = Find.SummaryHeight(400)
+    ck(hBig == Find.SUMMARY_MAX_H, "a huge list clamps to the max panel height")
+    ck(rBig > 0, "…and the overshoot becomes scroll range")
+    ck(rBig == Find.SUMMARY_CAP_H + 400 * Find.ROW_H - Find.SUMMARY_MAX_H,
+        "…which is exactly the overshoot")
+    ck(Find.SUMMARY_MAX_H >= Find.SUMMARY_CAP_H + 8 * Find.ROW_H,
+        "at least 8 rows are visible before scrolling starts")
+    -- The caption band must actually reserve room for the bank's two-line caption.
+    ck(Find.SUMMARY_CAP_H >= 2 * Find.ROW_H - 12, "the caption band fits a wrapped line")
+end
+
 function Find.RunSelfTests(verbose)
     local suites = {
         { name = "find across owners",  fn = testFindAcrossOwners },
         { name = "aggregate item rows", fn = testFindAggregateRows },
         { name = "summary owners",      fn = testFindSummaryOwners },
         { name = "window geometry",     fn = testFindWindowGeometry },
+        { name = "summary panel geometry", fn = testSummaryPanelGeometry },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

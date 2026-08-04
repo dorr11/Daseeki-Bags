@@ -571,6 +571,10 @@ function Bank.Ensure()
         -- thing that tells the server we walked away. Without this the session stays open
         -- until the range check drops it and the bank looks live when it is not.
         if ns.SafeCall then ns:SafeCall(Bank.EndBankSession) else Bank.EndBankSession() end
+        -- CHARACTER MENU (2.0.2, owner-reported): the flyout lives on UIParent, so this
+        -- window closing does not take it with it. Same fix, same reason, as the
+        -- inventory window's OnHide. Guarded — ui_owner is optional to this file.
+        if ns.Owner and ns.Owner.CloseAllMenus then ns.Owner.CloseAllMenus() end
     end)
 
     Bank.ApplyScale()
@@ -797,6 +801,50 @@ function Bank.Rebuild()
                    buttonSize = Frame and Frame.ButtonSize and Frame.ButtonSize() or 37,
                    gap = Frame and Frame.Gap and Frame.Gap() or 4 }
     local hasBank = Bank.HasBankData(viewed)
+
+    -- ── SUMMARY PREVIEW (2.0.2) ──────────────────────────────────────────────────
+    -- Right-clicking a Nexus-only character's name opens this window on a record that
+    -- has no bank containers — and cannot have any, because the Nexus wire payload
+    -- carries ONE merged itemCounts map (carried + equipped + the persisted bank and
+    -- mail counts, folded by inventory.lua's AggregateCounts). There is no bags-vs-bank
+    -- split in the data.
+    --
+    -- So this shows the SAME summary the inventory window shows, under a caption that
+    -- says the split does not exist. The alternative — an empty bank grid — would read
+    -- as "this character's bank is empty", which is a claim the payload cannot support
+    -- and the one thing worse than saying nothing.
+    local summaryOwner = (ns.Owner and ns.Owner.IsSummaryView and ns.Owner.IsSummaryView(viewed))
+                         and viewed or nil
+    if summaryOwner then
+        if win.emptyFS then win.emptyFS:Hide() end
+        if not win._summary and ns.Find and ns.Find.CreateSummaryPanel then
+            win._summary = ns.Find.CreateSummaryPanel(win.content)
+        end
+        local nRows = 0
+        if win._summary then
+            win._summary:ClearAllPoints()
+            win._summary:SetPoint("TOPLEFT", win.content, "TOPLEFT", 0, 0)
+            win._summary:SetPoint("RIGHT", win.content, "RIGHT", 0, 0)
+            nRows = win._summary:SetSummary(summaryOwner, { bank = true, sortBy = "name" }) or 0
+            win._summary:Show()
+        end
+        if win._group then win._group:Clear(); if win._group.Hide then win._group:Hide() end end
+        local band = Bank.ComputeContentSize(nil, opts).width
+        local h = (ns.Find and ns.Find.SummaryHeight and ns.Find.SummaryHeight(nRows)) or 60
+        win.content:SetSize(math.max(band, 1), math.max(h, 1))
+        win:SetSize(band + Bank.PAD * 2,
+                    Bank.TITLE_H + Bank.PAD + Bank.STRIP_H + Bank.VGAP + h + Bank.VGAP
+                    + Bank.FOOTER_H + Bank.PAD)
+        if win.sortBtn then
+            if win.sortBtn.SetEnabled then win.sortBtn:SetEnabled(false) end
+            win.sortBtn:SetAlpha(0.4)
+        end
+        if ns.Search and ns.Search.Reapply then ns.Search.Reapply() end
+        return
+    elseif win._summary then
+        win._summary:Hide()
+    end
+
     if win.emptyFS then win.emptyFS:SetShown(not hasBank) end
 
     local content = Bank.ComputeContentSize(renderOwner, opts)
@@ -1400,6 +1448,67 @@ local function testBankOverride(fails)
     Store.db = savedDb
 end
 
+-- 2.0.2: the BANK PREVIEW of a Nexus-only character.
+--
+-- THE PAYLOAD FACT this whole case exists to encode: Daseeki-Nexus builds `itemCounts`
+-- as ONE merged aggregate (inventory.lua BuildPayload folds carried + equipped +
+-- parts.bank + parts.mail through AggregateCounts). The frozen wire contract carries no
+-- bags-vs-bank breakdown at all, and cannot — the cold components are stored as counts,
+-- not layouts. So the preview shows the SAME item list the inventory window shows, under
+-- a caption that SAYS the split does not exist. What it must never do is render an empty
+-- bank grid, which would read as "this character's bank is empty" — a claim the data
+-- cannot support.
+local function testBankSummaryPreview(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local O = ns.Owner
+    if not (O and O.SummaryCaption) then
+        ck(false, "ui_owner's summary model is absent, so the bank preview cannot be gated")
+        return
+    end
+
+    local nexusOwner = { nameRealm = "Rin-R", name = "Rin", class = "MAGE",
+                         source = "summary", nexus = true, money = 4242, ts = 1700000000,
+                         containers = {}, equip = {}, itemCounts = { [6948] = 1, [4306] = 40 } }
+
+    -- Without the branch this owner takes the empty-state path, which is the defect.
+    ck(Bank.HasBankData(nexusOwner) == false,
+        "a Nexus-only character has no bank containers (so the grid path would say nothing)")
+    ck(O.IsSummaryView(nexusOwner) == true, "…and it is therefore a SUMMARY PREVIEW")
+
+    -- The caption is the whole contract: it must name the source, the age, AND the fact.
+    local cap = O.SummaryCaption(nexusOwner, 1700000000 + 86400, { bank = true })
+    ck(cap:find("Daseeki Nexus", 1, true) ~= nil, "the preview names its source: " .. cap)
+    ck(cap:find("updated 1d ago", 1, true) ~= nil, "…and how old the snapshot is")
+    ck(cap:find("not separated", 1, true) ~= nil,
+        "…and states that bags and bank are NOT separated in synced data")
+    -- The inventory window's caption is the same line WITHOUT the bank sentence, so the
+    -- two surfaces cannot drift into telling different stories about the same record.
+    local invCap = O.SummaryCaption(nexusOwner, 1700000000 + 86400)
+    ck(invCap:find("not separated", 1, true) == nil,
+        "the inventory caption does not carry the bank sentence")
+    ck(cap:sub(1, #invCap) == invCap, "…and the bank caption is that same line, extended")
+
+    -- Both surfaces render the SAME rows (there is only one aggregate to render).
+    local resolver = { instant = function() end, info = function(id) return "item" .. id, nil, 1 end }
+    local rows = O.SummaryRows(nexusOwner, resolver)
+    ck(#rows == 2, "the preview lists every item in the merged aggregate")
+
+    -- Sizing: the preview band is the summary panel's height over the bank chrome.
+    if ns.Find and ns.Find.SummaryHeight then
+        local h = ns.Find.SummaryHeight(#rows)
+        ck(h > 0, "the preview band has a real height")
+        local winH = Bank.TITLE_H + Bank.PAD + Bank.STRIP_H + Bank.VGAP + h + Bank.VGAP
+                     + Bank.FOOTER_H + Bank.PAD
+        ck(winH > h, "…and the window clears its own chrome around it")
+    end
+
+    -- A store-sourced summary owner is untouched: still the empty-state bank.
+    local meshOwner = { nameRealm = "Old-R", name = "Old", source = "summary",
+                        containers = {}, itemCounts = { [1] = 1 } }
+    ck(O.IsSummaryView(meshOwner) == false,
+        "a Bags-store summary owner keeps the 2.0.1 empty-state bank")
+end
+
 function Bank.RunSelfTests(verbose)
     local suites = {
         { name = "blizzard panel override", fn = testBankOverride },
@@ -1411,6 +1520,7 @@ function Bank.RunSelfTests(verbose)
         { name = "cached-view proxy",      fn = testCachedViewProxy },
         { name = "bank entries + sizing",  fn = testBankEntriesAndSizing },
         { name = "footer parity",          fn = testBankFooterParity },
+        { name = "nexus summary preview",  fn = testBankSummaryPreview },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -1,5 +1,70 @@
 # Changelog
 
+## Unreleased — 2.0.2
+
+**Characters that only exist in Daseeki Nexus now show up in the character menu with a
+readable summary instead of being invisible, sorting keeps a private log of every run so
+it can be tuned against real data, and the character menu no longer floats on screen after
+you close the bags.**
+
+### Characters synced from Daseeki Nexus
+
+If another one of your accounts syncs a character through Daseeki Nexus but that character
+has never been played on this one, Bags knew about its gold — the money tooltip counted it —
+but the character menu did not list it at all. It does now, with the same class colour, the
+same **Summary** tag and the same "3d" age stamp as any other row.
+
+Picking one opens a **summary view**: that character's gold, and a list of everything it is
+carrying — icon, name and count — sorted by name, with a line at the top saying where the
+data came from and how old it is. That replaces the blank grid the row would have shown.
+
+Two things about those rows are deliberate.
+
+- **There is no remove ✕ on them.** The record lives in Nexus, not in Bags, so deleting it
+  here would not stick — the character would simply reappear the next time the two stores
+  are merged. A control that does nothing is worse than no control.
+- **The favourite star still works.** Favourites are Bags' own preference, stored under the
+  character's name, so starring a synced character sticks and lifts it to the top of the
+  menu exactly like any other.
+
+Right-clicking a synced character's name still opens the bank preview, and it shows that
+same summary. It says so plainly, too: what Nexus sends is one combined tally of everything
+a character holds — bags, bank, equipped and mail together — so there is no bags-versus-bank
+split to show. Bags says that rather than showing you an empty bank window, which would have
+read as "this character's bank is empty".
+
+With Daseeki Nexus not installed, or its Inventory module switched off, none of the above
+appears and the character menu is exactly what it was.
+
+### Sorting
+
+- **Sorting is faster on a slow connection.** A sort issues its moves in rounds, and each
+  round used to wait out a fixed 1/20th-second tick before looking again — even when the
+  server had already confirmed the move the next one was waiting on. Confirmations now wake
+  the sort immediately when they unblock something. Measured across the simulated bag and
+  bank fixtures at 50ms–500ms latency: **15% less time overall**, up to 39% on a full
+  120-slot bank, with no increase in the number of moves made and several runs that used to
+  give up now finishing. The old tick remains as the safety cadence, so nothing depends on
+  the confirmations arriving.
+- **Sorting keeps a log.** Every run now records one compact line — how big the bag was, how
+  full, how many moves were planned versus made, how many rounds, how long it took, the
+  measured server round-trip, and why it stopped if it did. The last 50 runs are kept.
+  `/bags sortlog` prints them newest first; `/bags sortlog clear` empties the list. Nothing
+  about the sort itself is slower for it, and the single chat line at the end is unchanged.
+  This exists so the next round of tuning is done against your bags rather than a guess.
+- **Long sorts get more patience on a slow link.** The guards that stop a sort which has
+  genuinely stalled are now measured in seconds rather than in ticks, and they stretch to
+  fit the round-trip the log has actually measured. They can only ever get more patient,
+  never less.
+
+### Fixed
+
+- **The character menu no longer outlives the window.** Opening the character dropdown and
+  then closing the bags — with Escape, or the X — left the menu floating on screen with
+  nothing behind it. It now closes with the window it belongs to, on both the bag and bank
+  windows.
+
+
 ## 2.0.1 — 2026-08-04
 
 **Sorting is faster and always finishes, the Blizzard bank window no longer turns up
