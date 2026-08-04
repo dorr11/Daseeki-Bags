@@ -483,7 +483,34 @@ end
 -- merchant/bank/mail close only hides what we opened (never the user's own open
 -- window); combat-close always hides a shown window.
 Features._autoOpened = false
+
+-- 2.0.1 HOTFIX — leave the sort-lock CONFIG MODE when a hostile context opens.
+--
+-- While that mode is on, ui_items raises an insecure catcher over every live cell and it
+-- swallows the whole secure click path, including the right-click that would place an
+-- item into a TRADE window (C_Container.UseContainerItem). The owner hit exactly that:
+-- a right-click on the sort glyph meaning "sort" opened the mode, an open bag window
+-- carried it (features only auto-closes what IT auto-opened), and every right-click in
+-- the trade toggled a lock instead of moving an item until he relogged.
+--
+-- Deliberately runs BEFORE the autoDisplay gate and independently of it: a user who has
+-- turned "open bags at the merchant" OFF must still get his item clicks back. The
+-- decision (which events are hostile) lives in locks.lua beside the mode it ends; this
+-- is only the wiring. Guarded end to end, so a missing locks.lua/ui_frame is a no-op.
+function Features.ReleaseLockModeFor(event)
+    local L = ns.Locks
+    if not (L and L.ExitForContext and L.ContextIsHostile) then return false end
+    if not L.ContextIsHostile(event) then return false end
+    if not (L.IsActive and L.IsActive()) then return false end
+    -- ui_frame subscribes to ns.Locks lazily from its own entry point; make sure the
+    -- listener that lowers the catchers exists before we fire the transition at it.
+    local Frame = ns.Frame
+    if Frame and Frame.EnsureLockWiring then Frame.EnsureLockWiring() end
+    return L.ExitForContext(event)
+end
+
 function Features.OnDisplayEvent(event)
+    Features.ReleaseLockModeFor(event)
     local Frame = ns.Frame
     if not Frame then return end
     local db = Store and Store.db

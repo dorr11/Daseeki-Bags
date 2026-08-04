@@ -2356,6 +2356,23 @@ end
 Frame.LOCK_NOTICE_W   = 300
 Frame.LOCK_NOTICE_PAD = 8
 
+-- PURE (2.0.1): which side of the window the notice can actually be SEEN on. Everything
+-- in SCREEN pixels so the window's own scale cannot skew the test.
+--
+-- The card floats above the window's top edge. A window parked near the top of the
+-- screen therefore pushes its only mode indicator off-screen — and an invisible mode
+-- indicator is how the owner spent a session in a bag grid whose clicks were suspended
+-- without knowing it. When there is no room above, the card goes BELOW instead.
+-- Unknown geometry (headless, or a client that answers nil) keeps the original "above".
+function Frame.LockNoticeSide(winTopPx, cardHPx, screenHPx)
+    if type(winTopPx) ~= "number" or type(cardHPx) ~= "number"
+       or type(screenHPx) ~= "number" or screenHPx <= 0 then
+        return "above"
+    end
+    if winTopPx + cardHPx > screenHPx then return "below" end
+    return "above"
+end
+
 function Frame.EnsureLockNotice(win)
     win = win or Frame.window
     if not win or not _G.CreateFrame then return nil end
@@ -2457,7 +2474,22 @@ function Frame._refreshLockNoticeOn(win)
     local TITLE_ROW = 22
     local bodyH  = (card._body and card._body:GetStringHeight()) or 24
     local countH = card._count:GetStringHeight() or 12
-    card:SetHeight(Frame.LOCK_NOTICE_PAD * 2 + TITLE_ROW + bodyH + 4 + countH)
+    local cardH  = Frame.LOCK_NOTICE_PAD * 2 + TITLE_ROW + bodyH + 4 + countH
+    card:SetHeight(cardH)
+
+    -- Re-side it now the height is known (2.0.1). Screen pixels: the window carries its
+    -- own SetScale, so raw GetTop/GetHeight are in different spaces.
+    local scale   = (win.GetEffectiveScale and win:GetEffectiveScale()) or 1
+    local top     = (win.GetTop and win:GetTop())
+    local UP      = _G.UIParent
+    local screenH = UP and UP.GetHeight and (UP:GetHeight() * ((UP.GetEffectiveScale and UP:GetEffectiveScale()) or 1))
+    local side    = Frame.LockNoticeSide(top and (top * scale), cardH * scale, screenH)
+    card:ClearAllPoints()
+    if side == "below" then
+        card:SetPoint("TOPLEFT", win, "BOTTOMLEFT", 0, -Frame.VGAP)
+    else
+        card:SetPoint("BOTTOMLEFT", win, "TOPLEFT", 0, Frame.VGAP)
+    end
 end
 
 -- Subscribe to ns.Locks exactly once, from the first transition rather than from a
@@ -2536,8 +2568,20 @@ function Frame.ApplyLockMode(active, reason)
                                  or (_G.SOUNDKIT.IG_MAINMENU_CLOSE or 851))
         end
         if ns.Print then
-            if active then ns:Print("lock configuration mode ON — click slots to lock them for sorting.")
-            else ns:Print("lock configuration mode off.") end
+            if active then
+                ns:Print("lock configuration mode ON — click slots to lock them for sorting.")
+            else
+                -- A context exit (2.0.1) says WHY, because the user did not ask for it and
+                -- the alternative — silently regaining item clicks — is how a mode nobody
+                -- noticed entering becomes a mode nobody notices leaving either.
+                local noun = ns.Locks and ns.Locks.ContextNoun and ns.Locks.ContextNoun(reason)
+                if noun then
+                    ns:Print("lock configuration mode off (the " .. noun ..
+                             " opened) — item clicks are back to normal.")
+                else
+                    ns:Print("lock configuration mode off.")
+                end
+            end
         end
     end
 end
@@ -3547,6 +3591,146 @@ local function testFooterRoster(fails)
         "the allowance still clears the 2px coin overhang at the smallest window scale")
 end
 
+-- LOCK-MODE EXIT ROUTES + TEARDOWN (2.0.1 regression lock).
+--
+-- The shipped 2.0.0 defect was a lock config mode nobody knew was on: it suspends every
+-- click on every live cell, so a right-click in a trade window toggled a lock instead of
+-- placing the item, and only a relog cleared it (`Locks._mode` is in-memory). This suite
+-- drives EVERY exit route and asserts the same two things each time — the state is off
+-- AND the per-cell catcher that does the suspending is down — so no route can ever again
+-- half-leave the mode. It also pins the new hostile-context exit and the notice's
+-- on-screen fallback.
+local function testLockModeExits(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local L = ns.Locks
+    if not L then fails[#fails + 1] = "ns.Locks missing (load order changed?)"; return end
+
+    -- ── isolate: our own listener list, mode, chat and button registry ────────────
+    local savedMode, savedListeners, savedWired = L._mode, L._listeners, Frame._lockWired
+    local savedPrint, savedCC = ns.Print, _G.C_Container
+    L._mode, L._listeners, Frame._lockWired = false, {}, false
+    ns.Print = function() end
+
+    local Items = ns.Items
+    local function region()
+        local r = { shown = false }
+        function r:Show() self.shown = true end
+        function r:Hide() self.shown = false end
+        function r:SetShown(v) self.shown = v and true or false end
+        function r:IsShown() return self.shown end
+        function r:SetVertexColor() end
+        return r
+    end
+    -- A live cell registered exactly as a real one is, so Items.RefreshLockLayer — the
+    -- teardown the listener calls — actually reaches it.
+    local cell = { _live = true, _cid = 0, _slot = 1,
+                   _dsLockMark = region(), _dsLockCatch = region() }
+    local savedButtons = Items and Items._buttons
+    if Items then Items._buttons = setmetatable({ [cell] = true }, { __mode = "k" }) end
+
+    Frame.EnsureLockWiring()
+    ck(Frame._lockWired == true, "the mode listener is wired")
+
+    -- Enter through the state machine (SetLockMode(true) needs a visible window, which
+    -- headless has none of — the ENTRY gate is pinned by the triage-bits suite).
+    local function enter()
+        L.Enter("test")
+        if Items then Items._applyLockLayer(cell) end
+    end
+    local function assertTornDown(route)
+        ck(L.IsActive() == false, route .. ": the mode is off")
+        ck(cell._dsLockCatch.shown == false,
+           route .. ": the per-cell click catcher is DOWN (items interactive again)")
+        ck(cell._dsLockMark.shown == false, route .. ": the lock mark is cleared too")
+        if Items then
+            ck(Items.CellClickAction(cell._live, L.IsActive()) == "use",
+               route .. ": a live cell is back on the secure use path")
+        end
+    end
+
+    -- ROUTE 1 — the shared exit. Escape, clicking the notice and BOTH windows' OnHide
+    -- all call exactly this, which is why there is only one of it to test.
+    enter()
+    ck(cell._dsLockCatch.shown == true, "premise: entering the mode raises the catcher")
+    ck(Frame.SetLockMode(false) == true, "SetLockMode(false) reports it closed the mode")
+    assertTornDown("SetLockMode(false) [escape / card click / window close]")
+
+    -- ROUTE 2 — right-clicking the sort glyph again (Frame.ToggleLockMode).
+    enter()
+    Frame.ToggleLockMode()
+    assertTornDown("ToggleLockMode [right-click the sort glyph again]")
+
+    -- ROUTE 3 — a sort actually starting. Driven through the real Sort.Run, so the route
+    -- is proved to be in the shipping code path and not merely in a comment. The run
+    -- itself aborts on the stub snapshot; the exit happens before that, by design.
+    if ns.Sort and ns.Sort.Run then
+        enter()
+        _G.C_Container = {}                     -- past Run's first guard, no further API
+        ck(ns.Sort.Run({ 0 }) == false, "the stubbed sort run aborts (no container API)")
+        assertTornDown("Sort.Run [a sort starting]")
+        _G.C_Container = savedCC
+    end
+
+    -- ROUTE 4 — a HOSTILE CONTEXT opening. THE FIX for the field defect.
+    local F = ns.Features
+    if F and F.ReleaseLockModeFor then
+        enter()
+        ck(F.ReleaseLockModeFor("TRADE_SHOW") == true, "TRADE_SHOW releases the mode")
+        assertTornDown("TRADE_SHOW [the owner's trade window]")
+
+        for _, e in ipairs({ "MERCHANT_SHOW", "BANKFRAME_OPENED", "MAIL_SHOW" }) do
+            enter()
+            F.ReleaseLockModeFor(e)
+            assertTornDown(e)
+        end
+
+        -- THROUGH THE REAL EVENT HANDLER, not just the helper — the shipping path is the
+        -- call inside Features.OnDisplayEvent, and a release that is never wired there
+        -- would leave the field defect exactly where it was.
+        --
+        -- Driven with auto-display OFF for this context, which does double duty: the
+        -- handler's own gate returns early, so the mode must already have been released
+        -- ABOVE that gate. Someone who turned "open my bags at the merchant" off must
+        -- still get his item clicks back.
+        local db = Store and Store.db
+        local savedAD = db and db.autoDisplay
+        if db then db.autoDisplay = { merchant = false, trade = false } end
+        enter()
+        F.OnDisplayEvent("TRADE_SHOW")
+        assertTornDown("OnDisplayEvent(TRADE_SHOW) with auto-display OFF")
+        enter()
+        F.OnDisplayEvent("MERCHANT_SHOW")
+        assertTornDown("OnDisplayEvent(MERCHANT_SHOW) with auto-display OFF")
+        if db then db.autoDisplay = savedAD end
+
+        -- ...and it never fires on the events that are none of its business.
+        enter()
+        ck(F.ReleaseLockModeFor("TRADE_CLOSED") == false, "TRADE_CLOSED is not an exit")
+        ck(L.IsActive() == true, "  ...the mode survives a close event")
+        ck(F.ReleaseLockModeFor("BAG_UPDATE") == false, "an ordinary bag event is not an exit")
+        ck(L.IsActive() == true, "  ...and survives that too")
+        L.Exit("cleanup")
+
+        -- Closed mode: cheap no-op on every merchant visit, no listener churn.
+        ck(F.ReleaseLockModeFor("MERCHANT_SHOW") == false,
+           "with the mode closed the release is a silent no-op")
+    end
+
+    -- ── The NOTICE must be on screen, or the mode is invisible again ──────────────
+    -- (all values in screen pixels; 768 is the classic 1024x768 floor)
+    ck(Frame.LockNoticeSide(400, 80, 768) == "above", "room above -> the card floats above")
+    ck(Frame.LockNoticeSide(760, 80, 768) == "below",
+       "a window near the screen top would push the card off — it goes below instead")
+    ck(Frame.LockNoticeSide(688, 80, 768) == "above", "exactly flush with the screen top fits")
+    ck(Frame.LockNoticeSide(689, 80, 768) == "below", "one pixel over and it flips below")
+    ck(Frame.LockNoticeSide(nil, 80, 768) == "above", "unknown geometry keeps the default")
+    ck(Frame.LockNoticeSide(400, 80, 0) == "above", "a zero-height screen keeps the default")
+
+    if Items then Items._buttons = savedButtons end
+    L._mode, L._listeners, Frame._lockWired = savedMode, savedListeners, savedWired
+    ns.Print, _G.C_Container = savedPrint, savedCC
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "1.0 anatomy",         fn = testParityAnatomy },
@@ -3571,6 +3755,7 @@ function Frame.RunSelfTests(verbose)
         { name = "header strip roster",  fn = testHeaderStripRoster },
         { name = "footer roster",        fn = testFooterRoster },
         { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
+        { name = "lock-mode exit routes",  fn = testLockModeExits },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

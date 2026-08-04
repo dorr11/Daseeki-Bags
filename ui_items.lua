@@ -1120,6 +1120,44 @@ end
 
 Items.TEX_LOCK_SLOT = "Interface\\AddOns\\" .. tostring(ADDON) .. "\\art\\icon-lock-slot"
 
+-- ────────────────────────────────────────────────────────────────────
+-- THE CELL CLICK-ACTION SEAM (2.0.1)
+--
+-- One pure function decides what a click on ONE cell means. Extracted for the same
+-- reason Frame.SearchClickAction / Frame.SortClickAction were: the decision is the thing
+-- that broke in the field, so the decision is what the harness pins.
+--
+--   "lock" — LIVE cell, lock config mode ON. The insecure catcher is raised over the
+--            secure button and toggles the sort lock. NORMAL ITEM INTERACTION IS
+--            SUSPENDED — this is the state that caused the 2.0.0 trade defect.
+--   "use"  — LIVE cell, mode OFF. NOTHING OF OURS IS IN THE WAY, so the template's own
+--            secure handler runs on (parent:GetID(), self:GetID()) = the real (bag, slot):
+--              left-click            pickup / place
+--              shift-left            split
+--              RIGHT-click           C_Container.UseContainerItem(bag, slot)
+--                                    -> trade open   : place in the next free trade slot
+--                                       merchant open: sell
+--                                       bank open    : deposit
+--                                       mail open    : attach
+--                                       otherwise    : use / equip
+--            "use" is therefore the name of the WHOLE Blizzard contract, not of one
+--            context; restoring it restores every context at once.
+--   "link" — CACHED / offline-owner cell. Inert: shift-link only, and it must NEVER
+--            reach UseContainerItem (there is no live (bag, slot) behind it).
+--
+-- Pure: no WoW API, no frame, no globals. Both booleans are passed in.
+function Items.CellClickAction(live, lockActive)
+    if not live then return "link" end
+    if lockActive then return "lock" end
+    return "use"
+end
+
+-- The lock-mode wash the catcher wears. Low enough to read the icon through, high enough
+-- that a grid in config mode CANNOT be mistaken for a normal one — the 2.0.0 defect was
+-- that entering the mode changed nothing visible on a grid with no locks set yet, so the
+-- floating notice card was the only cue and it was missed.
+Items.LOCK_WASH_ALPHA = 0.22
+
 -- Every button ever created, weak-keyed so a pooled-away button is collectable.
 -- Used only to sweep the lock layer on a mode transition.
 Items._buttons = Items._buttons or setmetatable({}, { __mode = "k" })
@@ -1153,21 +1191,48 @@ end
 local function ensureLockLayer(button)
     if button._dsLockCatch or not _G.CreateFrame then return end
 
-    local mark = button:CreateTexture(nil, "OVERLAY", nil, 6)
-    mark:SetTexture(Items.TEX_LOCK_SLOT)
-    mark:SetAllPoints(button)
-    mark:SetVertexColor(lockDangerRGB())
-    mark:Hide()
-    button._dsLockMark = mark
-
     local catch = _G.CreateFrame("Button", nil, button)
     catch:SetAllPoints(button)
     if catch.SetFrameLevel then catch:SetFrameLevel((button:GetFrameLevel() or 1) + 10) end
     if catch.RegisterForClicks then catch:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
+
+    -- THE GRID-WIDE MODE CUE. The catcher IS the suspension, so painting the wash ON the
+    -- catcher means "tinted" and "clicks suspended" are the same pixels by construction —
+    -- they cannot drift apart, and a cell that is still interactive can never look
+    -- suspended (or the reverse). Texture op on an insecure child: taint-free.
+    local wash = catch:CreateTexture(nil, "OVERLAY", nil, 5)
+    wash:SetAllPoints(catch)
+    wash:SetTexture("Interface\\Buttons\\WHITE8X8")
+    local wr, wg, wb = lockDangerRGB()
+    wash:SetVertexColor(wr, wg, wb, Items.LOCK_WASH_ALPHA)
+    catch._wash = wash
+
+    -- The per-slot mark rides ON THE CATCHER, at a sublevel ABOVE the wash. It used to be
+    -- a texture on the button, which the catcher's higher FRAME level would now draw the
+    -- wash over — and mark and wash are the same `danger` hue, so a locked slot would
+    -- have gone quietly flat exactly while the owner was looking at it to decide.
+    local mark = catch:CreateTexture(nil, "OVERLAY", nil, 6)
+    mark:SetTexture(Items.TEX_LOCK_SLOT)
+    mark:SetAllPoints(catch)
+    mark:SetVertexColor(lockDangerRGB())
+    mark:Hide()
+    button._dsLockMark = mark
+
     catch:SetScript("OnClick", function(self)
         local b = self:GetParent()
         local L = ns.Locks
-        if not (L and L.ToggleSlot and b._cid and b._slot) then return end
+        -- BELT-AND-BRACES (2.0.1): a catcher must never outlive the mode. If one is
+        -- somehow still up with the mode off, it releases itself and swallows nothing —
+        -- so the worst a stale catcher can ever cost is a single click, not a bag that
+        -- has silently stopped working.
+        if not (L and L.IsActive and L.IsActive()) then
+            -- via the Items table: applyLockLayer is declared BELOW this closure, so a
+            -- direct name would compile to a global lookup (nil) instead of an upvalue.
+            if Items._applyLockLayer then Items._applyLockLayer(b) end
+            self:Hide()
+            return
+        end
+        if not (L.ToggleSlot and b._cid and b._slot) then return end
         local nowLocked = L.ToggleSlot(b._cid, b._slot)
         -- The canonical checkbox pair — this IS a checkbox, one per cell. (House
         -- pattern: named SOUNDKIT constant with the FrameXML numeric id as the guard.)
@@ -1177,7 +1242,15 @@ local function ensureLockLayer(button)
         end
         lockTooltip(b)   -- the cursor has not moved; refresh the state line under it
     end)
-    catch:SetScript("OnEnter", function(self) lockTooltip(self:GetParent()) end)
+    catch:SetScript("OnEnter", function(self)
+        local L = ns.Locks
+        if not (L and L.IsActive and L.IsActive()) then
+            if Items._applyLockLayer then Items._applyLockLayer(self:GetParent()) end
+            self:Hide()
+            return
+        end
+        lockTooltip(self:GetParent())
+    end)
     catch:SetScript("OnLeave", function() if _G.GameTooltip then _G.GameTooltip:Hide() end end)
     catch:Hide()
     button._dsLockCatch = catch
@@ -1185,10 +1258,16 @@ end
 
 -- Apply the current lock-mode state to ONE button. Idempotent; safe on any button in
 -- any state, and creates nothing while the mode is closed.
+--
+-- THE SANITY PASS (2.0.1): the verdict is Items.CellClickAction, and anything other than
+-- "lock" tears the whole layer down. paintButton runs this on EVERY repaint, so the
+-- suspension state is re-derived from the mode flag continuously and cannot be left
+-- behind by any exit route, missed listener or pooled-button reuse.
 local function applyLockLayer(button)
     local L = ns.Locks
-    local active = (L and L.IsActive and L.IsActive()) and button._live
-                   and button._cid ~= nil and button._slot ~= nil
+    local lockActive = (L and L.IsActive and L.IsActive()) and true or false
+    local action = Items.CellClickAction(button._live, lockActive)
+    local active = (action == "lock") and button._cid ~= nil and button._slot ~= nil
     if not active then
         if button._dsLockMark then button._dsLockMark:Hide() end
         if button._dsLockCatch then button._dsLockCatch:Hide() end
@@ -1196,8 +1275,13 @@ local function applyLockLayer(button)
     end
     ensureLockLayer(button)
     if not button._dsLockCatch then return end   -- headless
-    button._dsLockMark:SetVertexColor(lockDangerRGB())
+    local r, g, b = lockDangerRGB()
+    button._dsLockMark:SetVertexColor(r, g, b)
     button._dsLockMark:SetShown(L.IsLocked(button._cid, button._slot))
+    -- Re-tint the wash from the LIVE theme too (a ThemeChanged mid-mode must not leave a
+    -- stale colour on the only cue that the grid is suspended).
+    local wash = button._dsLockCatch._wash
+    if wash and wash.SetVertexColor then wash:SetVertexColor(r, g, b, Items.LOCK_WASH_ALPHA) end
     button._dsLockCatch:Show()
 end
 Items._applyLockLayer = applyLockLayer
@@ -3065,6 +3149,165 @@ local function testLockLayer(fails)
     ns.Store.db, L._self, L._mode = savedDB, savedSelf, savedMode
 end
 
+-- CELL CLICK ACTION — the 2.0.1 regression lock for the shipped trade defect.
+--
+-- What broke in the field: with the sort-lock config mode on, a right-click on a live
+-- cell hit the insecure catcher instead of the secure ContainerFrameItemButtonTemplate
+-- handler, so C_Container.UseContainerItem(bag, slot) never ran and the item never went
+-- into the open trade window. The DECISION is now Items.CellClickAction, and this suite
+-- pins all three verdicts plus the (bag, slot) the use path would actually receive.
+local function testCellClickAction(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local L = ns.Locks
+
+    -- ── The matrix ────────────────────────────────────────────────────────────────
+    ck(Items.CellClickAction(true, false) == "use",
+       "LIVE cell, mode OFF -> the secure template handles the click (the use path)")
+    ck(Items.CellClickAction(true, true) == "lock",
+       "LIVE cell, mode ON -> the catcher toggles the sort lock (interaction suspended)")
+    ck(Items.CellClickAction(false, false) == "link",
+       "CACHED cell -> inert (shift-link only), never the use path")
+    ck(Items.CellClickAction(false, true) == "link",
+       "CACHED cell stays inert even in lock mode — a cached slot has no live (bag, slot)")
+    ck(Items.CellClickAction(nil, nil) == "link", "no liveness known -> inert (fail safe)")
+    -- The whole contract in one line: OFF is the only state that reaches Blizzard.
+    ck(Items.CellClickAction(true, false) ~= Items.CellClickAction(true, true),
+       "the mode really is what decides between the use path and the lock toggle")
+
+    -- ── The REAL (bag, slot) the use path receives ────────────────────────────────
+    -- ContainerFrameItemButtonTemplate reads bagID from parent:GetID() and slot from
+    -- self:GetID(). _setSlot writes the slot; the group's per-cid holder carries the bag.
+    -- If either drifted, a right-click at a merchant would sell the WRONG item, so the
+    -- pair is asserted here alongside the verdict that lets the click through at all.
+    local holderID
+    local recorded = {}
+    local fakeIcon = { SetTexture = function() end, SetAlpha = function() end,
+                       SetDesaturated = function() end, SetVertexColor = function() end }
+    local holder = { GetID = function() return holderID end }
+    local btn = { _live = true, icon = fakeIcon,
+                  SetNormalTexture = function() end,
+                  GetParent = function() return holder end,
+                  SetID = function(self, id) recorded.id = id; self._id = id end,
+                  GetID = function(self) return self._id end,
+                  Show  = function() end }
+    holderID = 4
+    Items._setSlot(btn, nil, 4, 17, { id = 4306, quality = 1 })
+    ck(recorded.id == 17, "_setSlot binds the DISPLAYED slot into the secure button's GetID()")
+    ck(btn:GetID() == 17 and btn:GetParent():GetID() == 4,
+       "the use path would receive (bag 4, slot 17) — the real pair the cell paints")
+    ck(Items.CellClickAction(btn._live, false) == "use",
+       "...and with the mode off nothing of ours stands between the click and that pair")
+
+    -- ── The SANITY PASS: mode off tears the layer down, on every repaint ──────────
+    if not L then fails[#fails + 1] = "ns.Locks missing (load order changed?)"; return end
+    local function region()
+        local r = { shown = false }
+        function r:Show() self.shown = true end
+        function r:Hide() self.shown = false end
+        function r:SetShown(v) self.shown = v and true or false end
+        function r:IsShown() return self.shown end
+        function r:SetVertexColor() end
+        return r
+    end
+    local savedDB, savedSelf, savedMode = ns.Store.db, L._self, L._mode
+    ns.Store.db = {}
+    L.SetCharacter("Tester-TestRealm")
+
+    local cell = { _live = true, _cid = 0, _slot = 3,
+                   _dsLockMark = region(), _dsLockCatch = region() }
+    L._mode = true
+    Items._applyLockLayer(cell)
+    ck(cell._dsLockCatch.shown == true, "mode on: the catcher is up (clicks suspended)")
+
+    -- Simulate the exact field state: the mode flag says OFF but a catcher is still up.
+    -- One repaint must clear it — this is what makes a stuck suspension unreachable.
+    L._mode = false
+    cell._dsLockCatch:Show()
+    Items._applyLockLayer(cell)
+    ck(cell._dsLockCatch.shown == false,
+       "a repaint with the mode off releases a lingering catcher (the belt-and-braces pass)")
+    ck(Items.CellClickAction(cell._live, L.IsActive()) == "use",
+       "...and the cell is back on the use path")
+
+    -- The mode wash is a real constant, visible but readable through.
+    ck(type(Items.LOCK_WASH_ALPHA) == "number"
+       and Items.LOCK_WASH_ALPHA > 0 and Items.LOCK_WASH_ALPHA < 0.5,
+       "the grid-wide mode wash is declared and is a legible alpha")
+
+    -- ── THE CATCHER ITSELF, built through a RECORDING CreateFrame stub ────────────
+    -- ensureLockLayer is in-game-only code (borders.lua's glow suite uses the same
+    -- idiom for the same reason). Two things here are worth real coverage: the grid
+    -- WASH — the only cue that a grid with no locks yet is suspended — and the
+    -- catcher's own self-heal, whose body reaches applyLockLayer through the Items
+    -- table because the local is declared below the closure.
+    local function newTexture(layer, sublevel)
+        local t = { shown = false, layer = layer, sublevel = sublevel }
+        function t:SetTexture(p) self.texture = p end
+        function t:SetAllPoints() self.allPoints = true end
+        function t:SetVertexColor(r, g, b, a) self.r, self.g, self.b, self.a = r, g, b, a end
+        function t:SetAlpha(a) self.alpha = a end
+        function t:SetShown(v) self.shown = v and true or false end
+        function t:Show() self.shown = true end
+        function t:Hide() self.shown = false end
+        return t
+    end
+    local function newFrame(_, _, parent)
+        local f = { parent = parent, level = 1, shown = false, scripts = {}, clicks = {} }
+        function f:SetAllPoints() end
+        function f:SetFrameLevel(l) self.level = l end
+        function f:GetFrameLevel() return self.level end
+        function f:GetParent() return self.parent end
+        function f:RegisterForClicks(...) for i = 1, select("#", ...) do self.clicks[(select(i, ...))] = true end end
+        function f:SetScript(k, fn) self.scripts[k] = fn end
+        function f:Show() self.shown = true end
+        function f:Hide() self.shown = false end
+        function f:CreateTexture(_, layer, _, sublevel) return newTexture(layer, sublevel) end
+        return f
+    end
+
+    local savedCF = _G.CreateFrame
+    _G.CreateFrame = newFrame
+    local real = { _live = true, _cid = 0, _slot = 7,
+                   GetFrameLevel = function() return 3 end,
+                   CreateTexture = function(_, _, layer, _, sublevel) return newTexture(layer, sublevel) end }
+    L._mode = true
+    Items._applyLockLayer(real)
+    local catch = real._dsLockCatch
+    ck(catch ~= nil, "the catcher is built when the mode opens")
+    if catch then
+        ck(catch.shown == true, "...and raised over the cell")
+        ck(catch.level == 3 + 10, "...above the secure button, so it takes the clicks")
+        ck(catch.clicks.LeftButtonUp and catch.clicks.RightButtonUp,
+           "...registered for BOTH buttons (it is standing in for the whole click path)")
+        ck(catch._wash ~= nil and catch._wash.a == Items.LOCK_WASH_ALPHA,
+           "the mode WASH is painted on the catcher at the declared alpha")
+        ck(catch._wash and catch._wash.allPoints == true,
+           "...covering the whole cell, so 'tinted' and 'suspended' are the same pixels")
+        -- The mark and the wash are the SAME hue, so the mark has to sort above it or a
+        -- locked slot goes flat exactly while the owner is looking at it to decide.
+        local mark = real._dsLockMark
+        ck(mark ~= nil and catch._wash ~= nil and mark.sublevel > catch._wash.sublevel,
+           "the lock mark draws ABOVE the wash (a locked slot stays readable in the mode)")
+
+        -- SELF-HEAL: the mode is off but this catcher is still up (the field state).
+        -- The click must be given back, not swallowed, and no lock may be toggled.
+        L._mode = false
+        catch:Show()
+        local before = L.Count()
+        local ok, err = pcall(catch.scripts.OnClick, catch)
+        ck(ok, "a click on a stale catcher does not error (" .. tostring(err) .. ")")
+        ck(catch.shown == false, "...it releases itself instead")
+        ck(L.Count() == before, "...and toggles NO lock (the click was never the mode's)")
+
+        catch:Show()
+        local okE = pcall(catch.scripts.OnEnter, catch)
+        ck(okE and catch.shown == false, "hovering a stale catcher releases it too")
+    end
+    _G.CreateFrame = savedCF
+
+    ns.Store.db, L._self, L._mode = savedDB, savedSelf, savedMode
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -3087,6 +3330,7 @@ function Items.RunSelfTests(verbose)
         { name = "set membership (Armory)", fn = testSetMembership },
         { name = "slot substrate (1.x profile)", fn = testSlotSubstrate },
         { name = "sort-lock cell layer", fn = testLockLayer },
+        { name = "cell click action (use path)", fn = testCellClickAction },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

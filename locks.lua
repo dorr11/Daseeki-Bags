@@ -299,6 +299,68 @@ function Locks.Toggle(reason)
     return Locks.Enter(reason or "toggle"), true
 end
 
+----------------------------------------------------------------------
+-- HOSTILE CONTEXTS (2.0.1 hotfix)
+--
+-- FIELD DEFECT (owner, 2026-08-03): with a TRADE window open, right-clicking an item in
+-- the 2.0 bags did not place it into the trade. Root cause: earlier he had RIGHT-clicked
+-- the sort glyph meaning "sort" — which is the gesture that OPENS this mode. While the
+-- mode is open the per-cell insecure catcher (ui_items.ensureLockLayer) deliberately
+-- swallows every click on a live cell, so the secure template's right-click →
+-- C_Container.UseContainerItem path — the one whose context behaviours are trade-place /
+-- merchant-sell / bank-deposit / mail-attach / use-equip — never ran. `Locks._mode` is
+-- in-memory only, which is exactly why a full logout+login "fixed" it: nothing was
+-- corrupt, the mode was simply still on, and nothing had closed it.
+--
+-- The mode is a CONFIGURATION surface. The instant a context opens whose entire purpose
+-- is clicking items INTO it, suspending item clicks stops being configuration and becomes
+-- a broken game. So those contexts END the mode. The locks themselves are persisted and
+-- keep applying to sorts; only the editing mode closes.
+--
+-- DELIBERATELY INDEPENDENT of the autoDisplay toggles: someone who has turned off "open
+-- my bags at the merchant" must still get his clicks back. features.lua listens for these
+-- events already (they are the same six open-events in its DISPLAY_MATRIX), so the wiring
+-- costs no new event registration — but the DECISION lives here, beside the mode it ends.
+--
+-- The bag/bank WINDOW closing is a separate route that already existed (ui_frame /
+-- ui_bank OnHide -> Frame.SetLockMode(false)); it does not cover this case because a
+-- window the user opened himself is never auto-closed by the trade (features.lua only
+-- closes what IT auto-opened), so the mode could ride an open window across any number
+-- of trades.
+----------------------------------------------------------------------
+
+-- event -> the plain-language noun the exit message names.
+Locks.HOSTILE_CONTEXTS = {
+    TRADE_SHOW         = "trade window",
+    MERCHANT_SHOW      = "merchant",
+    MAIL_SHOW          = "mailbox",
+    BANKFRAME_OPENED   = "bank",
+    AUCTION_HOUSE_SHOW = "auction house",
+    TRADE_SKILL_SHOW   = "tradeskill window",
+}
+
+-- PURE: does this event open a context where suspending item clicks is hostile?
+function Locks.ContextIsHostile(event)
+    return type(event) == "string" and Locks.HOSTILE_CONTEXTS[event] ~= nil
+end
+
+-- PURE: pull the plain-language noun back out of an exit REASON ("context:TRADE_SHOW"),
+-- so the one message path in ui_frame can say WHY the mode closed. nil for every other
+-- reason, which is how the caller knows to use its ordinary wording.
+function Locks.ContextNoun(reason)
+    if type(reason) ~= "string" then return nil end
+    local event = reason:match("^context:(.+)$")
+    if not event then return nil end
+    return Locks.HOSTILE_CONTEXTS[event]
+end
+
+-- Leave the mode because `event` opened. No-op (false) for a non-hostile event or a mode
+-- that is already closed, so it is safe to call on every display event.
+function Locks.ExitForContext(event)
+    if not Locks.ContextIsHostile(event) then return false end
+    return Locks.Exit("context:" .. event)
+end
+
 -- The instructional copy. 1.x's wording, kept verbatim in meaning because it is
 -- exactly right; split into a title + body so the 2.0 banner can typeset it in the
 -- suite's own voice instead of a yellow Blizzard HelpTip.
@@ -510,6 +572,60 @@ local function testModeMachine(fails)
     Locks._mode = savedMode
 end
 
+-- HOSTILE CONTEXTS (2.0.1). The regression lock for the shipped 2.0.0 trade defect:
+-- opening a context you click items INTO must END the mode, because while it is open the
+-- per-cell catcher swallows the right-click that would otherwise reach
+-- C_Container.UseContainerItem (trade-place / merchant-sell / bank-deposit / mail-attach).
+local function testHostileContexts(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local saved, savedMode = Locks._listeners, Locks._mode
+    Locks._listeners, Locks._mode = {}, false
+    local seen = {}
+    Locks.OnChange(function(active, reason) seen[#seen + 1] = { active, reason } end)
+
+    -- The roster, as data. All six are open-events features.lua already listens for.
+    for _, e in ipairs({ "TRADE_SHOW", "MERCHANT_SHOW", "MAIL_SHOW",
+                         "BANKFRAME_OPENED", "AUCTION_HOUSE_SHOW", "TRADE_SKILL_SHOW" }) do
+        ck(Locks.ContextIsHostile(e) == true, e .. " is a hostile context")
+    end
+    -- CLOSE events are not: leaving a merchant must not be a reason to do anything, and
+    -- combat already closes the window (which exits by its own route).
+    for _, e in ipairs({ "TRADE_CLOSED", "MERCHANT_CLOSED", "BANKFRAME_CLOSED",
+                         "MAIL_CLOSED", "PLAYER_REGEN_DISABLED", "BAG_UPDATE" }) do
+        ck(Locks.ContextIsHostile(e) == false, e .. " is NOT hostile")
+    end
+    ck(Locks.ContextIsHostile(nil) == false, "nil event is not hostile (nil-safe)")
+    ck(Locks.ContextIsHostile(42) == false, "a non-string event is not hostile")
+
+    -- CLOSED mode: every route is a silent no-op (no listener churn on every merchant).
+    ck(Locks.ExitForContext("TRADE_SHOW") == false, "a closed mode has nothing to exit")
+    ck(#seen == 0, "  ...and fires no listener")
+
+    -- OPEN mode: the trade window ends it, and the reason carries the event.
+    Locks.Enter("test")
+    ck(#seen == 1, "entered")
+    ck(Locks.ExitForContext("TRADE_SHOW") == true, "TRADE_SHOW exits an open mode")
+    ck(Locks.IsActive() == false, "  ...the mode really is off (clicks return to the items)")
+    ck(#seen == 2 and seen[2][1] == false and seen[2][2] == "context:TRADE_SHOW",
+       "  ...and the listener is told, with the context in the reason")
+
+    -- A NON-hostile event leaves an open mode alone (BAG_UPDATE must not close it).
+    Locks.Enter("test")
+    ck(Locks.ExitForContext("BAG_UPDATE") == false, "a non-hostile event does not exit")
+    ck(Locks.IsActive() == true, "  ...the mode survives")
+    Locks.Exit("cleanup")
+
+    -- The message seam: reason -> plain-language noun, and nothing else parses as one.
+    ck(Locks.ContextNoun("context:TRADE_SHOW") == "trade window", "trade reason -> its noun")
+    ck(Locks.ContextNoun("context:BANKFRAME_OPENED") == "bank", "bank reason -> its noun")
+    ck(Locks.ContextNoun("ui") == nil, "an ordinary reason has no context noun")
+    ck(Locks.ContextNoun("context:NOT_A_REAL_EVENT") == nil, "an unknown context has no noun")
+    ck(Locks.ContextNoun(nil) == nil, "nil reason -> nil noun (nil-safe)")
+
+    Locks._listeners, Locks._mode = saved, savedMode
+end
+
 -- 1.x-shaped source, faithful to the OWNER's real DaseekiBagsAccount (verified against
 -- his WTF file): container ids are numeric keys of the char table, `locked` sits beside
 -- items/size/link, and Zaan carries a `locked` table whose entries are all nil.
@@ -621,12 +737,14 @@ ns:RegisterSelfTest("locks", function(verbose)
     local fails = {}
     testRootShape(fails)
     testModeMachine(fails)
+    testHostileContexts(fails)
     testMigration(fails)
     testPlannerHandshake(fails)
     for _, f in ipairs(fails) do ns:Print("  FAIL locks :: " .. f) end
     if #fails == 0 and verbose then
         ns:Print("  PASS locks/root shape")
         ns:Print("  PASS locks/mode state machine")
+        ns:Print("  PASS locks/hostile context exits")
         ns:Print("  PASS locks/1.x migration")
         ns:Print("  PASS locks/planner handshake")
     end

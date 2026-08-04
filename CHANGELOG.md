@@ -1,5 +1,46 @@
 # Changelog
 
+## 2.0.1
+
+**Fixes a bug where your bags could stop responding to clicks — most visibly, items would
+not go into a trade window.**
+
+### What was happening
+
+The sort glyph does two things: left-click sorts your bags, right-click opens *sort lock
+configuration mode*, where clicking a slot marks it so a sort never moves it. That mode
+deliberately takes over every click on every item, because in it a click means "lock this
+slot", not "use this item".
+
+If you right-clicked the sort glyph meaning "sort", you were in that mode without
+realising it. On a grid with nothing locked yet, nothing on the item cells looked any
+different, and the only sign was a small notice card floating above the bag window — which
+was easy to miss, and could sit off the top of the screen entirely if you keep your bags
+up high. From then on, every click on an item toggled a lock instead of doing what you
+expected: no picking items up, no selling at a vendor, no depositing at the bank, and — the
+way this was found — no right-clicking an item into an open trade. The mode was only ever
+held in memory, which is why logging out and back in appeared to "fix" it.
+
+### What changed
+
+- **Opening a trade, a merchant, the bank, the mailbox, the auction house or a tradeskill
+  window now ends the mode automatically**, and says so in chat. Those are windows you
+  click items *into*; suspending item clicks there is never what you wanted. Your locked
+  slots are saved and keep applying to sorts — only the editing mode closes. This happens
+  whether or not you have the matching "open my bags automatically" option switched on.
+- **The mode is now impossible to miss.** While it is open every item cell wears a red
+  wash, so the grid itself tells you clicks are suspended instead of leaving it to a
+  floating card.
+- **The notice card can no longer land off-screen.** If there is no room above the bag
+  window it appears below it instead.
+- **A stuck cell heals itself.** If anything ever leaves a cell suspended after the mode
+  has closed, the next click or hover on it releases it, and any repaint of the window
+  clears it — so the worst case is one lost click, not bags that quietly stop working.
+
+Nothing about how locking works has changed: right-click the sort glyph to open the mode,
+click slots to lock and unlock them, and right-click again (or press Escape, click the
+notice, close the window, or start a sort) to leave.
+
 ## 2.0.0
 
 **Daseeki Bags has been rebuilt from scratch — and everything you had comes with you.**
