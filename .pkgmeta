@@ -17,6 +17,7 @@ required-dependencies:
 ignore:
   - README.md
   - CHANGELOG.md
+  - DESCRIPTION.md
   - .github
   # Developer tooling: never shipped to users. harness/ carries the self-test runner, its
   # 1.x fixtures and a probe that walks the machine's AddOns folder; dev/ regenerates the
