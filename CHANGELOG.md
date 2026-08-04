@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.1
+## 2.0.1 — 2026-08-04
 
 **Sorting is faster and always finishes, the Blizzard bank window no longer turns up
 alongside ours, new items are marked on the border instead of with a corner dot, and a
