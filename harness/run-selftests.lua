@@ -402,6 +402,19 @@ realprint("")
 --     The .pkgmeta relation (required-dependencies: daseeki-core) is the CurseForge-side
 --     half of the same fix; it is asserted here too, because the toc and the packager
 --     must not disagree about what is required.
+--
+--  5. THE 1.x TREE STAYS DELETED (added 2026-08-03 with the syncBridge.lua removal).
+--     The cutover (423aa3d) deleted main.xml + core/ config/ frames/ skin/ libs/, but
+--     core/features/syncBridge.lua survived it: the file was created on `main` AFTER the
+--     v2 branch point, so it was absent from the merge base and the merge kept it as an
+--     unrelated addition. It then sat in the tree for months -- git-tracked, shipped in
+--     the zip (.pkgmeta ignores harness/ and dev/, not core/), never on the load list.
+--     That is a landmine, not just clutter: it publishes the 1.x `bags` namespace via
+--     Addon:NewModule('SyncBridge'), and Daseeki-Nexus's inventory coexistence probe
+--     reads a live SyncBridge module as "Bags owns the wire" and flips the account to
+--     consume-only. One line added to a load list would do it silently. A file that is
+--     not on disk cannot be re-added by accident, so the gate pins the ABSENCE of the
+--     whole retired tree rather than any one filename.
 ----------------------------------------------------------------------
 local REQUIRED_SV_2X = {
     "DaseekiBags2DB", "DaseekiBags2Data",
@@ -423,6 +436,9 @@ local TOCS_2X = { "Daseeki-Bags.toc" }
 -- Retired beta tocs. Present here only so their RETURN is caught: two .toc files in one
 -- folder is ambiguous to the client and re-introduces the duplicate-binding warning.
 local RETIRED_TOCS = { "Daseeki-Bags2.toc", "v2.toc" }
+-- The 1.x source tree the cutover deleted (see the gate header, point 5). Nothing in the
+-- 2.0 load list lives under any of these; a path that comes back is 1.x code returning.
+local RETIRED_1X_PATHS = { "main.xml", "core", "config", "frames", "skin", "libs" }
 
 local function tocDirective(src, key)
     for line in src:gmatch("[^\r\n]+") do
@@ -444,6 +460,29 @@ for _, toc in ipairs(RETIRED_TOCS) do
         realprint("  [FAIL] " .. toc .. " is back. The 2.0 cutover retired the side-by-side")
         realprint("         beta tocs; the shipping identity is Daseeki-Bags.toc alone.")
     end
+end
+
+-- The 1.x tree must stay gone (gate header, point 5). os.rename(p, p) is the pure-Lua
+-- 5.1 existence probe that works for DIRECTORIES as well as files (io.open cannot open a
+-- directory); renaming a path onto itself is a no-op when it exists and nil when it does
+-- not. No lfs, no shelling out.
+local treeFails = 0
+for _, path in ipairs(RETIRED_1X_PATHS) do
+    if os.rename(P(path), P(path)) then
+        idFails, treeFails = idFails + 1, treeFails + 1
+        realprint("  [FAIL] the retired 1.x tree is back on disk: " .. path)
+        realprint("         The 2.0 cutover deleted main.xml + core/ config/ frames/ skin/")
+        realprint("         libs/; git history and tag v1.1.5 keep them. 1.x sources left in")
+        realprint("         the folder ship in the CurseForge zip and are one load-list line")
+        realprint("         away from running -- core/features/syncBridge.lua was exactly")
+        realprint("         that, and it would hand cross-account sync back to the 1.x bags")
+        realprint("         namespace (Nexus reads a live SyncBridge module as 'Bags owns")
+        realprint("         the wire' and drops the account to consume-only).")
+    end
+end
+if treeFails == 0 then
+    realprint("  [ok] the retired 1.x tree is absent (" ..
+              table.concat(RETIRED_1X_PATHS, ", ") .. ")")
 end
 
 for _, toc in ipairs(TOCS_2X) do
