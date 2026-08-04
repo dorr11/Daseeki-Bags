@@ -1151,8 +1151,17 @@ local function testBankFooterParity(fails)
     ck(F.DressSelectorAsGlyph == nil, "the footer-glyph dressing helper is retired")
     ck(type(F.TitleClickAction) == "function",
         "the shared title-click matrix is published (both windows read it)")
-    ck(F.TitleClickAction("RightButton") == "layout",
-        "the bank's title right-click still toggles combined/split")
+    -- 2.0.1: the shared name zone's right-click is the BANK PREVIEW, not the layout toggle.
+    -- The bank window reads the same matrix, so its own name zone opens/closes this window
+    -- for whichever character is in view; combined/split stays on the bare titlebar, which
+    -- the bank builds for itself (its OnMouseUp forwards to Frame.SetLayout).
+    ck(F.TitleClickAction("RightButton") == "bank",
+        "the shared name-zone right-click is the bank preview")
+    ck(type(F.ToggleViewedBank) == "function",
+        "…and the verb behind it is published on the shared surface")
+    -- The preview only means anything because this window already renders a CACHED owner.
+    ck(type(Bank.HasBankData) == "function",
+        "the bank knows whether the viewed owner has stored bank data (the empty state)")
     local footerSet = {}
     for _, n in ipairs(F.FOOTER_CONTROLS or {}) do footerSet[n] = true end
     ck(not footerSet.ownerSelector, "no owner selector in the shared footer roster")

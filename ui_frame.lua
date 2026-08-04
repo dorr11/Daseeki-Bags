@@ -208,31 +208,45 @@ function Frame.SortClickAction(button)
     return "sort"
 end
 
--- PURE: what a click on the TITLE NAME ZONE means (header-selector round).
---   "layout" — right-click: flip combined/split
---   "owner"  — anything else: open the character menu
+-- PURE: what a click on the TITLE NAME ZONE means.
+--   "bank"  — right-click: open the VIEWED character's bank (bank preview)
+--   "owner" — anything else: open the character menu
 --
--- THE COLLISION, and how it is resolved. The title row already carried two gestures
--- before this round:
---   * LEFT-DRAG moves the window (titleBar RegisterForDrag).
---   * RIGHT-CLICK flips combined/split — an old binding, older than the layout button
---     that was added and then retired, and the gear's tooltip still documents it.
--- A plain LEFT-CLICK on the title did NOTHING, which is the seam the character menu now
--- takes. So nothing was displaced: the menu occupies the one gesture that was free.
+-- 2.0.1 CHANGE (owner-directed). The name zone's right-click used to forward to the same
+-- combined/split toggle the bare titlebar runs. That duplication is what freed the gesture:
+-- LAYOUT TOGGLING STAYS on the bare titlebar right-click (Frame.BuildTitleBar's
+-- OnMouseUp, and the bank's), which is where it has always lived and where the gear's
+-- tooltip has always pointed — nothing is lost by taking it off the NAME.
 --
--- The DRAG is preserved by construction rather than by luck. The hit area over the name is
+-- What the name zone gains is the gesture that actually belongs to it. Both of its clicks
+-- are now about the CHARACTER the zone names: left picks WHICH character you are looking
+-- at, right opens THAT character's bank. Since the bank window already renders whatever
+-- owner ns.Frame has in view — cached owners included, with its own empty-state when the
+-- viewed character has no stored bank (Bank.HasBankData) — right-clicking an offline alt's
+-- name is a bank PREVIEW for free, which is exactly the ask.
+--
+-- THE DRAG is preserved by construction rather than by luck. The hit area over the name is
 -- a Button, and a Button that has started a drag does not fire OnClick — so grabbing the
 -- character name and pulling still moves the window, and only a click that never became a
--- drag opens the menu. The hit area also forwards the right-click to the same layout
--- toggle the bare titlebar runs, so the gesture does not die in the middle of the row.
+-- drag opens anything.
 --
 -- Deliberately the same shape as SearchClickAction / SortClickAction above, so all three
 -- dual-purpose surfaces in this window obey ONE rule: left does the everyday verb, right
--- opens the thing that reconfigures the window. Both windows read this function (the bank
--- resolves it off ns.Frame), so the two title rows cannot drift apart.
+-- opens the wider surface behind it. Both windows read this function (the bank resolves it
+-- off ns.Frame), so the two title rows cannot drift apart.
 function Frame.TitleClickAction(button)
-    if button == "RightButton" then return "layout" end
+    if button == "RightButton" then return "bank" end
     return "owner"
+end
+
+-- The right-click's verb, resolved through ns so ui_bank stays optional to ui_frame.
+-- Toggles rather than only opening: a second right-click on the name puts the preview away,
+-- which is what a single gesture bound to a single window should do.
+function Frame.ToggleViewedBank()
+    local Bank = ns.Bank
+    if not (Bank and Bank.Toggle) then return false end
+    if ns.SafeCall then ns:SafeCall(Bank.Toggle) else Bank.Toggle() end
+    return true
 end
 
 Frame.ICONBTN     = 22   -- title-row control button (Nexus dashboard parity)
@@ -1163,8 +1177,8 @@ function Frame.BuildOwnerHeader(titleBar, titleFS, win, opts)
         if opts.onDragStop then opts.onDragStop(win) end
     end)
     hit:SetScript("OnClick", function(_, button)
-        if Frame.TitleClickAction(button) == "layout" then
-            Frame.SetLayout(Frame.Layout() == "split" and "combined" or "split")
+        if Frame.TitleClickAction(button) == "bank" then
+            Frame.ToggleViewedBank()
         else
             arrow:Toggle(hit)
         end
@@ -1175,7 +1189,7 @@ function Frame.BuildOwnerHeader(titleBar, titleFS, win, opts)
             _G.GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
             _G.GameTooltip:SetText("Viewing this character", UIkit.Color("text"))
             _G.GameTooltip:AddLine("Left-click: pick another character", UIkit.Color("muted"))
-            _G.GameTooltip:AddLine("Right-click: toggle combined/split", UIkit.Color("muted"))
+            _G.GameTooltip:AddLine("Right-click: show this character's bank", UIkit.Color("muted"))
             _G.GameTooltip:Show()
         end
     end)
@@ -1236,8 +1250,10 @@ function Frame.Ensure()
 
     -- ── Title row: gold character NAME + the top-right control strip
     --    (owner · find · sort · search · layout · gear · ✕), in the Nexus dashboard icon
-    --    language. Drag to move (unless the window is locked); RIGHT-CLICK still flips
-    --    the combined/split layout, which the layout button now also does visibly. ──
+    --    language. Drag to move (unless the window is locked); a RIGHT-CLICK on the BARE
+    --    titlebar (outside the name zone) flips the combined/split layout, which the layout
+    --    button also does visibly. The NAME ZONE's right-click is a different gesture —
+    --    it opens the viewed character's bank (Frame.TitleClickAction). ──
     local titleBar = _G.CreateFrame("Frame", nil, win)
     titleBar:SetPoint("TOPLEFT", win, "TOPLEFT", 0, 0)
     titleBar:SetPoint("TOPRIGHT", win, "TOPRIGHT", 0, 0)
@@ -1381,7 +1397,7 @@ function Frame.Ensure()
     -- not orphaned in the footer where it read as decoration. A cog is ambiguous, so
     -- unlike the ✕ it keeps its tooltip.
     local gearBtn = makeIconButton({ icon = "icon-gear",
-        tooltip = "Bag settings", tooltip2 = "Right-click the title toggles combined/split",
+        tooltip = "Bag settings", tooltip2 = "Right-click the title bar toggles combined/split",
         onClick = function()
             -- Options live in the Daseeki suite hub (options.lua RegisterAddon id="bags").
             -- Try the hub's open surface defensively; guarded so a name mismatch just no-ops.
@@ -3478,16 +3494,33 @@ local function testHeaderStripRoster(fails)
     ck(Frame.DressSelectorAsGlyph == nil,
         "the footer-glyph dressing helper is retired with the footer selector")
 
-    -- The TITLE's two scopes (header-selector round). The owner asked for the menu on the
-    -- name; the right-click layout toggle is older than that and had to survive it, so
-    -- both are pinned as data — see Frame.TitleClickAction for the collision write-up.
-    ck(Frame.TitleClickAction("LeftButton")   == "owner",  "left-click the name = the character menu")
-    ck(Frame.TitleClickAction("RightButton")  == "layout", "right-click the name = combined/split")
-    ck(Frame.TitleClickAction(nil)            == "owner",  "no button arg -> the character menu")
-    ck(Frame.TitleClickAction("MiddleButton") == "owner",  "any other button -> the character menu")
-    -- All three dual-purpose surfaces obey one rule: RIGHT is the reconfiguring click.
+    -- The TITLE NAME ZONE's two scopes. 2.0.1: both of them are now about the CHARACTER the
+    -- zone names — left picks which one you view, right opens THAT one's bank (a preview for
+    -- a cached alt). The combined/split toggle moved OFF the name and lives only on the bare
+    -- titlebar, where it always also lived. See Frame.TitleClickAction.
+    ck(Frame.TitleClickAction("LeftButton")   == "owner", "left-click the name = the character menu")
+    ck(Frame.TitleClickAction("RightButton")  == "bank",  "right-click the name = that character's bank")
+    ck(Frame.TitleClickAction(nil)            == "owner", "no button arg -> the character menu")
+    ck(Frame.TitleClickAction("MiddleButton") == "owner", "any other button -> the character menu")
+    -- REGRESSION LOCK: the name zone must not be the layout toggle any more. If this comes
+    -- back the bank preview has been silently displaced by the gesture it replaced.
+    ck(Frame.TitleClickAction("RightButton") ~= "layout",
+        "the name zone no longer toggles the layout (that is the BARE titlebar's gesture)")
+    -- All three dual-purpose surfaces obey one rule: RIGHT is the wider surface.
     ck(Frame.TitleClickAction("RightButton")  ~= Frame.TitleClickAction("LeftButton"),
         "the title's two buttons really do different things")
+    -- The right-click's verb is published, resolves through ns, and is inert without a bank.
+    ck(type(Frame.ToggleViewedBank) == "function", "the bank-preview verb is published")
+    do
+        local savedBank = ns.Bank
+        ns.Bank = nil
+        ck(Frame.ToggleViewedBank() == false, "…and is inert when ui_bank is absent")
+        local toggled = 0
+        ns.Bank = { Toggle = function() toggled = toggled + 1 end }
+        ck(Frame.ToggleViewedBank() == true and toggled == 1,
+            "…and TOGGLES the bank window (a second right-click puts the preview away)")
+        ns.Bank = savedBank
+    end
 
     -- The magnifier's two scopes.
     ck(Frame.SearchClickAction("LeftButton")  == "search", "left-click = inline search")

@@ -2,10 +2,67 @@
 
 ## 2.0.1
 
+**Sorting is faster and always finishes, the Blizzard bank window no longer turns up
+alongside ours, new items are marked on the border instead of with a corner dot, and a
+click that could leave your bags unresponsive is fixed.**
+
+### Sorting
+
+Sorting a full bank could crawl and then give up part-way, printing *"sort stopped: time
+budget exceeded"* and leaving a bag half arranged with no word about what it had skipped.
+Three separate things were wrong.
+
+- **It was waiting on itself.** While a sort is running, some slots are always mid-flight —
+  the server has been told to move them but has not answered yet. The sort was planning its
+  next batch of moves *including* those slots, and then throwing almost all of that batch
+  away because the game will not touch a slot twice at once. On a full bank it was managing
+  fewer than two moves per round when a dozen were available. It now plans around the slots
+  it is waiting on, so each round issues moves it can actually make. Measured on a full
+  120-slot bank, the same sort finished in **3.9 seconds instead of 7.4**.
+- **A sort no longer gives up because it is taking a while.** The old ten-second ceiling is
+  gone. A sort now stops only if it genuinely stops making progress, so a big bank on a slow
+  connection runs to completion instead of being abandoned. If a sort ever does have to
+  stop, it now tells you how much was left undone so you can just run it again.
+- **Specialised bags are filled first again.** Herb bags, enchanting bags, soul bags and
+  quivers are homes, not overflow — Bags 1 filled them first and put the leftovers in your
+  general bags, and 2.0 had it backwards, spilling herbs into your backpack while the herb
+  bag sat half empty. That is restored, along with Bags 1's rule that a swap is only made
+  when *both* items can legally live where they are going.
+
+### New items
+
+Newly-looted items used to be marked with a small crimson dot in the corner of the slot.
+They now **glow crimson and pulse gently on the border** instead, the way the rest of the
+item cues work — quest gold, unusable red and equipment-set teal are all border colours, and
+newness is now one too. The pulse stops as soon as you interact with the item.
+
+The new glow sits below the quest, unusable and equipment-set colours, so it never hides one
+of those; it does sit above the plain rarity colour while an item is new. You can turn it off
+under *Item borders → Glow newly-acquired items*.
+
+### The bank
+
+**Blizzard's bank window no longer appears when you visit a banker.** It was showing up
+next to (or on top of) the Daseeki bank window. If you would rather have the default one,
+there is a new option — *Auto-display → Use the Daseeki bank window* — and turning it off
+brings Blizzard's bank straight back, with no reload.
+
+### Right-clicking a character's name
+
+Right-clicking the character name at the top of the bag window now **opens that character's
+bank**. Because the bank window can show characters you are not logged into, this works as a
+bank preview for your alts: pick an alt from the name dropdown, right-click the name, and
+look through their bank. Right-click again to put it away.
+
+Toggling between the combined and split bag layouts has not moved — it is still a
+right-click on the title bar itself, anywhere outside the character name.
+
+### A click that could leave your bags unresponsive
+
 **Fixes a bug where your bags could stop responding to clicks — most visibly, items would
 not go into a trade window.**
 
-### What was happening
+#### What was happening
 
 The sort glyph does two things: left-click sorts your bags, right-click opens *sort lock
 configuration mode*, where clicking a slot marks it so a sort never moves it. That mode
@@ -21,7 +78,7 @@ expected: no picking items up, no selling at a vendor, no depositing at the bank
 way this was found — no right-clicking an item into an open trade. The mode was only ever
 held in memory, which is why logging out and back in appeared to "fix" it.
 
-### What changed
+#### What changed
 
 - **Opening a trade, a merchant, the bank, the mailbox, the auction house or a tradeskill
   window now ends the mode automatically**, and says so in chat. Those are windows you
