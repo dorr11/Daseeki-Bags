@@ -359,6 +359,16 @@ function Options.Build(flow)
         label = "At the bank", tooltip = "Open the bags when you open the bank.",
         get = function() return adGet("bank") end, set = function(v) adSet("bank", v) end,
     }).Refresh)
+    -- Whether OUR bank window replaces Blizzard's at a banker. Separate from "At the bank"
+    -- above, which is about the BAG window. Off restores Blizzard's panel immediately (the
+    -- ShowUIPanel hook re-parents it back to UIParent and gives it its OnHide back) — no
+    -- reload needed. See ui_bank.lua's BLIZZARD BANK-FRAME OVERRIDE block.
+    register(auto:Checkbox({
+        label = "Use the Daseeki bank window",
+        tooltip = "Replace Blizzard's bank window with the Daseeki one when you visit a banker. Turn this off to get the default Blizzard bank back.",
+        get = function() return not (ns.Bank and ns.Bank.Enabled) or ns.Bank.Enabled() end,
+        set = function(v) local db = DB(); if db then db.bankWindow = v and true or false end end,
+    }).Refresh)
     register(auto:Checkbox({
         label = "At the mailbox", tooltip = "Open the bags when you open the mail.",
         get = function() return adGet("mail") end, set = function(v) adSet("mail", v) end,

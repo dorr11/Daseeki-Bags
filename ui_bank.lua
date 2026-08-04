@@ -565,6 +565,12 @@ function Bank.Ensure()
     -- state transition and the notice card; this is only the exit trigger.
     win:SetScript("OnHide", function()
         if ns.Frame and ns.Frame.SetLockMode then ns.Frame.SetLockMode(false) end
+        -- END THE BANK SESSION. While our window is overriding Blizzard's panel that
+        -- panel's own OnHide is neutralised (see the BLIZZARD BANK-FRAME OVERRIDE block),
+        -- so nothing else will call CloseBankFrame — closing OUR window is now the only
+        -- thing that tells the server we walked away. Without this the session stays open
+        -- until the range check drops it and the bank looks live when it is not.
+        if ns.SafeCall then ns:SafeCall(Bank.EndBankSession) else Bank.EndBankSession() end
     end)
 
     Bank.ApplyScale()
@@ -866,12 +872,147 @@ function Bank.RequestRefresh()
     if _G.C_Timer and _G.C_Timer.After then _G.C_Timer.After(0, fire) else fire() end
 end
 
+-- =====================================================================
+-- BLIZZARD BANK-FRAME OVERRIDE  (2.0.1 regression fix)
+--
+-- SYMPTOM: walking up to a banker showed Blizzard's default bank window alongside (or
+-- instead of) ours. 2.0 replaced the nine FrameXML bag-toggle globals (ui_frame
+-- HookBagToggles) but never suppressed the BANK panel, and BANKFRAME_OPENED makes
+-- FrameXML call ShowUIPanel(BankFrame) directly — nothing we had replaced was in that path.
+--
+-- ── WHY NOT JUST Hide() IT ───────────────────────────────────────────────────
+-- BankFrame's OnHide script calls CloseBankFrame(), which ends the SERVER's bank session.
+-- Hiding the panel would therefore shut the bank the instant we suppressed it, and the
+-- player's own bank contents would go read-only under them. This is the trap the whole
+-- design is shaped around.
+--
+-- ── 1.x's PROVEN APPROACH, transcribed ───────────────────────────────────────
+-- Daseeki-Bags/core/features/uiOverrides.lua (v1.1.5) does three things and we do the same
+-- three, because they run on this exact client in the owner's live 1.x install:
+--
+--   :19-21  self.Disabled = CreateFrame('Frame', nil, UIParent); Disabled:SetAllPoints();
+--           Disabled:Hide()
+--             — a permanently HIDDEN host frame.
+--   :86-93  hooksecurefunc('ShowUIPanel', function(panel) ...
+--             panel.__onhide = panel.__onhide or panel:GetScript('OnHide')
+--             panel:SetScript('OnHide', not enabled and panel.__onhide or nil)
+--             panel:SetParent(enabled and self.Disabled or PanelParent)  end)
+--             — the panel is never hidden. It is RE-PARENTED onto the hidden host, so it
+--               renders nothing while remaining shown as far as the panel system and the
+--               bank session are concerned; and its OnHide is neutralised while overridden
+--               so nothing on this path can fire CloseBankFrame. Both are reversible: when
+--               our window is disabled the panel goes back to UIParent with its captured
+--               OnHide restored, which is how "turn it off and Blizzard's bank comes back"
+--               works without a reload.
+--   :95-100 hooksecurefunc('HideUIPanel', ...) — Blizzard closing the panel closes ours.
+--
+-- ── TAINT ────────────────────────────────────────────────────────────────────
+-- hooksecurefunc is the sanctioned non-tainting post-hook, and BankFrame is an ordinary
+-- (unprotected) UI panel on Classic Era — SetParent / SetScript on it are not protected
+-- operations. This is 1.x's own shape, shipping against 1.15.9.
+--
+-- Because the panel's OnHide no longer runs CloseBankFrame, closing OUR window is what has
+-- to end the session — see Bank.EndBankSession, wired to the window's OnHide.
+-- =====================================================================
+
+-- The panels we take over. A table (not a literal) so the pure resolver below is testable
+-- and so a future surface (void storage, guild bank) is a one-line addition.
+Bank.OVERRIDE_PANELS = { BankFrame = true }
+
+-- Is OUR bank window the one that should appear at a banker? `db.bankWindow`, default ON.
+-- Turning it off restores Blizzard's panel AND stops us auto-opening.
+function Bank.Enabled()
+    local db = Store and Store.db
+    if type(db) ~= "table" then return true end
+    if db.bankWindow == nil then return true end
+    return db.bankWindow and true or false
+end
+
+-- PURE: what should happen to a panel the game is about to show?
+--   "suppress" — hide it behind our host and neutralise its OnHide (our window is on)
+--   "restore"  — put it back on UIParent with its own OnHide (our window is off)
+--   nil        — not a panel we touch
+function Bank.ResolveOverride(panelName, enabled)
+    if not panelName or not Bank.OVERRIDE_PANELS[panelName] then return nil end
+    return enabled and "suppress" or "restore"
+end
+
+-- The permanently hidden host (1.x's `Disabled` frame). Created once, lazily.
+local function hiddenHost()
+    if Bank._hiddenHost then return Bank._hiddenHost end
+    if not _G.CreateFrame then return nil end
+    local h = _G.CreateFrame("Frame", nil, _G.UIParent)
+    if h.SetAllPoints then h:SetAllPoints() end
+    h:Hide()
+    Bank._hiddenHost = h
+    return h
+end
+
+-- Apply (or lift) the override on one panel. Idempotent in both directions.
+function Bank.ApplyOverride(panel, suppress)
+    if not (panel and panel.SetParent and panel.SetScript) then return false end
+    -- Capture the panel's OWN OnHide exactly once, before we ever null it. `false` is the
+    -- "captured, and there wasn't one" marker so a second capture can never overwrite the
+    -- real script with our own nil.
+    if panel.__dsOnHide == nil then
+        panel.__dsOnHide = (panel.GetScript and panel:GetScript("OnHide")) or false
+    end
+    if suppress then
+        local host = hiddenHost()
+        if not host then return false end
+        panel:SetScript("OnHide", nil)        -- never let this path fire CloseBankFrame
+        panel:SetParent(host)                 -- shown, but rendered nowhere
+    else
+        panel:SetScript("OnHide", panel.__dsOnHide or nil)
+        panel:SetParent(_G.UIParent)
+    end
+    return true
+end
+
+-- End the SERVER's bank session. Ours to call now that the panel's own OnHide is muted.
+function Bank.EndBankSession()
+    if not Bank._live then return false end
+    local fn = (_G.C_Bank and _G.C_Bank.CloseBankFrame) or _G.CloseBankFrame
+    if not fn then return false end
+    fn()
+    return true
+end
+
+Bank._overrideInstalled = false
+function Bank.InstallOverride()
+    if Bank._overrideInstalled then return false end
+    if not (_G.hooksecurefunc and _G.CreateFrame) then return false end
+    Bank._overrideInstalled = true
+
+    _G.hooksecurefunc("ShowUIPanel", function(panel)
+        if not (panel and panel.GetName) then return end
+        local verdict = Bank.ResolveOverride(panel:GetName(), Bank.Enabled())
+        if not verdict then return end
+        if ns.SafeCall then ns:SafeCall(Bank.ApplyOverride, panel, verdict == "suppress")
+        else Bank.ApplyOverride(panel, verdict == "suppress") end
+    end)
+
+    _G.hooksecurefunc("HideUIPanel", function(panel)
+        if not (panel and panel.GetName) then return end
+        if not Bank.OVERRIDE_PANELS[panel:GetName()] then return end
+        if Bank.Enabled() and Bank.IsShown() then Bank.Close() end
+    end)
+
+    return true
+end
+
 -- Self-registered login wiring (never touches core.lua). Mirrors features.lua.
 function Bank.OnLogin()
     if not ns.RegisterEvent then return end
+    -- Suppress Blizzard's bank panel before the first BANKFRAME_OPENED can reach it.
+    if ns.SafeCall then ns:SafeCall(Bank.InstallOverride) else Bank.InstallOverride() end
     ns:RegisterEvent("BANKFRAME_OPENED", function()
         Bank._live = true
-        Bank.Open()                 -- open the bank window alongside the inventory window
+        -- Gated: with our bank window turned off the player gets Blizzard's, and we stay
+        -- out of the way entirely (the ShowUIPanel hook has already restored the panel).
+        if Bank.Enabled() then
+            Bank.Open()             -- open the bank window alongside the inventory window
+        end
     end)
     ns:RegisterEvent("BANKFRAME_CLOSED", function()
         Bank._live = false          -- flip to cached; capture.lua already snapshots on close
@@ -1136,8 +1277,123 @@ local function testMoneyClick(fails)
         sBank, sPickup, sMoney, sCombat
 end
 
+----------------------------------------------------------------------
+-- BLIZZARD PANEL OVERRIDE (2.0.1 regression). The three properties that make the
+-- suppression safe, each pinned against the trap it avoids.
+----------------------------------------------------------------------
+local function testBankOverride(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedDb = Store.db
+
+    -- The gate.
+    Store.db = nil;                  ck(Bank.Enabled() == true,  "no store -> our bank window (default ON)")
+    Store.db = {};                   ck(Bank.Enabled() == true,  "unset key -> default ON")
+    Store.db = { bankWindow = true };  ck(Bank.Enabled() == true,  "explicit true honored")
+    Store.db = { bankWindow = false }; ck(Bank.Enabled() == false, "explicit false honored")
+
+    -- The pure resolver: only BankFrame, and the verdict follows the gate.
+    ck(Bank.ResolveOverride("BankFrame", true)  == "suppress", "BankFrame + enabled -> suppress")
+    ck(Bank.ResolveOverride("BankFrame", false) == "restore",  "BankFrame + disabled -> restore")
+    ck(Bank.ResolveOverride("MerchantFrame", true) == nil, "a panel we do not own -> nil")
+    ck(Bank.ResolveOverride(nil, true) == nil, "nil panel name -> nil (nil-safe)")
+    ck(Bank.OVERRIDE_PANELS.BankFrame == true, "BankFrame is the panel we take over")
+
+    -- A fake BankFrame carrying the ONE script that makes this dangerous.
+    local closed = 0
+    local function fakePanel()
+        local p = { scripts = {}, parent = "UIParent", hidden = false }
+        p.scripts.OnHide = function() closed = closed + 1 end   -- the CloseBankFrame trap
+        function p:GetName() return "BankFrame" end
+        function p:GetScript(k) return self.scripts[k] end
+        function p:SetScript(k, fn) self.scripts[k] = fn end
+        function p:SetParent(x) self.parent = x end
+        function p:Hide() self.hidden = true end
+        return p
+    end
+
+    local savedCF, savedUIP = _G.CreateFrame, _G.UIParent
+    _G.UIParent = "UIParent"
+    _G.CreateFrame = function()
+        local f = { shown = true }
+        function f:SetAllPoints() end
+        function f:Hide() self.shown = false end
+        function f:Show() self.shown = true end
+        return f
+    end
+    Bank._hiddenHost = nil
+
+    local panel = fakePanel()
+    local origOnHide = panel.scripts.OnHide
+
+    -- SUPPRESS: never hidden, re-parented onto a HIDDEN host, OnHide neutralised.
+    ck(Bank.ApplyOverride(panel, true) == true, "suppress applied")
+    ck(panel.hidden == false, "the panel is NEVER hidden (Hide() would fire CloseBankFrame)")
+    ck(panel.parent ~= "UIParent" and panel.parent == Bank._hiddenHost,
+        "…it is re-parented onto the hidden host instead (1.x uiOverrides:93)")
+    ck(Bank._hiddenHost.shown == false, "…and that host is hidden, so nothing renders")
+    ck(panel.scripts.OnHide == nil, "…and its OnHide is neutralised (1.x uiOverrides:92)")
+    ck(closed == 0, "…so suppressing the panel never closed the bank session")
+
+    -- The captured script survives, and a second suppress cannot clobber it with nil.
+    Bank.ApplyOverride(panel, true)
+    ck(panel.__dsOnHide == origOnHide, "the panel's own OnHide is captured exactly once")
+
+    -- RESTORE: back to UIParent with its own script — "turn the option off" with no reload.
+    ck(Bank.ApplyOverride(panel, false) == true, "restore applied")
+    ck(panel.parent == "UIParent", "restored to UIParent")
+    ck(panel.scripts.OnHide == origOnHide, "…with its own OnHide back")
+    ck(panel.hidden == false, "…and still never hidden by us")
+
+    -- A panel with no OnHide at all round-trips cleanly (the `false` capture marker).
+    local bare = fakePanel(); bare.scripts.OnHide = nil
+    Bank.ApplyOverride(bare, true)
+    ck(bare.__dsOnHide == false, "a panel with no OnHide records the `false` marker")
+    Bank.ApplyOverride(bare, false)
+    ck(bare.scripts.OnHide == nil, "…and restoring leaves it without one (not with `false`)")
+
+    -- Nil-safety: a malformed panel must not error.
+    ck(Bank.ApplyOverride(nil, true) == false, "ApplyOverride(nil) is inert")
+    ck(Bank.ApplyOverride({}, true) == false, "a panel with no SetParent is inert")
+
+    -- SESSION END: because the panel's OnHide is muted, ours must call CloseBankFrame —
+    -- and only while the bank is actually live, so it can never fire twice.
+    local ended = 0
+    local savedClose = _G.CloseBankFrame
+    _G.CloseBankFrame = function() ended = ended + 1 end
+    local savedLive = Bank._live
+    Bank._live = false
+    ck(Bank.EndBankSession() == false, "not at the bank -> no CloseBankFrame")
+    ck(ended == 0, "…and nothing was sent")
+    Bank._live = true
+    ck(Bank.EndBankSession() == true, "at the bank -> CloseBankFrame")
+    ck(ended == 1, "…exactly once")
+    Bank._live = false
+    Bank.EndBankSession()
+    ck(ended == 1, "…and the session-closed handler makes a second call a no-op")
+    Bank._live = savedLive
+    _G.CloseBankFrame = savedClose
+
+    -- Install is idempotent and headless-inert.
+    local savedHook, savedInstalled = _G.hooksecurefunc, Bank._overrideInstalled
+    _G.hooksecurefunc = nil
+    Bank._overrideInstalled = false
+    ck(Bank.InstallOverride() == false, "no hooksecurefunc -> install is a no-op (headless-safe)")
+    local hooks = {}
+    _G.hooksecurefunc = function(name) hooks[name] = (hooks[name] or 0) + 1 end
+    Bank._overrideInstalled = false
+    ck(Bank.InstallOverride() == true, "installs when the API is present")
+    ck(hooks.ShowUIPanel == 1 and hooks.HideUIPanel == 1, "…hooking both panel entry points")
+    ck(Bank.InstallOverride() == false, "…and a second install is a no-op")
+    _G.hooksecurefunc, Bank._overrideInstalled = savedHook, savedInstalled
+
+    _G.CreateFrame, _G.UIParent = savedCF, savedUIP
+    Bank._hiddenHost = nil
+    Store.db = savedDb
+end
+
 function Bank.RunSelfTests(verbose)
     local suites = {
+        { name = "blizzard panel override", fn = testBankOverride },
         { name = "bank container order",   fn = testBankContainerOrder },
         { name = "money tooltip (1.x)",    fn = testMoneyTooltip },
         { name = "money click (pickup)",   fn = testMoneyClick },
