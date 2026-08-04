@@ -1,20 +1,20 @@
--- Daseeki Bags 2.0 â€” ui_items.lua
+-- Daseeki Bags 2.0 — ui_items.lua
 -- The item button + grid group. Two layers, cleanly separated so the whole data
 -- side is headless-testable and the render/interaction side stays thin:
 --
 --   PURE core (no WoW API; unit-tested by the harness):
---     Items.ContainerRank / cidInScope     â€” canonical container ordering + scope
---     Items.BuildGroups / Items.BuildEntries â€” turn a store owner into the entry lists
+--     Items.ContainerRank / cidInScope     — canonical container ordering + scope
+--     Items.BuildGroups / Items.BuildEntries — turn a store owner into the entry lists
 --                                              the frame agent consumes (per-container
 --                                              grouping AND combined flatten)
---     Items.GridMetrics / Items.SlotPosition â€” grid math (cols/rows/self-size/xy)
---     Items.FlowClass / SplitRuns / RunLayout / RunSlotPosition â€” the 1.0 keyring
+--     Items.GridMetrics / Items.SlotPosition — grid math (cols/rows/self-size/xy)
+--     Items.FlowClass / SplitRuns / RunLayout / RunSlotPosition — the 1.0 keyring
 --                                              ROW-BREAK: the flat list is split into
 --                                              runs at the bag-family boundary and each
 --                                              later run restarts at column 0
---     Items.MarkerArt                       â€” the per-slot marker ART contract
+--     Items.MarkerArt                       — the per-slot marker ART contract
 --                                              (quest bang glyph / round token pips)
---     Items.ResolveVisual                   â€” icon/quality/name derivation with the
+--     Items.ResolveVisual                   — icon/quality/name derivation with the
 --                                              nil-quality (migrated) -> pending path
 --     Items.DimValues / Items.FormatCachedAge
 --
@@ -30,10 +30,10 @@
 -- ContainerFrameItemButtonTemplate and are parented to a per-container holder frame
 -- carrying holder:SetID(cid); with button:SetID(slot) the template's OWN default
 -- secure/combat-correct handlers (pickup / place / split / use / real-slot tooltip)
--- operate on the right (bag, slot) with zero behavior re-implemented â€” the public
+-- operate on the right (bag, slot) with zero behavior re-implemented — the public
 -- Blizzard template contract, not transcribed addon code. Structural (re)builds are
 -- deferred out of combat (secure frames are protected).
--- OFFLINE / REMOTE owners: render-only ItemButtonTemplate buttons â€” icon/count/quality
+-- OFFLINE / REMOTE owners: render-only ItemButtonTemplate buttons — icon/count/quality
 -- from cached data, hyperlink tooltip + "cached Xd ago", clicks inert (shift-link only).
 --
 -- Every API is catalog-verified against wow-api-catalog/1.15.9.68808:
@@ -61,12 +61,12 @@ Items.HEADER_HEIGHT   = 16   -- split-mode per-bag header band (sits ABOVE the g
 Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 
 -- ====================================================================================
--- THE CELL SUBSTRATE â€” transcribed from 1.x AND from the OWNER'S LIVE 1.x PROFILE.
+-- THE CELL SUBSTRATE — transcribed from 1.x AND from the OWNER'S LIVE 1.x PROFILE.
 --
 -- 1.x draws NOTHING of its own BEHIND a cell (core/classes/item.lua:51-52 hides the
 -- template NormalTexture and creates no replacement). An empty slot is expressed by
--- setting the ICON to a chosen bag-slot art at a chosen opacity, and EVERY cell â€” filled
--- or empty â€” is framed by a 2px `SlotBorder` backdrop edge:
+-- setting the ICON to a chosen bag-slot art at a chosen opacity, and EVERY cell — filled
+-- or empty — is framed by a 2px `SlotBorder` backdrop edge:
 --
 --   Daseeki-Bags/core/classes/item.lua:12-19   Item.Backgrounds (the slotBackground enum)
 --   Daseeki-Bags/core/classes/item.lua:65-71   SlotBorder = 2px WHITE8X8 backdrop EDGE
@@ -78,7 +78,7 @@ Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 -- THE PARITY ROUND GOT THE VALUES FROM THE WRONG PLACE. It read skin/defaults.lua's
 -- GlobalDefaults (slotBackground = 2 "the bevelled backpack art", slotAlpha = 1,
 -- slotBorderColor = {1,1,1,0} "invisible") and shipped those. The owner does not run the
--- defaults â€” he deliberately changed all three, years ago, and asked for them back
+-- defaults — he deliberately changed all three, years ago, and asked for them back
 -- verbatim: "can we also update the background of the item slots to match that of bags 1?
 -- this was something i deliberately implemented in bags 1. the darkened, slightly opaque
 -- background is easier on the eyes."
@@ -94,7 +94,7 @@ Items.PLACEHOLDER_ICON = "Interface\\Icons\\INV_Misc_QuestionMark"
 --                            --   59% on EVERY cell (his Alliance profile: a navy variant)
 --
 -- Rendered, that is exactly the screenshot he sent: near-black cells carrying a faint
--- tint, each one framed by a quiet dark edge â€” not 2.0's loud, fully-opaque bevel. These
+-- tint, each one framed by a quiet dark edge — not 2.0's loud, fully-opaque bevel. These
 -- are therefore the SHIPPED 2.0 DEFAULTS, and each is a live setting (db.slotBackground /
 -- db.slotAlpha / db.slotBorderColor) so the choice stays his.
 --
@@ -148,7 +148,7 @@ function Items.SlotBackgroundArt(which)
 end
 
 -- LIVE: the owner's three cell-substrate settings, each defaulting to his 1.x profile
--- value when the key is absent (additive â€” no SavedVariables write happens here).
+-- value when the key is absent (additive — no SavedVariables write happens here).
 local function storeDb()
     return (ns.Store and ns.Store.db) or nil
 end
@@ -195,15 +195,15 @@ end
 -- is erased on the next paint. Our regions are created by ensureDress and are not in the
 -- kill registry, so they survive.
 --
---   QUEST â€” the real bang glyph, 1.x-faithful. 1.x fact (core/classes/item.lua:39-47):
+--   QUEST — the real bang glyph, 1.x-faithful. 1.x fact (core/classes/item.lua:39-47):
 --     QuestBang IS the template's IconQuestTexture region and is painted with the
 --     FrameXML constant TEXTURE_ITEM_QUEST_BANG. We reference the SAME constant from our
 --     own region (with the literal Era path as a guard so a nil constant can never leave
---     an untextured object), anchored over the whole cell like the native region â€” so the
+--     an untextured object), anchored over the whole cell like the native region — so the
 --     glyph lands exactly where 1.x puts it. WHEN it shows is now 1.x-exact too: the bang
 --     is reserved for quest STARTERS only, and an ordinary quest item gets the gold border
 --     tint instead (see Items.QuestFlags).
---   NEW / SET â€” token-tinted pips, but round: a WHITE8X8 fill clipped by our shipped
+--   NEW / SET — token-tinted pips, but round: a WHITE8X8 fill clipped by our shipped
 --     circular stencil (art/dot-mask.tga). Same size and same tokens as before; only the
 --     SHAPE changes (hard square -> anti-aliased dot). Masking degrades to the old square
 --     if CreateMaskTexture is unavailable, never to an invisible marker.
@@ -227,13 +227,13 @@ end
 --     return info.isQuestItem, (info.questID and not info.isActive)
 -- ...consumed by UpdateBorder as `quest, bang`. So the DISTINGUISHING FIELD PAIR is
 -- questID + isActive, NOT isQuestItem:
---   * isStarter (the bang) == the item carries a questID that is NOT yet active â€” i.e.
+--   * isStarter (the bang) == the item carries a questID that is NOT yet active — i.e.
 --     right-clicking it STARTS that quest. `isActive` true means the quest is already in
 --     the log, so the item is just an objective and the bang is withheld.
---   * isQuest (the gold border) == isQuestItem â€” every quest item, starter or not.
+--   * isQuest (the gold border) == isQuestItem — every quest item, starter or not.
 -- 1.x paints the bang ONLY for a starter (`QuestBang:SetShown(bang)`) and tints the border
 -- for `(glowQuest and quest) or bang`, so a starter gets BOTH glyph and tint. glowQuest
--- defaults ON in 1.x and 2.0 has no equivalent per-cue toggle, so it is treated as on â€”
+-- defaults ON in 1.x and 2.0 has no equivalent per-cue toggle, so it is treated as on —
 -- no new setting, no SavedVariables change.
 --
 -- A starter is reported as a quest item too, so a starter whose isQuestItem is somehow
@@ -388,11 +388,11 @@ end
 -- 1.x never flows the keyring into the running row. The keyring is its own bag
 -- FAMILY (frames/inventory/inventory.lua family 9; normal bags + backpack are 0), and
 -- core/classes/itemGroup.lua records a BREAK at every family boundary, then resets the
--- column to 0 and drops y by `breakSpace` (1.3 rows â€” one normal row plus a ~0.3-row
+-- column to 0 and drops y by `breakSpace` (1.3 rows — one normal row plus a ~0.3-row
 -- gap) when it crosses one. So the keys start a FRESH ROW with a small gap above,
--- still inside the same single button array â€” no separate frame, no header.
+-- still inside the same single button array — no separate frame, no header.
 --
--- v2's combined view is one flat cid-ordered entry list (kept exactly as-is â€” the
+-- v2's combined view is one flat cid-ordered entry list (kept exactly as-is — the
 -- entry list is the click-identity contract). The break therefore lives HERE, where
 -- positions are assigned: the flat list is split into RUNS at the flow-class boundary
 -- and each run after the first starts at column 0 of a new row, `RUN_GAP` px lower.
@@ -405,7 +405,7 @@ Items.RUN_GAP = 12
 
 -- Layout FLOW CLASS of a container: "keyring" or "generic".
 -- Derived from the cid CLASS (Store.ContainerClass), NEVER from a captured `family`
--- field â€” capture never stores one for cid <= 0, so a naive family read returns nil,
+-- field — capture never stores one for cid <= 0, so a naive family read returns nil,
 -- collapses the keyring back into the main run and silently restores the defect.
 -- (1.x also breaks for quiver/soul/herb special bags; Era carries none by default and
 -- v2 captures no family, so those stay generic until a family fact exists to read.)
@@ -476,10 +476,10 @@ end
 
 -- Derive what a button needs to render from a store slot `data`, using an injected
 -- `resolver = { instant = <GetItemInfoInstant>, info = <GetItemInfo> }`:
---   * icon  â€” from GetItemInfoInstant, which resolves from static data for ANY valid
+--   * icon  — from GetItemInfoInstant, which resolves from static data for ANY valid
 --             itemID even when the item is server-uncached (so migrated slots, which
 --             cache no icon, still get one immediately).
---   * quality/name â€” captured quality wins; else GetItemInfo (server-cached). When
+--   * quality/name — captured quality wins; else GetItemInfo (server-cached). When
 --             quality is still unresolvable the slot is `pending` (placeholder now,
 --             repaint on GET_ITEM_INFO_RECEIVED).
 -- Returns { id, count, icon, quality, name, link, pending } or nil for an empty slot.
@@ -514,7 +514,7 @@ end
 
 -- Dress alpha for the whole slot dress (icon + quality edge + state markers + count).
 -- The dim-cascade fix: search-dim recedes the ENTIRE dress together, not just the icon.
--- CELL PARITY: 0.3, not 0.25 â€” 1.x core/classes/item.lua:233 `self:SetAlpha(matches and 1
+-- CELL PARITY: 0.3, not 0.25 — 1.x core/classes/item.lua:233 `self:SetAlpha(matches and 1
 -- or 0.3)` on the whole button. (DimValues below is the older two-value form and tracks it.)
 Items.DIM_ALPHA = 0.3
 function Items.DressAlpha(dimmed)
@@ -545,12 +545,12 @@ end
 --     membership through the SAME glow chain as everything else (teal .2/1/.8), between
 --     the unusable red and the rarity colour. `setBorder` replaces `showSetMark`, so a
 --     set item carries ONE cue like every other cell instead of a cue plus a corner pip.
--- 1.0-PARITY change (glowUnusable): UNUSABLE no longer greys the icon â€” 1.x kept the icon
+-- 1.0-PARITY change (glowUnusable): UNUSABLE no longer greys the icon — 1.x kept the icon
 -- FULL-COLOR and drew a RED BORDER instead (RED_FONT_COLOR). So unusable now yields
 -- redBorder=true (drawn by borders.Apply, winning over the quality edge on that cell) while
 -- the icon stays normal. `unusableTint` is retired (kept false for back-compat readers).
 -- 1.x QUEST SPLIT: `isQuest` (any quest item) and `isQuestStarter` (a quest STARTER) drive
--- two different cues, exactly as 1.x does â€” the bang glyph is reserved for starters
+-- two different cues, exactly as 1.x does — the bang glyph is reserved for starters
 -- (showQuestTab), while every quest item takes the gold border tint (questBorder). The
 -- tint is 1.x's FIRST border branch, so it wins over the unusable red and the quality
 -- edge; redBorder is therefore suppressed on a quest cell so the two never fight.
@@ -580,7 +580,7 @@ function Items.ResolveState(ctx)
     return {
         icon         = icon,
         iconDesat    = dimmed,                   -- ONLY the search dim (1.x item.lua:234)
-        -- 1.0 glowQuest: gold border, 1.x's first branch â€” it wins over the unusable red.
+        -- 1.0 glowQuest: gold border, 1.x's first branch — it wins over the unusable red.
         questBorder  = questBorder,
         -- 1.0 glowUnusable: red border, icon full-color. Yields to the quest gold.
         redBorder    = redBorder,
@@ -597,7 +597,7 @@ function Items.ResolveState(ctx)
         showQuestTab = (starter and not dimmed) and true or false,
         showSetMark  = false,                    -- retired: the set cue is setBorder (1.x)
         dressAlpha   = Items.DressAlpha(dimmed),
-        -- 1.x item.lua:167 â€” the icon's OWN alpha, independent of the search dim: 1 on a
+        -- 1.x item.lua:167 — the icon's OWN alpha, independent of the search dim: 1 on a
         -- filled cell, the profile's slotAlpha on an empty one. _applyDress multiplies the
         -- two, exactly as 1.x's icon alpha and button alpha multiply on screen.
         emptySlot    = emptySlot,
@@ -609,14 +609,14 @@ end
 -- PURE: class equip PROFICIENCY (clean-room; restores the 1.x glowUnusable rule)
 --
 -- ROOT CAUSE this replaces: the beta's slotIsUnusable read C_Item.IsUsableItem,
--- which for armor/weapons answers "can I right-click USE this now" â€” it returns
+-- which for armor/weapons answers "can I right-click USE this now" — it returns
 -- FALSE for equippable gear the character can wear, so nearly ALL gear desaturated
 -- ("grey washed"). 1.x drove glowUnusable from Unfit-1.0 (class weapon/armor
 -- PROFICIENCY via GetItemInfoInstant), never IsUsableItem. This restores that real
 -- rule fresh: an item washes ONLY when the CHARACTER CLASS can never equip its
 -- weapon/armor subclass (or, per the owner ask, when it is below its required
 -- level). Item classes that are neither Weapon nor Armor (consumables, trade
--- goods, quest, reagentsâ€¦) never enter this path â€” they can't be "unequippable".
+-- goods, quest, reagents…) never enter this path — they can't be "unequippable".
 --
 -- Numeric Enum.ItemClass / Enum.ItemWeaponSubclass / Enum.ItemArmorSubclass values
 -- (Classic Era 1.15) so the logic is pure (no live Enum global); the frame layer
@@ -673,7 +673,7 @@ function Items.ClassCannotEquip(classToken, classID, subclassID, equipLoc)
     return false                                                 -- neither weapon nor armor
 end
 
--- Pure: additive per owner ask â€” an EQUIPPABLE item whose required level exceeds the
+-- Pure: additive per owner ask — an EQUIPPABLE item whose required level exceeds the
 -- character level reads unusable (native "requires level N"). Bags/ammo/non-equippable
 -- are exempt; an unknown (server-uncached) minLevel never washes (re-evaluated on the
 -- pending repaint once GetItemInfo resolves).
@@ -703,7 +703,7 @@ end
 -- via Items.SetSelf; derived lazily from UnitName/GetRealmName if unset.
 function Items.SetSelf(nameRealm) Items._self = nameRealm end
 
--- Live player class token ("WARRIOR", â€¦) for the proficiency gate. Set at login via
+-- Live player class token ("WARRIOR", …) for the proficiency gate. Set at login via
 -- Items.SetPlayerClass; derived lazily from UnitClass if unset. Cached (class never
 -- changes mid-session).
 function Items.SetPlayerClass(token) Items._playerClass = token end
@@ -745,7 +745,7 @@ end
 
 -- Token color with a hardcoded fallback (so per-slot dress still tints sensibly if
 -- DaseekiUI is somehow absent). Colors are read at button CREATION and baked into the
--- dress (no per-cell ThemeChanged hook â€” 100+ hooks are the per-frame cost C vetoes;
+-- dress (no per-cell ThemeChanged hook — 100+ hooks are the per-frame cost C vetoes;
 -- the quality edge, which re-reads the live provider each paint, carries live rarity).
 local TOKEN_FALLBACK = {
     inset      = { 0.0706, 0.0627, 0.0471 }, -- #12100C sunken well (EMPTY cell)
@@ -774,7 +774,7 @@ end
 Items._tokenRGB = tokenRGB   -- exposed so the harness can prove the Core-less fallbacks
 
 -- Subtle danger tint for an UNUSABLE icon: danger mixed toward white so a desaturated
--- (greyscale) icon reads warm-red â€” the classic "can't use" cue â€” not a solid red block.
+-- (greyscale) icon reads warm-red — the classic "can't use" cue — not a solid red block.
 local function unusableTintRGB()
     local dr, dg, db = tokenRGB("danger")
     local m = 0.45
@@ -823,7 +823,7 @@ end
 -- STATE layer (Layer 2): live-fact detection for the per-slot markers.
 -- All three read the LIVE container/item APIs and are meaningful only for the logged-in
 -- character's own bags (button._live). Offline/remote owners get no state markers (they
--- have no live new/quest/usable state) â€” junk calm still applies via captured quality.
+-- have no live new/quest/usable state) — junk calm still applies via captured quality.
 ----------------------------------------------------------------------
 
 -- NEW-ITEM: C_NewItems is the game's own new-item set (1.x drove glowNew from it). The
@@ -844,10 +844,10 @@ local function slotQuestFlags(button)
 end
 
 -- UNUSABLE: 1.x glowUnusable parity via CLASS PROFICIENCY (Items.ClassCannotEquip),
--- NOT C_Item.IsUsableItem (which washed all equippable gear grey â€” the beta defect).
+-- NOT C_Item.IsUsableItem (which washed all equippable gear grey — the beta defect).
 -- GetItemInfoInstant resolves classID/subclassID/equipLoc from static data for any
 -- valid itemID immediately, so the proficiency verdict is stable on the first paint.
--- The additive below-level gate uses GetItemInfo's minLevel (async â€” nil => not washed
+-- The additive below-level gate uses GetItemInfo's minLevel (async — nil => not washed
 -- until known; the pending repaint re-evaluates once the server responds).
 local function slotIsUnusable(button)
     local id = button._data and button._data.id
@@ -867,7 +867,7 @@ local function slotIsUnusable(button)
 end
 
 -- ====================================================================================
--- EQUIPMENT-SET teal â€” the cue that regressed, and why it is now OPT-IN.
+-- EQUIPMENT-SET teal — the cue that regressed, and why it is now OPT-IN.
 --
 -- WHAT 1.x ACTUALLY DOES ON THIS CLIENT. 1.x's set branch (core/classes/item.lua:201,
 -- `Addon.sets.glowSets and Search:BelongsToSet(id)`) is fed by ItemSearch-1.3, and that
@@ -883,7 +883,7 @@ end
 -- the `nop` arm: BelongsToSet always returns nil and 1.x paints ZERO set teal, ever.
 --
 -- WHAT THE PARITY ROUND SHIPPED. It transcribed the branch faithfully but wired it to a
--- source 1.x never reads â€” Daseeki-Armory's saved gear sets â€” and defaulted it ON. The
+-- source 1.x never reads — Daseeki-Armory's saved gear sets — and defaulted it ON. The
 -- owner keeps 9 sets per raiding character naming 63 distinct item ids; measured against
 -- his live SavedVariables, 47 of Poonyx's 156 filled bag cells (30%) match, and because
 -- the set branch outranks rarity (borders.lua:191) every one of those cells LOSES its
@@ -893,10 +893,10 @@ end
 -- THE FIX IS TWO PARTS.
 --   1. DEFAULT OFF (db.setMarkers absent => OFF). Off is what his 1.x renders, so the
 --      shipped default is now byte-for-byte his 1.x appearance. The toggle stays, because
---      the Armory bridge is a genuinely useful 2.0 feature â€” it is just not parity.
+--      the Armory bridge is a genuinely useful 2.0 feature — it is just not parity.
 --   2. A STRICTER, PURE predicate (below): 1.x/ItemSearch only ever answers true for an
 --      EQUIPPABLE item, and only when a set actually NAMES that item id in a slot that set
---      has not disabled. No Armory, no sets, an empty sets table, a malformed entry â€” all
+--      has not disabled. No Armory, no sets, an empty sets table, a malformed entry — all
 --      false, with no error surfaced to the paint path.
 --
 -- Like new/quest, this is meaningful only for live self bags: Armory's sets are
@@ -914,12 +914,12 @@ end
 -- Armory shape (Daseeki-Armory/core.lua:59, sets.lua:143-149):
 --   db.sets[<name>] = { name=, icon=, order=, equip = { [slotId] = { id=, exact=, str= } },
 --                       disabled = { [slotId] = true } }
--- so the id lives at db.sets[name].equip[slotId].id â€” an ID-KEYED-BY-SLOT map, never a
+-- so the id lives at db.sets[name].equip[slotId].id — an ID-KEYED-BY-SLOT map, never a
 -- flat list. A slot listed in `disabled` is one the set deliberately does not equip, so an
 -- item parked there is NOT a member. Every level is type-guarded: this walks foreign
 -- SavedVariables and must never throw into a paint.
 --
--- Returns true/false only â€” it never leaks the Armory tables to the caller.
+-- Returns true/false only — it never leaks the Armory tables to the caller.
 function Items.ArmoryNamesItem(armoryDb, itemID)
     if type(armoryDb) ~= "table" or type(itemID) ~= "number" then return false end
     local sets = armoryDb.sets
@@ -940,7 +940,7 @@ end
 
 -- PURE: 1.x/ItemSearch gates the whole set branch on IsEquippableItem (API.lua:115/130).
 -- Ours derives the same fact from GetItemInfoInstant's equipLoc, which the proficiency
--- path already reads â€” a non-empty, non-BAG equip location means the item goes on the
+-- path already reads — a non-empty, non-BAG equip location means the item goes on the
 -- character, which is the only kind of thing a gear set can contain.
 function Items.IsEquippableLoc(equipLoc)
     if type(equipLoc) ~= "string" or equipLoc == "" then return false end
@@ -980,7 +980,7 @@ function Items.MarkSeen(button)
 end
 
 -- Apply a resolved STATE spec to a button's dress. Operates ONLY on child textures/
--- frames/fontstrings + the icon sub-texture â€” never a protected op on the secure button.
+-- frames/fontstrings + the icon sub-texture — never a protected op on the secure button.
 -- This is also the DIM CASCADE: `spec.dressAlpha` recedes the icon, quality edge, count
 -- numeral AND both markers together, so a search-dimmed slot fully recedes (no bright
 -- quality rim or crimson dot floating over a non-match).
@@ -1007,7 +1007,7 @@ function Items._applyDress(button, spec)
     if ns.Borders and ns.Borders.SetAlpha then ns.Borders.SetAlpha(button, a) end
 
     -- 1.x SLOT BORDER: re-asserted from the live profile colour on every dress, and
-    -- cascaded with the dim (1.x dims it too â€” it dims the entire button).
+    -- cascaded with the dim (1.x dims it too — it dims the entire button).
     if Items._applySlotBorder then Items._applySlotBorder(button) end
     if button._dsSlotBorder and button._dsSlotBorder.SetAlpha then
         button._dsSlotBorder:SetAlpha(a)
@@ -1043,7 +1043,7 @@ function Items._applyDress(button, spec)
         if spec.showQuestTab then tab:SetAlpha(a); tab:Show() else tab:Hide() end
     end
 
-    -- JUNK COIN â€” the template's own JunkIcon, driven exactly as 1.x drives it
+    -- JUNK COIN — the template's own JunkIcon, driven exactly as 1.x drives it
     -- (item.lua:222). This replaces the greyscale junk icon: 1.x keeps the icon in full
     -- colour and puts a small vendor coin on the cell instead.
     local junk = button.JunkIcon
@@ -1212,7 +1212,7 @@ end
 
 -- LIVE fact behind 1.x's glowPoor gate (item.lua:222 `not self.info.hasNoValue`): a poor
 -- item a vendor will not buy carries no coin. Only the live container API knows it; a
--- cached/offline slot returns nil, which reads as "has value" â€” exactly what 1.x's cached
+-- cached/offline slot returns nil, which reads as "has value" — exactly what 1.x's cached
 -- info does, since it never populates the field either.
 local function slotHasNoValue(button)
     if not button._live then return nil end
@@ -1238,11 +1238,11 @@ local function updateCooldown(button)
     end
 end
 
--- CELL PARITY: the stack-count numeral is the TEMPLATE's, untouched â€” 1.x never restyles
+-- CELL PARITY: the stack-count numeral is the TEMPLATE's, untouched — 1.x never restyles
 -- it (core/classes/item.lua:168 is a bare `SetItemButtonCount(self, stackCount)` and there
 -- is no font/colour/anchor call anywhere in the file). The previous round re-fonted it to
 -- ARIALN+OUTLINE in cream and pulled it 3px in from the template's own corner, on the
--- reasoning that the default "glares on the dark well" â€” but there is no dark well any
+-- reasoning that the default "glares on the dark well" — but there is no dark well any
 -- more, and the owner's target is the default numeral he already looks at in 1.x.
 --
 -- We still BIND the region, because the dim cascade has to be able to recede it with the
@@ -1255,18 +1255,18 @@ local function bindCount(button)
 end
 
 -- =====================================================================
--- TEMPLATE-ART KILL-LIST â€” the load-bearing defensive layer
+-- TEMPLATE-ART KILL-LIST — the load-bearing defensive layer
 -- =====================================================================
 -- INSTITUTIONAL LESSON (why the previous single-shot neutralize failed): killing the
 -- template art ONCE at creation is not enough. ContainerFrameItemButtonTemplate /
--- ItemButtonTemplate re-apply their art AFTER creation â€” SetItemButton* helpers, the
+-- ItemButtonTemplate re-apply their art AFTER creation — SetItemButton* helpers, the
 -- template's own OnShow, and quality/new-item update paths re-SHOW NormalTexture /
 -- IconBorder / NewItemTexture and re-start the flash/glow anims. Any build that verifies
 -- the kill only at creation is verifying a state the game overwrites on the owner's screen.
 --
 -- So this is DEFENSIVE BY CONSTRUCTION, three redundant layers:
 --   (1) an EXHAUSTIVE kill sweep (Items._killTemplateArt) that unconditionally hides every
---       art region both templates own and stops the glow anims â€” idempotent, cheap, pure
+--       art region both templates own and stops the glow anims — idempotent, cheap, pure
 --       texture/anim ops;
 --   (2) GLOBAL hooksecurefunc post-hooks on the resurrection helpers (SetItemButtonTexture
 --       / SetItemButtonQuality / SetItemButtonCount) that re-sweep OUR buttons the instant
@@ -1276,26 +1276,26 @@ end
 -- The ONLY visible slot art after this is OURS (well + quality edge + markers + count).
 --
 -- Every entry has a REASON (the owner asked "no blue anywhere"; each is a blue/bright vector):
---   NormalTexture      UI-Quickslot2 bluish-lavender ring â€” empty-cell blue glow (defect #1)
+--   NormalTexture      UI-Quickslot2 bluish-lavender ring — empty-cell blue glow (defect #1)
 --                      + filled-cell blue-purple rim (defect #2). Killed + SetNormalTexture(nil).
 --                      This is the one region 1.x also kills (item.lua:51-52).
---   NewItemTexture     the "new loot" flash sheet (blue/gold burst) â€” our crimson wax dot replaces it.
+--   NewItemTexture     the "new loot" flash sheet (blue/gold burst) — our crimson wax dot replaces it.
 --                      1.x kills this one too (item.lua:49).
---   flashAnim /        AnimationGroups that PULSE NewItemTexture's alpha back up â€” stopped, or
+--   flashAnim /        AnimationGroups that PULSE NewItemTexture's alpha back up — stopped, or
 --   newitemglowAnim    the sheet we just hid re-animates itself bright next frame.
---   BattlepayItemTexture  cash-shop swirl â€” irrelevant in Classic bags, hidden for safety.
+--   BattlepayItemTexture  cash-shop swirl — irrelevant in Classic bags, hidden for safety.
 --                      1.x kills this one too (item.lua:48).
---   UpgradeIcon        green upgrade arrow (may be absent in Classic) â€” off; we don't upsell.
---   IconOverlay(2)     azerite/corruption ring (retail-only; absent in Classic) â€” off if present.
---   SearchOverlay      the template's OWN dark search dim â€” we run our own dim cascade; killing
+--   UpgradeIcon        green upgrade arrow (may be absent in Classic) — off; we don't upsell.
+--   IconOverlay(2)     azerite/corruption ring (retail-only; absent in Classic) — off if present.
+--   SearchOverlay      the template's OWN dark search dim — we run our own dim cascade; killing
 --                      it prevents a double-dark muddy overlay (a "dull" contributor).
---   IconQuestTexture   the template's quest region â€” killed because the sweep re-hides it
+--   IconQuestTexture   the template's quest region — killed because the sweep re-hides it
 --                      on every repaint; we paint the SAME bang art on our own region.
---   Stock              merchant stock count â€” never valid in bags, hidden.
---   Cooldown edge/bling  the cooldown swipe's bright edge ring + finish flash â€” quieted
+--   Stock              merchant stock count — never valid in bags, hidden.
+--   Cooldown edge/bling  the cooldown swipe's bright edge ring + finish flash — quieted
 --                      (SetDrawEdge/SetDrawBling false); the dark swipe itself stays (ours).
 --
--- CELL PARITY â€” TWO REGIONS LEFT THE KILL LIST, because 1.x DRIVES them rather than killing
+-- CELL PARITY — TWO REGIONS LEFT THE KILL LIST, because 1.x DRIVES them rather than killing
 -- them, and both are load-bearing for the look the owner is comparing against:
 --   IconBorder   1.x re-tints it to the glow colour and shows it on exactly the glowing
 --                cells (item.lua:194/210/220). It is the crisp ring that anchors the soft
@@ -1305,7 +1305,7 @@ end
 --                full-saturation ring survives a repaint.
 --   JunkIcon     1.x shows the vendor coin on poor items that have value (item.lua:222) and
 --                keeps the icon in FULL COLOUR. 2.0 used to kill the coin and greyscale the
---                icon instead â€” a third of a Classic bag rendered in greyscale, which is the
+--                icon instead — a third of a Classic bag rendered in greyscale, which is the
 --                "hard to view" half of the owner's report. Owned by Items._applyDress.
 -- Both are still SWEPT on the paths that can resurrect them out of band (the OnShow hook
 -- and the SetItemButton* post-hooks run the sweep, then our paint re-asserts the state), so
@@ -1314,7 +1314,7 @@ end
 -- SECURE / TAINT: every op here is a texture/animation op on a CHILD region of the button
 -- (SetTexture / SetAlpha / Hide / anim:Stop / Cooldown:SetDrawEdge). NONE is a protected op
 -- on the secure button itself (no Show/Hide/SetPoint/SetID/SetParent/SetAttribute on the
--- button), so the whole sweep is combat-safe and taint-free â€” it can run on every paint and
+-- button), so the whole sweep is combat-safe and taint-free — it can run on every paint and
 -- inside the hooksecurefunc post-hooks without touching the secure click path.
 -- Guard-free of the WoW API (resolves regions via the accessors/$parent names the templates
 -- expose) so the harness drives it headless with a fake button.
@@ -1360,7 +1360,7 @@ function Items._killTemplateArt(button)
     if button.SetNormalTexture then pcall(button.SetNormalTexture, button, nil) end
     button._dsSlotArtHidden = nt   -- back-compat marker
 
-    -- CELL PARITY: IconBorder and JunkIcon are NOT killed any more â€” 1.x drives both (see
+    -- CELL PARITY: IconBorder and JunkIcon are NOT killed any more — 1.x drives both (see
     -- the block above). They are owned by borders.SetIconBorder / Items._applyDress, which
     -- re-assert their state on every paint and on every resurrection path.
 
@@ -1395,7 +1395,7 @@ Items._neutralizeSlotArt = Items._killTemplateArt
 -- CELL PARITY, layer 2b: re-assert the two template regions we now OWN rather than kill.
 -- The kill sweep can no longer hide IconBorder / JunkIcon (1.x shows both), so every path
 -- that runs the sweep because the template may have just resurrected art must also re-put
--- OUR verdict back on those two. Reads only cached button state â€” it never calls
+-- OUR verdict back on those two. Reads only cached button state — it never calls
 -- SetItemButton*, so it cannot re-enter the post-hooks that invoke it.
 function Items._reassertOwnedArt(button)
     if not (button and button._dsDressed) then return end
@@ -1420,7 +1420,7 @@ end
 -- GATE HELPER: does the art registry report every killed region hidden? True iff every
 -- recorded region has alpha 0 OR is not shown. The kill-list presence test drives a
 -- SetItemButtonQuality-style resurrection (re-show the regions), fires the re-kill, and
--- asserts this returns true â€” proving the DEFENSIVE re-kill, not just the creation kill.
+-- asserts this returns true — proving the DEFENSIVE re-kill, not just the creation kill.
 function Items.ArtRegistryHidden(button)
     local reg = button and button._dsArt
     if not reg then return true end
@@ -1435,7 +1435,7 @@ end
 -- Restyle the KEPT click feedback (hover highlight + pressed) to a quiet token wash so we
 -- keep the tactile feedback without the template's bluish default highlight. In-game only
 -- (SetHighlightTexture/SetPushedTexture are button methods). Non-secure texture setup at
--- creation â€” not a protected op.
+-- creation — not a protected op.
 local function restyleFeedback(button)
     if button.SetHighlightTexture then
         local hl = button:CreateTexture(nil, "HIGHLIGHT")
@@ -1462,7 +1462,7 @@ end
 -- Install the GLOBAL defensive re-kill hooks ONCE. hooksecurefunc post-hooks run AFTER the
 -- game's own helper, so the instant the template re-applies art (icon/quality/count update)
 -- we re-sweep. The hooks are global (these helpers are global), but each body no-ops unless
--- the button is one of OURS (marked _dsDressed) â€” a single cheap identity check; foreign item
+-- the button is one of OURS (marked _dsDressed) — a single cheap identity check; foreign item
 -- buttons (bank/merchant/etc.) are untouched. hooksecurefunc is the sanctioned non-tainting
 -- hook; the bodies do only child-texture ops, so no taint reaches the secure click path.
 local function installArtHooks()
@@ -1482,12 +1482,12 @@ local function installArtHooks()
         end)
     end
     -- The SetItemButtonCount hook is GONE: the numeral is the template's own again
-    -- (CELL PARITY â€” 1.x never restyles it), so there is nothing to re-assert.
+    -- (CELL PARITY — 1.x never restyles it), so there is nothing to re-assert.
     Items._artHooksInstalled = true
 end
 Items._installArtHooks = installArtHooks
 
--- THE WELL IS RETIRED â€” see the CELL SUBSTRATE block at the top of this file and the
+-- THE WELL IS RETIRED — see the CELL SUBSTRATE block at the top of this file and the
 -- superseding note in borders.lua. 1.x paints NO cell substrate FILL in any state; the icon
 -- region is the substrate, carrying the item's icon when filled and the chosen slot-
 -- background art when empty. setWellState is gone with it; paintButton drives the icon
@@ -1497,13 +1497,13 @@ Items._installArtHooks = installArtHooks
 -- EMPTY-CELL ICON (1.x item.lua:156-166). `bg` is a texture path OR an atlas descriptor;
 -- 1.x branches on `type(bg) == 'function'` for exactly this reason (its atlas entries are
 -- functions calling icon:SetAtlas). Enum 1 ("None") clears the icon entirely, which is what
--- 1.x's nil Backgrounds[1] does in Era. Never a protected op â€” a texture set on a child.
+-- 1.x's nil Backgrounds[1] does in Era. Never a protected op — a texture set on a child.
 local function paintEmptyIcon(button)
     local art = Items.SlotBackgroundArt(Items.SlotBackground())
     local tex = iconOf(button)
     if type(art) == "table" and art.atlas then
         -- 1.x clears the texture FIRST, then applies the atlas (item.lua:159-160). An atlas
-        -- the client does not ship simply leaves the region blank â€” which is precisely what
+        -- the client does not ship simply leaves the region blank — which is precisely what
         -- 1.x renders in that case too, so the fallback IS the parity behaviour.
         if tex then
             if tex.SetTexture then tex:SetTexture(nil) end
@@ -1524,15 +1524,15 @@ local function paintEmptyIcon(button)
     if tex and tex.SetTexture then tex:SetTexture(nil) end
 end
 
--- PER-CELL SLOT BORDER â€” 1.x's `SlotBorder` (item.lua:65-71), driven exactly as 1.x drives
+-- PER-CELL SLOT BORDER — 1.x's `SlotBorder` (item.lua:65-71), driven exactly as 1.x drives
 -- it (item.lua:171-174): a 2px edge around EVERY cell, filled or empty, in the profile's
 -- slotBorderColor. 1.x ships it invisible (alpha 0); the owner deliberately set a near-black
--- maroon at 59% and asked for it back â€” it is what makes his grid read as "darkened,
+-- maroon at 59% and asked for it back — it is what makes his grid read as "darkened,
 -- slightly opaque" and is the reason the pre-parity 2.0 grid felt bare by comparison.
 --
 -- Implemented on borders.lua's SHARED snapped-outline factory rather than a BackdropTemplate
 -- so the edge stays a true 2 physical pixels at any UI scale (a fractional-scale backdrop
--- edgeSize half-samples into a fuzzy rim at 720p â€” the reason that factory exists).
+-- edgeSize half-samples into a fuzzy rim at 720p — the reason that factory exists).
 local function ensureSlotBorder(button)
     if button._dsSlotBorder then return button._dsSlotBorder end
     if not (ns.Borders and ns.Borders.NewSnappedOutline) then return nil end
@@ -1558,11 +1558,11 @@ local function applySlotBorder(button)
 end
 Items._applySlotBorder = applySlotBorder
 
--- PURE: the CELL border-presence matrix (1.0 parity â€” NO universal neutral ring). 1.x shows
+-- PURE: the CELL border-presence matrix (1.0 parity — NO universal neutral ring). 1.x shows
 -- no border on common/poor items or empties; a cell gets a ring ONLY for the quest gold
 -- (which wins outright), the unusable red, the equipment-set teal, or a qualifying quality
 -- edge (uncommon+, per minQuality). The order is 1.x's UpdateBorder branch chain
--- (item.lua:197-205) â€” quest > unusable > set > quality. Mirrors borders.ResolveTint so the
+-- (item.lua:197-205) — quest > unusable > set > quality. Mirrors borders.ResolveTint so the
 -- two never disagree.
 -- Returns "quest" | "unusable" | "set" | "quality" | "none".
 function Items.CellBorderKind(quality, unusable, enabled, minQuality, quest, set)
@@ -1578,9 +1578,9 @@ end
 -- spec's theme token, clipped to the shipped round stencil so it reads as a DOT and not a
 -- box. Mirrors the suite's mask primitive (Daseeki-Core ledgerkit UI.MaskTexture: a
 -- CreateMaskTexture host + AddMaskTexture, CLAMPTOBLACKADDITIVE both axes so everything
--- outside the stencil is clipped) but implemented locally â€” Core is OptionalDeps and a
+-- outside the stencil is clipped) but implemented locally — Core is OptionalDeps and a
 -- core visual must not depend on it. `host` is the frame that owns the mask (masks are
--- frame-level objects); when masking is unavailable the pip simply stays a square â€” the
+-- frame-level objects); when masking is unavailable the pip simply stays a square — the
 -- old look, never an invisible marker.
 local function paintPip(tex, host, art)
     if tex.SetTexture then tex:SetTexture(art.texture) end
@@ -1594,8 +1594,8 @@ local function paintPip(tex, host, art)
 end
 
 -- Build the per-slot dress ONCE, at button creation (out of combat, gated by the
--- combat-deferred layout). After the CELL-PARITY round that is TWO regions â€” the round
--- new-item wax dot and the quest bang glyph â€” plus a binding of the template's own count
+-- combat-deferred layout). After the CELL-PARITY round that is TWO regions — the round
+-- new-item wax dot and the quest bang glyph — plus a binding of the template's own count
 -- numeral so the dim cascade can reach it. There is no well, no hairline and no set pip:
 -- 1.x draws none of them, and the icon region is the whole cell substrate. All children are
 -- non-secure; nothing here (or at runtime) is a protected op on the button. Also installs
@@ -1609,14 +1609,14 @@ local function ensureDress(button)
     installArtHooks()
     restyleFeedback(button)
 
-    -- CELL PARITY: NO WELL. 1.x draws no cell substrate FILL in any state â€” the icon region
+    -- CELL PARITY: NO WELL. 1.x draws no cell substrate FILL in any state — the icon region
     -- IS the substrate (item's icon when filled, the chosen slot-background art when empty),
     -- and nothing else COVERS the cell's footprint. The `inset`/`raised` colour rect that
     -- used to live here, inset 1px inside every button, is what turned the grid into a
     -- lattice of hard-edged squares with a visible gutter; it is gone, not tuned.
     button._dsDressed = true
 
-    -- 1.x SLOT BORDER â€” the one cell-footprint element 1.x DOES create for every cell
+    -- 1.x SLOT BORDER — the one cell-footprint element 1.x DOES create for every cell
     -- (item.lua:65-71) and colours on every update (item.lua:171-174). The previous round
     -- omitted it because 1.x's shipped default makes it invisible (alpha 0); the owner's
     -- profile does not, and the cue is his deliberate design. Created once, here.
@@ -1638,7 +1638,7 @@ local function ensureDress(button)
     dot:Hide()
     button._dsNewDot = dot
 
-    -- QUEST bang glyph, over the cell â€” the real 1.x marker (item.lua:47 paints the
+    -- QUEST bang glyph, over the cell — the real 1.x marker (item.lua:47 paints the
     -- template's IconQuestTexture with TEXTURE_ITEM_QUEST_BANG). Ours is an addon-owned
     -- OVERLAY region on the same footprint, because _killTemplateArt permanently hides
     -- the native one. No token tint: the bang keeps its own gold, exactly as in 1.0.
@@ -1653,7 +1653,7 @@ local function ensureDress(button)
     -- CELL PARITY: NO equipment-set corner pip. 1.x expresses set membership through the
     -- glow chain (item.lua:201-202, teal .2/1/.8), not as a second mark on the cell. The
     -- bronze pip that used to be created here is retired; borders.ResolveTint carries the
-    -- cue now, gated by the same db.setMarkers toggle â€” which is DEFAULT OFF, because 1.x
+    -- cue now, gated by the same db.setMarkers toggle — which is DEFAULT OFF, because 1.x
     -- cannot draw the cue at all on Classic Era with ItemRack disabled (see slotIsSet).
 
     bindCount(button)
@@ -1663,13 +1663,13 @@ Items._ensureDress = ensureDress
 local function paintButton(button)
     -- DEFENSIVE re-kill sweep (layer 3): our own paint calls SetItemButton* below, which are
     -- the template's art-resurrection helpers. Sweeping first makes a repaint idempotent w.r.t.
-    -- template art â€” no resurrected blue can survive a paint even if a hook is somehow missed.
+    -- template art — no resurrected blue can survive a paint even if a hook is somehow missed.
     Items._killTemplateArt(button)
 
     local data = button._data
     if not data or not data.id then
         -- CELL PARITY (1.x item.lua:156-167): an EMPTY slot is the CHOSEN slot-background
-        -- art in the icon region, at slotAlpha â€” not a blank icon over a colour rect, and
+        -- art in the icon region, at slotAlpha — not a blank icon over a colour rect, and
         -- not the bevelled backpack art at full opacity. The owner's profile selects the
         -- faction crest at 29%; applyDressState below applies the alpha.
         paintEmptyIcon(button)
@@ -1698,7 +1698,7 @@ local function paintButton(button)
 
     local quality = visual and visual.quality
     -- CELL PARITY (1.x item.lua:194): hand the quality to the TEMPLATE first, exactly as 1.x
-    -- does, so Blizzard sets the IconBorder region's own art from its own tables â€” we never
+    -- does, so Blizzard sets the IconBorder region's own art from its own tables — we never
     -- guess a texture path. borders.Apply immediately below overrides colour + shown, which
     -- is precisely 1.x's item.lua:210/220 sequence.
     if _G.SetItemButtonQuality then
@@ -1706,7 +1706,7 @@ local function paintButton(button)
     end
 
     -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > SET teal > quality edge.
-    -- A quest item (starter or objective) draws the gold tint â€” 1.x's first branch. An
+    -- A quest item (starter or objective) draws the gold tint — 1.x's first branch. An
     -- UNUSABLE (class-can't-equip / below-level) item draws the red. A saved-set member draws
     -- the teal. All are computed once here (live only) and cached on the button so
     -- applyDressState and the re-assert path reuse them without a second scan; the bang
@@ -1796,7 +1796,7 @@ function Items.CreateButton(parent, opts)
         -- LIVE keeps the template's own OnClick/OnDragStart/OnReceiveDrag/OnEnter handlers
         -- (secure, combat-correct pickup/place/split/use + real-slot tooltip) untouched.
         -- An INSECURE OnEnter post-hook clears the new-item mark on hover (1.x MarkSeen
-        -- fact) â€” a non-secure hook that never touches the secure click path.
+        -- fact) — a non-secure hook that never touches the secure click path.
         if button.HookScript then
             button:HookScript("OnEnter", function(self) Items.MarkSeen(self) end)
         end
@@ -1879,7 +1879,7 @@ local function layoutGroup(G, entries)
     entries = entries or {}
     local n = #entries
 
-    -- Secure item buttons are protected frames â€” never create/reparent them in combat.
+    -- Secure item buttons are protected frames — never create/reparent them in combat.
     -- Defer the whole relayout to PLAYER_REGEN_ENABLED (repaint of existing buttons is
     -- safe, but a structural rebuild is not, so we defer wholesale for simplicity).
     if _G.InCombatLockdown and _G.InCombatLockdown() then
@@ -2161,7 +2161,7 @@ local function testCellClamp(fails)
 end
 
 -- STATE-marker precedence matrix (Layer 2). Verifies the icon precedence
---   dimmed > junk > normal   (1.0: unusable no longer greys the icon â€” it flags redBorder)
+--   dimmed > junk > normal   (1.0: unusable no longer greys the icon — it flags redBorder)
 -- and that markers / the red border show only when NOT dimmed.
 local function testStatePrecedence(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -2173,7 +2173,7 @@ local function testStatePrecedence(fails)
     ck(s.showNewDot == false and s.showQuestTab == false and s.showSetMark == false, "normal -> no markers")
     ck(s.dressAlpha == 1.0, "normal -> full dress alpha")
 
-    -- CELL PARITY â€” junk (quality 0): FULL-COLOUR icon + the template's vendor coin, exactly
+    -- CELL PARITY — junk (quality 0): FULL-COLOUR icon + the template's vendor coin, exactly
     -- as 1.x (item.lua:170 restores vertex colour; :222 shows JunkIcon). The greyscale junk
     -- treatment is retired: it washed out a third of a Classic bag.
     local j = Items.ResolveState({ quality = 0 })
@@ -2195,7 +2195,7 @@ local function testStatePrecedence(fails)
     ck(uj.icon == "normal" and uj.junkCoin == true and uj.redBorder == true,
         "unusable junk -> full-colour icon + coin + red border")
 
-    -- CELL PARITY â€” the SET cue is a BORDER now, not a corner pip (1.x item.lua:201-202).
+    -- CELL PARITY — the SET cue is a BORDER now, not a corner pip (1.x item.lua:201-202).
     local m = Items.ResolveState({ quality = 3, isNew = true, isQuestStarter = true, isSet = true, isUnusable = true })
     ck(m.showNewDot == true and m.showQuestTab == true, "new + quest-starter markers still show")
     ck(m.showSetMark == false, "the bronze set pip is retired (regression lock)")
@@ -2247,7 +2247,7 @@ end
 -- 1.x QUEST RULE (Items.QuestFlags): the exact field mechanism that separates a quest
 -- STARTER (bang glyph) from an ordinary quest item (gold border tint only). 1.x fact:
 --   Item:GetQuestInfo -> info.isQuestItem, (info.questID and not info.isActive)
--- so the starter test is questID-present AND not-active â€” NOT isQuestItem.
+-- so the starter test is questID-present AND not-active — NOT isQuestItem.
 local function testQuestFlags(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local function flags(info) local q, s = Items.QuestFlags(info); return q, s end
@@ -2328,7 +2328,7 @@ local function testDimCascade(fails)
     ns.Borders.SetAlpha(b3, 0.3)
     ck(b3._dsBagsBorder.alpha == 0.3, "Borders.SetAlpha recedes the quality edge container")
 
-    -- CELL PARITY: the JUNK COIN cascades too â€” shown at the dress alpha on a poor item that
+    -- CELL PARITY: the JUNK COIN cascades too — shown at the dress alpha on a poor item that
     -- has value, hidden otherwise, and never resurrected on a dimmed cell.
     local coin = recorder(); coin.shown = false
     local btn4 = { icon = recorder(), JunkIcon = coin }
@@ -2344,7 +2344,7 @@ end
 -- rimmed" half of #2). The item-button templates ship a UI-Quickslot2 NormalTexture (a
 -- bright bluish ring) that drew over our dark well. _neutralizeSlotArt must clear it (and
 -- the native IconBorder) to invisible. Driven headless with a fake button exposing the
--- same accessors the real templates do â€” no CreateFrame needed.
+-- same accessors the real templates do — no CreateFrame needed.
 local function testSlotArtNeutralized(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -2392,7 +2392,7 @@ local function testSlotArtNeutralized(fails)
     ck(Items._neutralizeSlotArt(nil) == nil, "nil button -> safe no-op")
 end
 
--- KILL-LIST PRESENCE GATE â€” proves the DEFENSIVE re-kill, not just the creation kill.
+-- KILL-LIST PRESENCE GATE — proves the DEFENSIVE re-kill, not just the creation kill.
 -- Builds a fake button with every art region VISIBLE, kills once, then simulates the
 -- template's SetItemButtonQuality/OnShow resurrection (re-showing NormalTexture / IconBorder
 -- / NewItemTexture and restarting the glow anim), runs the re-kill the hooks + paint sweep
@@ -2497,7 +2497,7 @@ local function testClickIdentityMatrix(fails)
         return seen
     end
 
-    -- COMBINED-FLAT: positions map to (cid,slot) â€” backpack 1..4, then bag 1..3, then bank 1..2.
+    -- COMBINED-FLAT: positions map to (cid,slot) — backpack 1..4, then bag 1..3, then bank 1..2.
     local flat = Items.BuildEntries(o, { scope = "all" })
     ck(#flat == 4 + 3 + 2, "combined flatten covers every slot of every container")
     assertBijection(flat, "combined")
@@ -2516,7 +2516,7 @@ local function testClickIdentityMatrix(fails)
     end
 
     -- CATEGORIES (mixed-cid section): a category = a saved query, so its section mixes bags.
-    -- Every entry must keep its ORIGINAL (cid,slot) â€” mixed cids allowed â€” and the section's
+    -- Every entry must keep its ORIGINAL (cid,slot) — mixed cids allowed — and the section's
     -- pairs must equal the occupied source slots exactly (no repaint over a stale pair).
     local filled = {}
     for _, e in ipairs(flat) do if e.data then filled[#filled + 1] = e end end
@@ -2525,7 +2525,7 @@ local function testClickIdentityMatrix(fails)
         "mixed-cid section spans all bags with the exact source (cid,slot) pairs")
 
     -- RE-BUCKET STABILITY: a reorder / search pass reuses pooled buttons. Position i must ALWAYS
-    -- rebind to entries[i]'s own (cid,slot) â€” never inherit a stale pair from its prior tenant.
+    -- rebind to entries[i]'s own (cid,slot) — never inherit a stale pair from its prior tenant.
     local flat2 = Items.BuildEntries(o, { scope = "all" })
     for i = 1, #flat2 do
         ck(flat2[i].cid == flat[i].cid and flat2[i].slot == flat[i].slot,
@@ -2547,7 +2547,7 @@ local function testClickIdentityMatrix(fails)
     ck(recorded.shown == true, "_setSlot shows the freshly-bound button")
 end
 
--- CLASS PROFICIENCY MATRIX (Task 1 â€” the grey-wash fix). Locks the real Era rule
+-- CLASS PROFICIENCY MATRIX (Task 1 — the grey-wash fix). Locks the real Era rule
 -- (Unfit parity) that ONLY class-unequippable weapon/armor washes, and that
 -- consumables / non-gear never do. This is the regression guard for "IsUsableItem
 -- greyed everything".
@@ -2650,7 +2650,7 @@ local function testDaseekiCellVsQualityEdge(fails)
     -- Unusable pure-red vs Legendary orange: the unusable cue never reads as legendary.
     ck(dist({ B.UnusableRGB() }, { B.QualityRGB(5) }) >= 0.30, "unusable red distinguishable from Legendary orange")
     -- 1.0 clean-cell invariant: a cell carries a border ONLY at uncommon+ (quality) or when
-    -- unusable â€” common/poor/empty draw NO ring at all (the neutral hairline was removed).
+    -- unusable — common/poor/empty draw NO ring at all (the neutral hairline was removed).
     ck(B.ShouldShow(2, true) == true and B.ShouldShow(1, true) == false,
         "border only at uncommon+ (common/poor draw no ring â€” 1.0 clean cell)")
 end
@@ -2659,7 +2659,7 @@ end
 -- Common/poor/empty draw NO ring (the universal neutral hairline is gone); uncommon+ get the
 -- quality edge; unusable gets red (winning over quality); a QUEST item gets the gold tint,
 -- which is 1.x's first branch and wins over both; borders-off draws nothing. This is the
--- styling the KEYRING keys inherit too â€” keys are common quality, so they render as clean
+-- styling the KEYRING keys inherit too — keys are common quality, so they render as clean
 -- dark cells like 1.x.
 local function testCellBorderMatrix(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -2695,7 +2695,7 @@ local function testCellBorderMatrix(fails)
     ck(K(4, false, false, 2, true) == "none", "borders off -> quest draws no ring either")
 
     -- The 1.x quest gold itself: (1, .82, .2), read as fact from 1.x's UpdateBorder. It is
-    -- deliberately NOT NORMAL_FONT_COLOR (1, .82, 0) â€” the blue channel is .2.
+    -- deliberately NOT NORMAL_FONT_COLOR (1, .82, 0) — the blue channel is .2.
     local r, g, b = ns.Borders.QuestRGB()
     ck(r == 1 and g == 0.82 and b == 0.2, "quest gold is exactly 1, .82, .2 (1.x fact)")
     -- ...and it stays distinguishable from the unusable red on the same cell edge.
@@ -2706,7 +2706,7 @@ local function testCellBorderMatrix(fails)
     -- CROSS-CHECK against borders.lua's ResolveTint, which is the single decision the halo
     -- AND the well yield both key off. "This cell carries a ring" and "this cell glows" must
     -- be the same predicate, or a cell could suppress its well without glowing (or glow with
-    -- its grey well still up â€” the defect this lock exists to prevent).
+    -- its grey well still up — the defect this lock exists to prevent).
     -- case = { quality, unusable, enabled, minQuality, quest, set }
     for _, c in ipairs({
         { nil, false, true, 2, false, false }, { 0, false, true, 2, false, false },
@@ -2728,7 +2728,7 @@ local function testCellBorderMatrix(fails)
 end
 
 -- RUN SPLIT (1.0 keyring row-break). The defect: the keyring began at flat index
--- (Î£ bag slots)+1 and therefore at column (Î£ bag slots) % columns â€” mid-row, "floating".
+-- (Σ bag slots)+1 and therefore at column (Σ bag slots) % columns — mid-row, "floating".
 -- The fix breaks the row at the generic->keyring family boundary. These cases pin the
 -- exact geometry at the owner's real 11-column config.
 local function testRunSplit(fails)
@@ -2772,7 +2772,7 @@ local function testRunSplit(fails)
     local x37, y37 = Items.RunSlotPosition(L, 37, COLS, SZ, GAP)
     ck(x37 == 0, "FIRST KEY starts at column 0 (1.0 row break), got x=" .. x37)
     ck(y37 == -(4 * PITCH + RG), "first key drops a full row + RUN_GAP below the bags")
-    -- flat math would have put it mid-row â€” the regression guard
+    -- flat math would have put it mid-row — the regression guard
     local fx = Items.SlotPosition(37, COLS, SZ, GAP)
     ck(fx == 3 * PITCH and x37 ~= fx, "the OLD flat flow put key 1 at column 3 (the defect)")
     -- the rest of the keyring flows normally inside its own run
@@ -2799,7 +2799,7 @@ local function testRunSplit(fails)
     ck(kOnly.runs[1].y == 0, "keyring-only view starts at the top (no leading break)")
 end
 
--- MARKER ART (defect #2). The markers were literal SetColorTexture squares â€” an amber box
+-- MARKER ART (defect #2). The markers were literal SetColorTexture squares — an amber box
 -- where 1.0 shows the quest bang. This locks the ART CONTRACT: every marker names a real
 -- texture, the quest marker is the native bang glyph 1.x uses, and the token pips carry a
 -- shape mask so they render round. Also guards the Core-less white-square token gap.
@@ -2850,13 +2850,13 @@ local function testMarkerArt(fails)
     _G.DaseekiUI = savedUI
 end
 
--- EQUIPMENT-SET MEMBERSHIP â€” the predicate behind the teal regression. Driven against
+-- EQUIPMENT-SET MEMBERSHIP — the predicate behind the teal regression. Driven against
 -- REAL Daseeki-Armory shapes (core.lua:59 / sets.lua:143-149), including the malformed
 -- ones a foreign SavedVariables file can legitimately hand us.
 local function testSetMembership(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
-    -- An Armory db with two sets. `equip` is keyed BY SLOT ID, not a list â€” reading it as
+    -- An Armory db with two sets. `equip` is keyed BY SLOT ID, not a list — reading it as
     -- a list, or testing "does any set data exist", is the class of bug this guards.
     local armory = {
         sets = {
@@ -2914,7 +2914,7 @@ local function testSetMembership(fails)
     ck(broken(armory, 19341) ~= Items.ArmoryNamesItem(armory, 19341),
         "MUTATION: â€¦and on an item parked in a disabled slot")
 
-    -- 1.x's EQUIPPABLE gate (ItemSearch-1.3/API.lua:115/130) â€” a gear set can only ever
+    -- 1.x's EQUIPPABLE gate (ItemSearch-1.3/API.lua:115/130) — a gear set can only ever
     -- contain something that goes on the character.
     ck(Items.IsEquippableLoc("INVTYPE_HEAD") == true, "an equip location is equippable")
     ck(Items.IsEquippableLoc("") == false, "no equip location (a consumable) is not")
@@ -2937,7 +2937,7 @@ local function testSetMembership(fails)
     end
 end
 
--- SLOT SUBSTRATE â€” the owner's three profile values and their SCOPE.
+-- SLOT SUBSTRATE — the owner's three profile values and their SCOPE.
 local function testSlotSubstrate(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local savedDb = ns.Store and ns.Store.db
