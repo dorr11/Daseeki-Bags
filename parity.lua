@@ -266,13 +266,18 @@ function Parity.TwoOhElementCount(ctx)
     -- the set cue only reaches the chain when the (default-OFF) toggle is on, exactly as
     -- 1.x's only reaches it when ItemSearch bound BelongsToSet to something real
     local setLive = ctx.isSet and Items.SetCueEnabled()
+    -- The NEW-ITEM cue is a BRANCH of this same chain now (crimson + pulse), not a corner
+    -- element — so a new item adds NO element to the cell, it only changes which colour the
+    -- halo already there is painted. That is what closes the last knowing divergence from
+    -- 1.x's element count.
     local glows = B.GlowShown(ctx.quality, ctx.isUnusable,
-        (ctx.isQuest or ctx.isQuestStarter), setLive, true, B.DEFAULT_MIN_QUALITY)
+        (ctx.isQuest or ctx.isQuestStarter), setLive, true, B.DEFAULT_MIN_QUALITY,
+        nil, ctx.isNew)
     if ctx.dimmed then glows = false end
     if glows then n = n + 2 end        -- halo + template IconBorder (borders.Apply)
     if spec.showQuestTab then n = n + 1 end
     if spec.junkCoin      then n = n + 1 end
-    if spec.showNewDot    then n = n + 1 end   -- the ONE knowing divergence from 1.x
+    if spec.showNewDot    then n = n + 1 end   -- retired (was the wax dot); must never fire
     if spec.showSetMark   then n = n + 1 end   -- retired; must never fire
     return n
 end
@@ -481,15 +486,21 @@ local function testCellComposition(fails)
     -- SEARCH DIM.
     ck(Items.DressAlpha(true) == X.DIM_ALPHA, "dim alpha == 1.x item.lua:233 (0.3)")
 
-    -- CORNER PIPS. 1.x draws none. 2.0 keeps exactly ONE knowingly-divergent mark (the
-    -- new-item wax dot, an owner-requested 2.0 feature 1.x has no counterpart for — 1.x
-    -- hides NewItemTexture outright at item.lua:49). The equipment-set pip is retired
-    -- because 1.x DOES have a counterpart for it and it is a glow branch, not a mark.
+    -- CORNER PIPS. 1.x draws none, and 2.0 now draws none either — this row used to record
+    -- ONE knowing divergence (the crimson new-item wax dot) and no longer does. The dot is
+    -- retired in favour of a crimson BRANCH of the glow chain plus a slow pulse, which is
+    -- 1.x's own model (one cue per cell, expressed as a branch) applied to a fact 1.x had no
+    -- cue for at all. See borders.lua's NEW-ITEM ARCHAEOLOGY block for the evidence that
+    -- 1.x genuinely had no new-item treatment: item.lua:49 hides NewItemTexture outright and
+    -- the glow chain at :196-205 has no `new` branch and no `glowNew` setting behind it.
     ck(X.CORNER_PIPS == 0 and X.NEWITEM_KILLED == true, "1.x model: no corner pips at all")
     ck(Items.MarkerArt("set") == nil, "2.0: the set pip is retired (1.x makes it a teal glow)")
-    ck(Items.MarkerArt("new") ~= nil, "2.0: the new-item dot is the ONE knowing divergence")
+    ck(Items.MarkerArt("new") == nil, "2.0: the new-item wax dot is retired (now a glow branch)")
+    ck(Items.MarkerArt("quest") ~= nil, "…and the quest bang glyph, which 1.x DOES draw, stays")
     ck(Items.ResolveState({ quality = 3, isSet = true }).showSetMark == false,
         "…and no state can turn the set pip back on")
+    ck(Items.ResolveState({ quality = 3, isNew = true, filled = true }).showNewDot == false,
+        "…and no state can turn the new-item dot back on")
 
     -- THE COUNT. This is the single number the owner's "cluttered" verdict reduces to:
     -- how many distinct things are drawn on ONE cell. Derived from the LIVE 2.0 model, not
@@ -515,11 +526,36 @@ local function testCellComposition(fails)
         == Parity.TwoOhElementCount(ctxOf(3)),
         "…so a RARE set member draws the same cell as a rare non-member")
 
-    -- The ONE row where the two models are knowingly allowed to differ, by exactly one:
-    -- the new-item wax dot, which 1.x does not have at all (it hides NewItemTexture).
+    -- NEW ITEM: the row that used to carry the single knowing divergence. It is now ZERO
+    -- extra elements — a new COMMON item draws icon + slot border + halo + ring, which is
+    -- two MORE than 1.x's bare common cell only because 1.x would not glow a common at all.
+    -- The pin that matters is that 2.0 adds no ELEMENT for newness beyond the halo/ring pair
+    -- the glow chain already owns: a new cell and a rare cell draw the same COUNT.
     local newCtx = ctxOf(1, { isNew = true })
-    ck(Parity.TwoOhElementCount(newCtx) - Parity.OneXElementCount(newCtx) == 1,
-        "NEW item: 2.0 draws exactly ONE more element than 1.x (the wax dot — owner feature)")
+    ck(Parity.TwoOhElementCount(newCtx) == Parity.TwoOhElementCount(ctxOf(3)),
+        "NEW item: same element count as any other glowing cell — the cue is the tint, not a mark")
+    ck(Parity.TwoOhElementCount(ctxOf(3, { isNew = true }))
+        == Parity.TwoOhElementCount(ctxOf(3)),
+        "…and a new RARE adds nothing over a plain rare (it only recolours the halo)")
+    -- PRECEDENCE: new sits above rarity and below the three item-facts.
+    local nr = { B.NewRGB() }
+    ck(nr[1] and nr[1] > nr[2] and nr[1] > nr[3], "the new-item tint is the brand crimson")
+    local MIN = B.DEFAULT_MIN_QUALITY
+    ck(select(1, B.ResolveTint(4, false, false, false, true, MIN, nil, true)) == nr[1],
+        "new beats RARITY (a new epic glows crimson, not purple)")
+    ck(select(1, B.ResolveTint(4, false, true, false, true, MIN, nil, true)) == select(1, B.QuestRGB()),
+        "…but quest gold still beats new")
+    ck(select(1, B.ResolveTint(4, true, false, false, true, MIN, nil, true)) == select(1, B.UnusableRGB()),
+        "…and unusable red still beats new, so crimson only ever marks a USABLE item")
+    ck(B.GlowShown(1, false, false, false, true, MIN, nil, true) == true,
+        "a new COMMON glows even though its rarity is below the floor")
+    ck(B.GlowShown(1, false, false, false, true, MIN, nil, false) == false,
+        "…and stops the moment it is no longer new")
+    -- The pulse is real and subtle (a slow breathe, not 1.x's FlashFind strobe).
+    ck(B.PULSE_DURATION and B.PULSE_DURATION >= 0.5,
+        "the new-item pulse is slow (>=0.5s per half-cycle), not a strobe")
+    ck(B.PULSE_MIN and B.PULSE_MIN > 0.25 and B.PULSE_MIN < B.PULSE_MAX,
+        "…and shallow: it never fades the halo out, it breathes it")
 end
 
 -- MUTATION TESTS. A parity suite that cannot fail is worthless. These flip a row of the

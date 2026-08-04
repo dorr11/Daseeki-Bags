@@ -255,13 +255,16 @@ function Items.MarkerArt(kind)
         -- footprint = the native IconQuestTexture geometry 1.x paints.
         return { texture = Items.QuestBangTexture(), mask = nil, token = nil,
                  sizeRatio = 1, anchor = "CELL", glyph = true }
-    elseif kind == "new" then
-        return { texture = Items.TEX_WHITE, mask = Items.TEX_DOT_MASK, token = "brand",
-                 sizeRatio = 0.24, anchor = "TOPRIGHT", glyph = false }
     end
-    -- CELL PARITY: the "set" pip spec is RETIRED. 1.x expresses equipment-set membership as
-    -- a teal branch of the glow chain (item.lua:201-202), not as a corner mark, so there is
-    -- no art to declare. Borders.SetRGB carries the cue.
+    -- CELL PARITY: the "set" AND "new" pip specs are both RETIRED, for the same reason.
+    -- 1.x draws exactly ONE cue per cell — the halo — and expresses every per-item fact as
+    -- a BRANCH of that one chain (item.lua:196-205). Equipment-set membership is its teal
+    -- branch (Borders.SetRGB); the new-item cue is now a crimson branch plus a slow pulse
+    -- (Borders.NewRGB / Borders.PULSE_*, and see borders.lua's NEW-ITEM ARCHAEOLOGY block
+    -- for why that branch is new design rather than transcription). Neither has corner art
+    -- any more, so there is nothing to declare here. art/dot-mask.tga stays on disk — the
+    -- shipped stencil is still referenced by Items.TEX_DOT_MASK for any future pip — but no
+    -- caller asks MarkerArt for one.
     return nil
 end
 
@@ -556,9 +559,10 @@ end
 -- edge; redBorder is therefore suppressed on a quest cell so the two never fight.
 --   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>,
 --           isQuestStarter=<bool>, isUnusable=<bool>, isSet=<bool> }
--- returns { icon, iconDesat, redBorder, questBorder, setBorder, junkCoin, unusableTint,
---           showNewDot, showQuestTab, showSetMark, dressAlpha }.
--- `showSetMark` is retained at `false` for back-compat readers; the set cue is `setBorder`.
+-- returns { icon, iconDesat, redBorder, questBorder, setBorder, newBorder, junkCoin,
+--           unusableTint, showNewDot, showQuestTab, showSetMark, dressAlpha }.
+-- `showSetMark` and `showNewDot` are retained at `false` for back-compat readers; those two
+-- cues are now `setBorder` and `newBorder` — branches of the ONE glow chain, per 1.x.
 function Items.ResolveState(ctx)
     ctx = ctx or {}
     local dimmed = ctx.dimmed and true or false
@@ -592,7 +596,12 @@ function Items.ResolveState(ctx)
         -- 1.x's nil-valued cached info does.
         junkCoin     = (ctx.quality == 0 and not ctx.hasNoValue and not dimmed) and true or false,
         unusableTint = false,                    -- retired (1.x kept the icon full-color)
-        showNewDot   = (ctx.isNew and not dimmed) and true or false,
+        -- 2.0 new-item cue: a CRIMSON BRANCH of the glow chain plus a slow pulse, below
+        -- the three item-facts above and above rarity. Replaces the corner wax dot for the
+        -- same reason the set pip went: 1.x draws one cue per cell, and it is a branch.
+        newBorder    = (ctx.isNew and not dimmed and not questBorder and not redBorder
+                        and not (set and not dimmed)) and true or false,
+        showNewDot   = false,                    -- retired: the new cue is newBorder
         -- 1.x reserves the bang glyph for quest STARTERS; ordinary quest items get the tint.
         showQuestTab = (starter and not dimmed) and true or false,
         showSetMark  = false,                    -- retired: the set cue is setBorder (1.x)
@@ -1020,22 +1029,9 @@ function Items._applyDress(button, spec)
     -- an addon-owned region the kill sweep can't reach)
     if button._dsNativeQuest then button._dsNativeQuest:Hide() end
 
-    -- NEW-ITEM wax dot: one-shot 120ms fade-in on the rising edge (arrival), then still.
-    -- No OnUpdate/loop; shown frames only. Hidden entirely while dimmed.
-    local dot = button._dsNewDot
-    if dot then
-        if spec.showNewDot then
-            if not (dot.IsShown and dot:IsShown()) then
-                local UI = _G.DaseekiUI
-                if UI and UI.Animate and UI.Animate.FadeIn then UI.Animate.FadeIn(dot, 120)
-                else dot:SetAlpha(1); dot:Show() end
-            else
-                dot:SetAlpha(a)
-            end
-        else
-            dot:Hide()
-        end
-    end
+    -- NEW-ITEM: no corner element any more. The cue is the crimson glow branch + pulse that
+    -- Borders.Apply already painted from the same `isNew` fact, and it recedes with the dim
+    -- through the Borders.SetAlpha cascade above like every other part of the halo.
 
     -- QUEST bang glyph
     local tab = button._dsQuestTab
@@ -1485,7 +1481,7 @@ function Items._reassertOwnedArt(button)
     if not (button and button._dsDressed) then return end
     if ns.Borders and ns.Borders.Apply then
         ns.Borders.Apply(button, button._quality, button._unusable,
-            button._questItem, button._isSet)
+            button._questItem, button._isSet, button._isNew)
     end
     local junk = button.JunkIcon
         or (button.GetName and _G and _G[(button:GetName() or "") .. "JunkIcon"])
@@ -1708,19 +1704,10 @@ local function ensureDress(button)
 
     local sz = button:GetWidth() or Items.DEFAULT_SIZE
 
-    -- NEW-ITEM wax dot (brand crimson), top-right corner. A Frame (so UI.Animate.FadeIn can
-    -- play a one-shot 120ms reveal on arrival) holding the round pip texture.
-    local newArt = Items.MarkerArt("new")
-    local dot = _G.CreateFrame("Frame", nil, button)
-    local dsz = math.max(5, math.floor(sz * newArt.sizeRatio))
-    dot:SetSize(dsz, dsz)
-    dot:SetPoint("TOPRIGHT", button, "TOPRIGHT", -1, -1)
-    if dot.SetFrameLevel then dot:SetFrameLevel((button:GetFrameLevel() or 1) + 2) end
-    local dt = dot:CreateTexture(nil, "OVERLAY")
-    dt:SetAllPoints(dot)
-    paintPip(dt, dot, newArt)
-    dot:Hide()
-    button._dsNewDot = dot
+    -- CELL PARITY: NO new-item corner pip. The crimson wax dot that used to be created here
+    -- is retired; the cue is now a branch of the ONE glow chain plus a slow pulse
+    -- (Borders.NewRGB / Borders.PULSE_*), which is 1.x's model — one cue per cell — applied
+    -- to a fact 1.x itself had no cue for at all. See borders.lua's NEW-ITEM ARCHAEOLOGY.
 
     -- QUEST bang glyph, over the cell — the real 1.x marker (item.lua:47 paints the
     -- template's IconQuestTexture with TEXTURE_ITEM_QUEST_BANG). Ours is an addon-owned
@@ -1789,12 +1776,14 @@ local function paintButton(button)
         pcall(_G.SetItemButtonQuality, button, quality, data.link or data.id, false, false)
     end
 
-    -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > SET teal > quality edge.
-    -- A quest item (starter or objective) draws the gold tint — 1.x's first branch. An
-    -- UNUSABLE (class-can't-equip / below-level) item draws the red. A saved-set member draws
-    -- the teal. All are computed once here (live only) and cached on the button so
-    -- applyDressState and the re-assert path reuse them without a second scan; the bang
-    -- glyph is decided from _questStarter over in ResolveState.
+    -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > SET teal > NEW crimson
+    -- > quality edge. A quest item (starter or objective) draws the gold tint — 1.x's first
+    -- branch. An UNUSABLE (class-can't-equip / below-level) item draws the red. A saved-set
+    -- member draws the teal. A recently-acquired item draws the crimson AND breathes (2.0's
+    -- new-item cue, which replaced the corner wax dot — see borders.lua's NEW-ITEM
+    -- ARCHAEOLOGY block: 1.x had no new-item treatment at all). All are computed once here
+    -- (live only) and cached on the button so applyDressState and the re-assert path reuse
+    -- them without a second scan; the bang glyph is decided from _questStarter in ResolveState.
     local isQuest, isStarter = false, false
     if button._live then isQuest, isStarter = slotQuestFlags(button) end
     button._questItem, button._questStarter = isQuest, isStarter
@@ -1802,8 +1791,10 @@ local function paintButton(button)
     button._unusable = unusable
     local isSet = (button._live and slotIsSet(button)) or false
     button._isSet = isSet
+    local isNew = (button._live and slotIsNew(button)) or false
+    button._isNew = isNew
     button._hasNoValue = slotHasNoValue(button)
-    if ns.Borders then ns.Borders.Apply(button, quality, unusable, isQuest, isSet) end
+    if ns.Borders then ns.Borders.Apply(button, quality, unusable, isQuest, isSet, isNew) end
     button._quality = quality
 
     -- FILLED: the icon IS the cell (1.x). No card, no ring by default; the ONLY thing that
@@ -2281,8 +2272,9 @@ local function testStatePrecedence(fails)
 
     -- CELL PARITY — the SET cue is a BORDER now, not a corner pip (1.x item.lua:201-202).
     local m = Items.ResolveState({ quality = 3, isNew = true, isQuestStarter = true, isSet = true, isUnusable = true })
-    ck(m.showNewDot == true and m.showQuestTab == true, "new + quest-starter markers still show")
+    ck(m.showQuestTab == true, "the quest-starter bang still shows")
     ck(m.showSetMark == false, "the bronze set pip is retired (regression lock)")
+    ck(m.showNewDot == false, "the crimson new-item pip is retired too (regression lock)")
     ck(m.questBorder == true and m.redBorder == false and m.setBorder == false,
         "quest gold wins the cell over BOTH the unusable red and the set teal (1.x branch order)")
     -- an unusable NON-quest item still gets the red, and the set teal yields to it
@@ -2318,14 +2310,26 @@ local function testStatePrecedence(fails)
     local nq = Items.ResolveState({ quality = 1 })
     ck(nq.questBorder == false and nq.showQuestTab == false, "non-quest item -> no gold, no bang")
 
-    -- new-only, quest-starter-only, set-only
+    -- new-only, quest-starter-only, set-only. NEW is a BORDER branch now, never a pip.
     local n = Items.ResolveState({ quality = 2, isNew = true })
-    ck(n.showNewDot == true and n.showQuestTab == false and n.icon == "normal", "new-only marker")
+    ck(n.newBorder == true and n.showNewDot == false and n.showQuestTab == false
+        and n.icon == "normal", "new-only -> the crimson border, no pip, clean icon")
     local q = Items.ResolveState({ quality = 2, isQuestStarter = true })
     ck(q.showQuestTab == true and q.showNewDot == false, "quest-starter-only marker")
     local st = Items.ResolveState({ quality = 2, isSet = true })
     ck(st.setBorder == true and st.showNewDot == false and st.showQuestTab == false
         and st.icon == "normal", "set-only -> the teal border, no pip, clean icon")
+
+    -- NEW-ITEM BRANCH PRECEDENCE inside ResolveState: new yields to all three item-facts,
+    -- so a cell never claims two border branches at once.
+    local nq = Items.ResolveState({ quality = 2, isNew = true, isQuest = true })
+    ck(nq.questBorder == true and nq.newBorder == false, "new yields to the quest gold")
+    local nu = Items.ResolveState({ quality = 2, isNew = true, isUnusable = true })
+    ck(nu.redBorder == true and nu.newBorder == false, "new yields to the unusable red")
+    local nset = Items.ResolveState({ quality = 2, isNew = true, isSet = true })
+    ck(nset.setBorder == true and nset.newBorder == false, "new yields to the set teal")
+    local nd = Items.ResolveState({ quality = 2, isNew = true, dimmed = true })
+    ck(nd.newBorder == false, "a search-dimmed cell drops the new cue with everything else")
 end
 
 -- 1.x QUEST RULE (Items.QuestFlags): the exact field mechanism that separates a quest
@@ -2364,8 +2368,13 @@ local function testQuestFlags(fails)
 end
 
 -- DIM CASCADE covering ALL dress layers: a dimmed slot recedes icon + quality edge +
--- count numeral + new dot + quest tab together (the C condition-4 bug fix). Uses a fake
--- button (no CreateFrame needed) so the wiring itself is asserted headless.
+-- count numeral + quest tab together (the C condition-4 bug fix). Uses a fake button (no
+-- CreateFrame needed) so the wiring itself is asserted headless.
+--
+-- The NEW-ITEM cue is deliberately absent from this list now: it is a branch of the glow
+-- chain, so it recedes through the `_dsBagsBorder` container alpha asserted below rather
+-- than through an element of its own. A stale `_dsNewDot` is still fed in to prove the
+-- retired pip is never resurrected by a dress.
 local function testDimCascade(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -2397,8 +2406,11 @@ local function testDimCascade(fails)
     ck(border.alpha == 0.3, "cascade: quality edge dimmed to 0.3")
     ck(count.alpha == 0.3,  "cascade: count numeral dimmed to 0.3")
     ck(icon.desat == true,   "cascade: icon desaturated while dimmed")
-    ck(dot.shown == false,   "cascade: new dot hidden while dimmed")
     ck(tab.shown == false,   "cascade: quest tab hidden while dimmed")
+    -- The retired wax dot is never touched by a dress any more; the halo carries the cue
+    -- and it is already receding via `border.alpha` above.
+    ck(Items.ResolveState({ quality = 4, isNew = true, dimmed = true }).newBorder == false,
+        "cascade: the new-item glow branch is dropped while dimmed")
 
     -- UNDIMMED normal: dress alpha restored to 1.0, no desat
     local icon2, border2, count2 = recorder(), recorder(), recorder()
@@ -2905,20 +2917,12 @@ local function testMarkerArt(fails)
        "constant present -> the game's own value wins")
     _G.TEXTURE_ITEM_QUEST_BANG = saved
 
-    for _, kind in ipairs({ "new" }) do
-        local a = Items.MarkerArt(kind)
-        ck(a ~= nil, kind .. " marker has an art spec")
-        ck(a.texture == Items.TEX_WHITE, kind .. " pip is a WHITE8X8 fill (theme-tintable)")
-        ck(a.mask == Items.TEX_DOT_MASK, kind .. " pip carries the ROUND mask (not a hard square)")
-        ck(type(a.token) == "string", kind .. " pip is token-tinted")
-        ck(a.sizeRatio > 0 and a.sizeRatio < 1, kind .. " pip stays a corner pip")
-    end
-    -- sizes/tokens/corners unchanged from the squares they replace
-    ck(Items.MarkerArt("new").token == "brand" and Items.MarkerArt("new").sizeRatio == 0.24,
-       "new dot keeps brand @ 0.24")
-    ck(Items.MarkerArt("new").anchor == "TOPRIGHT", "new-dot corner unchanged")
-    -- CELL PARITY: the equipment-set corner pip is retired; 1.x makes it a glow branch.
+    -- CELL PARITY: BOTH corner pips are retired; 1.x expresses each as a glow branch.
+    -- `quest` is the only kind left, because the bang glyph is the one addon-owned mark
+    -- 1.x actually draws (item.lua:39-47, TEXTURE_ITEM_QUEST_BANG on IconQuestTexture).
     ck(Items.MarkerArt("set") == nil, "set pip retired (1.x expresses sets as a teal glow)")
+    ck(Items.MarkerArt("new") == nil,
+       "new-item wax dot retired (2.0 makes it a crimson glow branch + pulse)")
     ck(Items.MarkerArt("nope") == nil, "unknown marker kind -> nil")
     -- the mask is OUR shipped stencil, addressed through the live addon folder
     ck(Items.TEX_DOT_MASK:find("art\\dot%-mask") ~= nil, "mask path points at the shipped art/dot-mask")

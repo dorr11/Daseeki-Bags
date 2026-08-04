@@ -240,6 +240,17 @@ function Options.Build(flow)
         set = function(v) local db = DB(); if db then db.setMarkers = v and true or false end regrid() end,
     }).Refresh)
 
+    -- New-item crimson + pulse. DEFAULT ON: unlike the set teal this cue is transient (it
+    -- clears the moment the game's own new-item set does), so it cannot permanently repaint
+    -- the bag. It replaced the crimson corner dot 2.0 used to draw — see borders.lua's
+    -- NEW-ITEM ARCHAEOLOGY block for why Bags 1 has no counterpart to copy here.
+    register(ib:Checkbox({
+        label = "Glow newly-acquired items",
+        tooltip = "Glow items you have picked up but not looked at yet in crimson, with a slow pulse. The cue clears as soon as you interact with the item. It sits below the quest, unusable and equipment-set colours, so it never hides one of those — but it does win over the plain rarity colour while the item is new.",
+        get = function() return not (ns.Borders and ns.Borders.NewCueEnabled) or ns.Borders.NewCueEnabled() end,
+        set = function(v) local db = DB(); if db then db.newItemMarkers = v and true or false end regrid() end,
+    }).Refresh)
+
     -- ── Slot appearance (Bags 1 parity: slotBackground / slotAlpha / slotBorderColor) ──
     -- The owner's deliberate Bags 1 look: a quiet faction crest in each EMPTY cell at low
     -- opacity, and a dark, slightly-opaque 2px edge on EVERY cell. Defaults here are his
