@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2.0.2
+## 2.0.2 — 2026-08-04
 
 **Characters that only exist in Daseeki Nexus now show up in the character menu with a
 readable summary instead of being invisible, sorting keeps a private log of every run so
