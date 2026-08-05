@@ -18,7 +18,7 @@ local ADDON, ns = ...
 
 ns.ADDON    = ADDON
 ns.DISPLAY  = "Daseeki Bags"
-ns.VERSION  = "2.0.2"
+ns.VERSION  = "2.0.3"
 ns.CHAT_TAG = "|cffc9a24dDaseeki Bags|r"
 
 ----------------------------------------------------------------------

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2.0.3
+## 2.0.3 — 2026-08-05
 
 **Sorting a full bag no longer throws "Internal Bag Error" and stops half way. The sort
 now waits for the game to confirm each move before it plans the next one, which means it
