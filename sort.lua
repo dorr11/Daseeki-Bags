@@ -576,6 +576,85 @@ function Sort.PartitionWaves(moves)
 end
 
 ----------------------------------------------------------------------
+-- THE FINAL CLEANUP WAVE (2.0.3)
+--
+-- An abort lands BETWEEN waves, so the selection sort's partially applied prefix has
+-- items parked in temporary places and gaps where they came from — the owner's live
+-- report, verbatim: "items scattered with holes". Sorted-but-partial is an acceptable
+-- outcome for an interrupted run; HOLED is not, because a gap in the middle of the grid
+-- reads as damage rather than as an unfinished job.
+--
+-- So every abort that can still legally touch the bags ends with ONE compaction pass:
+-- pull each item backwards into the earliest legal free cell before it. Properties that
+-- make this safe to run on a bag in ANY state:
+--   * It is a single WAVE. Every move it emits is slot-disjoint by construction (a cell
+--     is either a hole or a source, never both in the same emitted move, and a consumed
+--     hole leaves the list), so no move depends on another landing first — which is what
+--     lets an aborting executor issue the whole thing and stop.
+--   * It never crosses a family boundary (`canHold`), never touches a user-locked, live-
+--     locked or in-flight cell (`isFixed`), and never splits or merges a stack — it only
+--     relocates whole cells, so the item multiset is conserved exactly.
+--   * It is bounded: at most `Sort.MAX_CLEANUP_MOVES`, and both loops are ceilinged.
+-- It is deliberately NOT a sort. It closes holes; finishing the arrangement is the next
+-- run's job, and the abort line says so.
+Sort.MAX_CLEANUP_MOVES = 24
+
+-- TWO POINTERS, and why not the obvious shuffle. The natural way to close holes is to
+-- walk forward moving each item into the earliest hole behind it — but that RECYCLES the
+-- cell it vacates as a hole for the next item, so move k+1's destination is move k's
+-- source and the pass is a dependency CHAIN, not a wave. An aborting executor cannot pay
+-- for a chain: it is stopping, so every move after the first would be issued against a
+-- slot that has not settled, which is the very failure this release exists to remove.
+--
+-- So: holes from the FRONT, items from the BACK, meeting in the middle. Every hole used
+-- is strictly before every item moved, no vacated cell is ever reused, and the whole pass
+-- is therefore slot-disjoint — one wave, issuable in one go, correct whether or not the
+-- executor ever runs again. It also compacts BETTER than the forward shuffle, because it
+-- fills the earliest holes with the furthest items.
+function Sort.CompactMoves(cells, canHold, isFixed)
+    local moves = {}
+    local usable = function(c)
+        if c.userLocked or c.locked then return false end
+        if isFixed and isFixed(c) then return false end
+        return true
+    end
+    local taken = {}                     -- items already claimed as a source
+    local back  = #cells
+    local guard = 0
+    for front = 1, #cells do
+        if #moves >= Sort.MAX_CLEANUP_MOVES or front >= back then break end
+        local h = cells[front]
+        if h.id == nil and usable(h) then
+            -- Furthest item that may legally live in this hole. Ceilinged by `back`,
+            -- which only ever moves down, so the whole search is O(#cells) amortized.
+            local pick
+            local probe = back
+            while probe > front do
+                guard = guard + 1
+                if guard > 20000 then break end          -- headless discipline
+                local c = cells[probe]
+                if c.id ~= nil and not taken[probe] and usable(c)
+                   and ((not canHold) or canHold(h.cid, c.id)) then
+                    pick = probe
+                    break
+                end
+                probe = probe - 1
+            end
+            if not pick then break end                  -- nothing left to pull forward
+            local c = cells[pick]
+            moves[#moves + 1] = { op = "swap",
+                a = { cid = c.cid, slot = c.slot },
+                b = { cid = h.cid, slot = h.slot } }
+            h.id, h.count = c.id, c.count
+            c.id, c.count = nil, 0
+            taken[pick] = true
+            back = pick - 1
+        end
+    end
+    return moves
+end
+
+----------------------------------------------------------------------
 -- Container-id set helpers
 ----------------------------------------------------------------------
 
@@ -616,19 +695,26 @@ end
 --      get the same placement the full plan would have given them. That is what stops
 --      optimistic re-planning from oscillating (a re-plan against merely OBSERVED, i.e.
 --      pre-move, content would keep rearranging cells the in-flight moves already fixed).
---      Predictions are dropped the moment reality can be observed (slot seen unlocked, or
---      ITEM_LOCK_CHANGED reports it clear), and expire on `Sort.LOCK_TTL` regardless — so
---      a FAILED or dropped move self-corrects on the very next tick.
+--      A prediction is dropped when the slot is SETTLED — unlocked AND showing the
+--      content the move promised (2.0.3; see the SETTLE-AWARE ARMING banner above, and
+--      Sort.PredSettled). Not merely unlocked: the client releases the lock before it
+--      rewrites the slot's contents, and retiring in that window is what made 2.0.2
+--      re-issue moves the server had already applied. `Sort.SETTLE_TTL` and
+--      `Sort.LOCK_TTL` are the backstops, so a FAILED or dropped move still
+--      self-corrects — just not while it might still be in the air.
 --   3. Re-PLAN from scratch (the planner is a documented fixed point, so this converges).
---      The predicted slots are ALSO handed to the planner as BUSY (see Sort.Plan's banner):
---      they keep their place in the target map but are excluded as move ENDPOINTS, so the
---      plan only ever proposes moves we can actually issue right now.
---   4. Issue WAVE 1 ONLY of the dependency partition. Wave-1 moves depend on no earlier
---      move, so each is valid against the state we just observed — never against a
---      hypothetical post-plan state. Later waves are simply left for a later tick, by
---      which time their dependencies have settled and they have become wave 1.
---   5. Return immediately. NEVER wait for the server.
+--   4. Issue WAVE 1 ONLY of the dependency partition, up to `Sort.MAX_IN_FLIGHT`
+--      concurrent un-acked moves. Wave-1 moves depend on no earlier move, so each is
+--      valid against the state we just observed — never against a hypothetical
+--      post-plan state. Later waves are simply left for a later round, by which time
+--      their dependencies have settled and they have become wave 1.
+--   5. Return immediately. NEVER wait for the server — but if the round could issue
+--      NOTHING because every slot it needs is held by one of our own un-acked moves,
+--      it is WAITING, not working: it backs off to `Sort.WAIT_TICK` and re-arms on the
+--      bag events rather than re-planning at 20 Hz through a settle window.
 -- Termination: converged when a plan with NO outstanding predictions yields zero moves.
+-- An ABORT ends with one compaction wave (Sort.CompactMoves) so an interrupted run
+-- never leaves the grid holed.
 --
 -- ── ABORTS ARE PROGRESS-BASED, NOT CLOCK-BASED ──────────────────────────────
 -- The executor used to stop at a fixed 200 ticks (~10 s) and print "time budget exceeded",
@@ -668,10 +754,118 @@ Sort.MAX_NO_PROGRESS    = 120
 Sort.MAX_MOVE_FACTOR    = 4      -- move budget = factor × residual + MOVE_SLACK, RE-BASED
 Sort.MOVE_SLACK         = 32     -- upward on every improvement (see Sort._tick)
 -- Hand the planner the set of cells with one of OUR moves in flight (Sort.Plan's BUSY
--- banner, and issueWave1's). THE throughput fix — a constant, not a setting, and it is ON.
-Sort.PLAN_BUSY          = true
+-- banner, and issueWave1's).
+--
+-- 2.0.3: OFF. Not deleted — the planner's busy support and its tests are untouched, and
+-- this is one constant away from returning — but the executor no longer issues from a
+-- restricted re-plan, because the premise the fallback was built on has been removed.
+--
+-- 2.0.2 added it because the full plan's wave 1 kept coming back entirely made of moves
+-- on in-flight cells, so the issue guard rejected nearly all of them and the round idled.
+-- That happened because a prediction was retired the moment its slot read UNLOCKED, so
+-- the overlay was substituting content for a set of slots that kept churning underneath
+-- it. With settle-aware retirement the overlay reflects what the moves will actually
+-- deliver, and the full plan's wave 1 is issuable. What remains of the fallback is a
+-- deliberately WORSE decomposition bought on rounds that should simply have waited.
+--
+-- MEASURED on the owner's 88-cell / 74% fixture, same seed, both ways:
+--     PLAN_BUSY on : 81 moves for a 72-move plan, 48 waves, 4338ms
+--     PLAN_BUSY off: 78 moves for a 72-move plan, 46 waves, 4231ms
+-- Fewer moves AND less wall clock — the throughput argument for it has inverted. On the
+-- small healthy fixture it is 19 moves / 2418ms off against 21 / 2092ms on: ~330ms of a
+-- 2s sort spent WAITING for the server instead of papering over the wait with two extra
+-- moves. That is the trade this release is explicitly making (see the WAITING round in
+-- Sort._tick): the owner's complaint is over-issue and client rejections, not 300ms.
+Sort.PLAN_BUSY          = false
 Sort.LOCK_TTL           = 3.00   -- backstop only: a slot locked THIS long is pathological
 Sort.QUIET_REFRESH      = 0.20   -- 5 Hz grid heartbeat while the refresh storm is muted
+
+-- =====================================================================
+-- 2.0.3 — SETTLE-AWARE ARMING, and the over-issue it fixes
+--
+-- LIVE FAILURE (owner, 88 combined cells at 74% fill): plan 60 moves, EXECUTE 305,
+-- 82 waves, 5.32s, client "Internal Bag Error", run aborted mid-layout on the move
+-- budget. Even a healthy run of the same session executed 15 moves for a 5-move plan.
+-- The executor had been over-issuing 3x all along; the big bag only made it fatal.
+--
+-- THE MECHANISM. ITEM_LOCK_CHANGED and BAG_UPDATE are DIFFERENT events, and BAG_UPDATE
+-- is the LATER one. When the server answers a move the client releases the slot lock
+-- FIRST and rewrites the slot's visible CONTENTS only when the bag-update burst lands.
+-- 2.0.2's `releasePred` retired a prediction the instant the slot read UNLOCKED — so
+-- inside that window the executor:
+--     1. dropped its prediction and recorded an ack,
+--     2. re-snapshotted the slot, getting its PRE-MOVE contents,
+--     3. re-planned the move it had just performed, and
+--     4. re-issued it, because neither the prediction nor the live lock forbade it.
+-- The server then refused the duplicate — its truth no longer matched what the client
+-- had sent — which is precisely ERR_INTERNAL_BAG_ERROR. The refused move never landed,
+-- the residual never dropped, and the next round did it all again: 305 executions of a
+-- 60-move plan. Unlocked is NOT settled. Settled is "the contents I predicted are the
+-- contents I can now see".
+--
+-- (Same failure class as Daseeki-Conduit's mail attach, fixed there the same way: a
+-- locked/unsettled bag slot made SplitContainerItem a silent no-op, and the fix was to
+-- arm on settlement rather than on the lock. mail.lua's SETTLE_TIMEOUT = 1.0 with
+-- BAG_UPDATE_DELAYED as the primary signal is the model these constants follow.)
+--
+-- THE 1.x CONTRAST. 1.x (core/api/sorting.lua) has no in-flight memory at all — but it
+-- cannot churn, because a pass that issues nothing ENDS THE RUN (`if not self:Delaying
+-- ('Run') then self:Stop() end`) and its MutexDelay collapses a whole pass into exactly
+-- ONE follow-up pass. A 1.x run therefore cannot outlive its own progress: total issued
+-- moves is bounded by the moves it could legally issue. 2.0 traded that for a
+-- re-planning loop that keeps going until a budget or stall guard fires, which is what
+-- turned re-issue into 305 executions. This block restores the missing bound in the
+-- form 2.0's design can carry it: strict in-flight accounting, plus a round that WAITS
+-- for the next bag event instead of burning budget when it cannot progress.
+--
+-- SETTLE_TTL / SETTLE_ACKS: the backstop for a prediction whose contents never arrive
+-- (the move was genuinely refused, or the server dropped it). It must be comfortably
+-- longer than one round-trip or a healthy move would be re-planned mid-flight; the
+-- owner's measured avgAckMs is ~240ms, so 1.0s is ~4 acks, and SETTLE_ACKS keeps that
+-- ratio on a slower connection. Reality wins at the ceiling — a stale prediction is
+-- dropped and the move is re-planned from OBSERVED state, which is the correct
+-- self-correction and the only path that may legitimately re-issue a move.
+Sort.SETTLE_TTL         = 1.00
+Sort.SETTLE_ACKS        = 4
+
+-- BOUNDED IN-FLIGHT. Each outstanding move takes TWO cells out of the planner's reach,
+-- so 2.0.2's 24-moves-per-tick burst froze up to 48 of the owner's 88 cells — more than
+-- half the bag — which is exactly why its full plan kept coming back unissuable. 10
+-- concurrent moves is 20 cells, ~23% of an 88-cell view: the planner keeps three
+-- quarters of the bag to work with, and at the measured ~240ms round-trip the bound
+-- still sustains ~40 moves/s, so it is never the limiter on a healthy sort. It IS the
+-- limiter on a pathological one, which is the point. (1.x's equivalent bound is
+-- structural rather than numeric: one pass, then one follow-up pass, then stop.)
+--
+-- SWEPT on the owner's 88-cell / 74% fixture (72-move plan), same seed throughout:
+--      4 -> 74 moves,  8.5s     10 -> 78 moves, 4.2s
+--      6 -> 74 moves,  5.9s     12 -> 80 moves, 4.4s
+--      8 -> 78 moves,  6.0s     24 -> 82 moves, 3.7s
+-- Below 8 the executor starves (4 and 6 also fail the shipped "feels instant at
+-- realistic latency" pin); at 24 — 2.0.2's effective burst — the move count breaks the
+-- fixture's tolerance, which is the churn this release exists to remove, showing up on
+-- the dial that causes it. 10 is the knee: the best wall clock of any value that does
+-- not buy it with extra moves.
+Sort.MAX_IN_FLIGHT      = 10
+
+-- A round that issued nothing while our own moves are still in flight is WAITING, not
+-- working. It re-arms on the bag events (ITEM_LOCK_CHANGED / BAG_UPDATE / the
+-- BAG_UPDATE_DELAYED burst-over signal) and keeps only this slow backstop tick, so a
+-- settle window costs no budget, no churn and no re-plans — see Sort._tick.
+Sort.WAIT_TICK          = 0.25
+
+-- ERR_INTERNAL_BAG_ERROR. The numeric id is build-specific across Classic Era builds,
+-- so the classifier accepts a known id OR the message text. Observed only — the count
+-- rides in the telemetry ring so a future log says "the client refused N operations"
+-- instead of leaving it to be inferred from an executed/planned ratio.
+Sort.BAG_ERROR_IDS      = { [44] = true, [45] = true, [46] = true }
+Sort.BAG_ERROR_PATTERN  = "[Bb]ag [Ee]rror"
+
+function Sort.IsBagError(id, msg)
+    if id ~= nil and Sort.BAG_ERROR_IDS[id] then return true end
+    if type(msg) == "string" and msg:find(Sort.BAG_ERROR_PATTERN) then return true end
+    return false
+end
 
 -- =====================================================================
 -- 2.0.2 — EVENT-DRIVEN ISSUING, and why the tick survives beside it
@@ -767,6 +961,25 @@ Sort.LOG_CAP            = 50
 --   avgAckMs           MEASURED mean per-move lock-clear round-trip, ms (0 = unmeasured)
 --   version            ns.VERSION, so a mixed log is still attributable
 --
+-- 2.0.3 additions. ADDITIVE ONLY — appended to LOG_FIELDS, nothing renamed, nothing
+-- reordered, so a log written by 2.0.2 still parses and a 2.0.3 log still answers every
+-- 2.0.2 question. These five are the settle story:
+--   bagErrors          UI_ERROR_MESSAGE bag-error refusals OBSERVED during the run. This
+--                      is the number the owner's failing run had to be inferred from;
+--                      now it is stated. A healthy run reads 0.
+--   settleWaits        rounds that issued nothing because every needed slot was held by
+--                      one of OUR un-acked moves — the executor waiting, correctly, for
+--                      the contents to land. Costs no budget and no churn.
+--   settleHolds        prediction checks that found the slot UNLOCKED but its contents
+--                      not yet updated: the exact window 2.0.2 re-issued moves into.
+--                      Non-zero here with executedMoves == planMoves is the fix working.
+--   settleDrops        predictions that hit the SETTLE_TTL ceiling — moves the server
+--                      never confirmed. The direct tuning input for SETTLE_TTL, and the
+--                      only path on which a move may legitimately be re-planned.
+--   inFlightPeak       high-water mark of concurrent un-acked moves (vs MAX_IN_FLIGHT)
+--   cleanupMoves       moves issued by the final compaction wave of an ABORT (0 on a
+--                      completed run — completion leaves no holes to close)
+--
 -- ── RING SEMANTICS ───────────────────────────────────────────────────────────
 -- A plain 1..n ARRAY, oldest first, newest last, capped at Sort.LOG_CAP: appending past
 -- the cap drops index 1 and shifts. A cursor key would be cheaper by O(cap) per run, but
@@ -782,6 +995,8 @@ Sort.LOG_FIELDS = {
     "ts", "context", "cells", "fillPct", "planMoves", "executedMoves", "waves",
     "durationMs", "aborted", "reason", "stallTicks", "busyFallbackTicks",
     "avgAckMs", "version",
+    -- 2.0.3, APPENDED (never inserted): a 2.0.2 reader walking the first 14 is unaffected.
+    "bagErrors", "settleWaits", "settleHolds", "settleDrops", "inFlightPeak", "cleanupMoves",
 }
 
 local function num(v) local n = tonumber(v); return n or 0 end
@@ -808,6 +1023,12 @@ function Sort.NewLogRecord(r)
         busyFallbackTicks = int(r.busyFallbackTicks),
         avgAckMs          = int(r.avgAckMs),
         version           = (type(r.version) == "string") and r.version or tostring(ns.VERSION or "?"),
+        bagErrors         = int(r.bagErrors),
+        settleWaits       = int(r.settleWaits),
+        settleHolds       = int(r.settleHolds),
+        settleDrops       = int(r.settleDrops),
+        inFlightPeak      = int(r.inFlightPeak),
+        cleanupMoves      = int(r.cleanupMoves),
     }
 end
 
@@ -898,11 +1119,15 @@ end
 function Sort.FormatLogLine(rec, index)
     rec = Sort.NewLogRecord(rec)
     local outcome = rec.aborted and ("ABORT:" .. (rec.reason ~= "" and rec.reason or "?")) or "ok"
+    -- 2.0.3: `err=` only appears when the CLIENT refused something. On a healthy run it
+    -- is absent, so the line stays the width the owner is used to reading; when it shows
+    -- up it is the first thing to look at.
+    local err = (rec.bagErrors > 0) and string.format(" err=%d", rec.bagErrors) or ""
     return string.format(
-        "%2d. %s %-4s cells=%d fill=%d%% plan=%d exec=%d waves=%d %.2fs ack=%dms busy=%d stall=%d %s",
+        "%2d. %s %-4s cells=%d fill=%d%% plan=%d exec=%d waves=%d %.2fs ack=%dms busy=%d stall=%d%s %s",
         tonumber(index) or 0, stampStr(rec.ts), rec.context,
         rec.cells, rec.fillPct, rec.planMoves, rec.executedMoves, rec.waves,
-        rec.durationMs / 1000, rec.avgAckMs, rec.busyFallbackTicks, rec.stallTicks, outcome)
+        rec.durationMs / 1000, rec.avgAckMs, rec.busyFallbackTicks, rec.stallTicks, err, outcome)
 end
 
 -- `/bags sortlog` / `/dbg sortlog` — print the buffer, newest first. `arg` == "clear" empties it.
@@ -1101,11 +1326,14 @@ local function performMove(m)
     elseif m.op == "merge" then
         CC.PickupContainerItem(m.from.cid, m.from.slot)
         CC.PickupContainerItem(m.to.cid, m.to.slot)
-        -- Same-item merge fills `to` to max and leaves any overflow on the cursor;
-        -- drop it back into `from` so the residual matches MergePour's model.
-        if _G.CursorHasItem and _G.CursorHasItem() then
-            CC.PickupContainerItem(m.from.cid, m.from.slot)
-        end
+        -- A same-item merge fills `to` to max and leaves the overflow on the cursor.
+        -- 2.0.2 put it back with a THIRD PickupContainerItem on `m.from` — an extra
+        -- container operation aimed at a slot the pour has just put in flight, i.e. the
+        -- one place performMove itself could hand the client an unsettled target. The
+        -- unconditional ClearCursor below already returns a held container item to the
+        -- slot it came from, which is the same outcome through a client-side path that
+        -- issues no container request at all. (2.0.3: the pickup is gone, not the
+        -- behaviour — MergePour's residual model is unchanged.)
     elseif m.op == "split" then
         if CC.SplitContainerItem then CC.SplitContainerItem(m.from.cid, m.from.slot, m.amount) end
         CC.PickupContainerItem(m.to.cid, m.to.slot)
@@ -1199,6 +1427,11 @@ local function stopDriver()
     Sort._ackSum, Sort._ackN = nil, nil
     Sort._lastTickAt, Sort._lastProgressAt, Sort._idleSince = nil, nil, nil
     Sort._waiting = nil
+    -- 2.0.3 settle-aware accumulators (same "no state between runs" contract).
+    Sort._bagErrors, Sort._settleWaits, Sort._settleHolds = nil, nil, nil
+    Sort._settleDrops, Sort._inFlightPeak, Sort._cleanupMoves = nil, nil, nil
+
+    Sort._settleSecs, Sort._waitingRound = nil, nil
     Sort._idleSecs, Sort._noProgressSecs, Sort._runawaySecs = nil, nil, nil
     Sort._cellCount, Sort._fillPct, Sort._planMoves0, Sort._context = nil, nil, nil, nil
     Sort._tickGen = (Sort._tickGen or 0) + 1   -- invalidate any queued tick
@@ -1230,7 +1463,15 @@ local function logRun(aborted, reason)
         busyFallbackTicks = Sort._busyRounds or 0,
         avgAckMs          = ackMs,
         version           = tostring(ns.VERSION or "?"),
+        bagErrors         = Sort._bagErrors or 0,
+        settleWaits       = Sort._settleWaits or 0,
+        settleHolds       = Sort._settleHolds or 0,
+        settleDrops       = Sort._settleDrops or 0,
+        inFlightPeak      = Sort._inFlightPeak or 0,
+        cleanupMoves      = Sort._cleanupMoves or 0,
     }
+    -- Test hook: the finished record, in full, for a harness with no settings store.
+    Sort._lastRun = Sort.NewLogRecord(rec)
     local write = function() Sort.LogAppend(nil, rec) end
     if ns.SafeCall then ns:SafeCall(write) else pcall(write) end
 end
@@ -1246,16 +1487,28 @@ end
 
 -- An abort must never be silent about the part it did not do. `_residual` is the move
 -- count of the last plan taken, i.e. how much arranging is still outstanding.
+--
+-- 2.0.3: and it must never leave the grid HOLED. `cleanupWave` (defined below, next to
+-- the machinery it needs — forward-declared here) issues one compaction pass before the
+-- run is torn down, and the chat line says plainly what happened: what stopped it, what
+-- the cleanup closed, and how much arranging is left for the next run.
+local cleanupWave
+
 local function abort(reason)
     if not Sort._running then return end
+    local tidied = cleanupWave and cleanupWave(reason) or 0
     local stats = runStats()
     local left  = Sort._residual or 0
     logRun(true, reason)
     stopDriver()
     if ns.Print then
         local tail = ""
+        if tidied > 0 then
+            tail = tail .. string.format(" Tidied up: %d item%s pulled back to close the gaps.",
+                tidied, tidied == 1 and "" or "s")
+        end
         if left > 0 then
-            tail = string.format(" %d move%s still outstanding — run sort again to finish.",
+            tail = tail .. string.format(" %d move%s still outstanding — run sort again to finish.",
                 left, left == 1 and "" or "s")
         end
         ns:Print("sort stopped: " .. tostring(reason) .. " (" .. stats .. ")." .. tail)
@@ -1311,13 +1564,15 @@ end
 -- Drop a prediction once reality is observable for that slot. Called from the tick's
 -- overlay and (same-frame fast path) from ITEM_LOCK_CHANGED.
 --
--- The lock state is the authority, NOT the clock: as long as the client still reports the
--- slot locked the move is genuinely in flight, however slow the server is, and the
--- prediction must stand — expiring it on a timer would hand the planner the stale
--- pre-move contents and restart the churn the overlay exists to prevent. The TTL is only
--- a backstop for a slot that stays locked pathologically long; a slot that is NOT locked
--- is settled (or the move never happened), and reality wins immediately either way —
--- which is exactly how a rejected or dropped move self-corrects.
+-- OBSERVED STATE is the authority, NOT the clock: as long as the client has not yet
+-- shown us the result of a move, the move is genuinely in flight however slow the server
+-- is, and the prediction must stand — expiring it on a timer would hand the planner the
+-- stale pre-move contents and restart the churn the overlay exists to prevent. The TTLs
+-- are backstops only.
+--
+-- 2.0.2 read "has the client shown us the result?" as "is the slot still locked?", and
+-- that is the bug this release fixes — see the arms below, and the SETTLE-AWARE ARMING
+-- banner at the top of the file for the mechanism.
 -- 2.0.2 (telemetry + adaptive seed): the ACK path is also where the per-move round-trip
 -- is MEASURED — `now - p.at` is the time between issuing a move on this slot and the
 -- client reporting it unlocked, i.e. the number the whole cost model is written against.
@@ -1331,18 +1586,72 @@ end
 -- at most one round gap. With event issuing on (the default) almost every release takes
 -- the event path, so the recorded avgAckMs reads slightly HIGH at worst, never low —
 -- which is the safe direction for a number that sizes patience windows.
+--
+-- ── 2.0.3: SETTLED, NOT MERELY UNLOCKED ─────────────────────────────────────────
+-- The paragraph above says "a slot that is NOT locked is settled". That was the bug.
+-- The lock releases on ITEM_LOCK_CHANGED; the slot's CONTENTS are rewritten later, on
+-- BAG_UPDATE. Between the two the slot reads unlocked and shows its PRE-MOVE contents,
+-- and 2.0.2 retired the prediction there — handing the planner exactly the stale state
+-- the overlay exists to prevent, and re-issuing the move against a server that had
+-- already applied it. See the SETTLE-AWARE ARMING banner for the full mechanism.
+--
+-- So a prediction retires on CONTENT: unlocked AND the slot now shows what we predicted.
+-- Three arms, in order:
+--   * still locked          -> in flight, keep (unchanged).
+--   * unlocked + matches    -> SETTLED. Retire, and sample the round-trip.
+--   * unlocked + mismatched -> the answer has not arrived yet (or the move was refused).
+--                              Keep until SETTLE_TTL, then let reality win.
+-- The TTL arm is the ONLY path that may re-plan a move we already issued, which is what
+-- makes "issued and un-acked is never reissued" true by construction everywhere else.
+
+-- THE SETTLE RULE (2.0.3), factored out as one named decision — same treatment as
+-- Sort.ShouldKick — so the harness can pin it AND mutate it without a client. The 2.0.2
+-- executor is exactly the mutant `function() return true end`: "unlocked is settled".
+--
+-- Does the live slot now show the content the prediction promised?
+function Sort.PredSettled(p)
+    local CC = _G.C_Container
+    if not (CC and CC.GetContainerItemInfo) then return true end
+    local info = CC.GetContainerItemInfo(p.cid, p.slot)
+    local id   = (info and info.itemID) or nil
+    if p.id == nil then return id == nil end
+    if id ~= p.id then return false end
+    return (info.stackCount or 0) == (p.count or 0)
+end
+
 local function releasePred(key, now)
     local p = Sort._pred[key]
     if not p then return end
-    if not slotLocked(p.cid, p.slot) then
+    local age = now - p.at
+    if slotLocked(p.cid, p.slot) then
+        -- Genuinely in flight. Only the pathological-lock backstop can clear it.
+        if age >= Sort.LOCK_TTL then Sort._pred[key] = nil end
+        return
+    end
+    if Sort.PredSettled(p) then
         Sort._pred[key] = nil
-        local dt = now - p.at
-        if dt >= 0 and dt < Sort.LOCK_TTL then
-            Sort._ackSum = (Sort._ackSum or 0) + dt
+        if age >= 0 and age < Sort.LOCK_TTL then
+            Sort._ackSum = (Sort._ackSum or 0) + age
             Sort._ackN   = (Sort._ackN or 0) + 1
         end
-    elseif now - p.at >= Sort.LOCK_TTL then
-        Sort._pred[key] = nil
+        return
+    end
+    -- Unlocked but the contents have not caught up: we are inside the settle window.
+    -- HOLD the prediction — this is the exact instant 2.0.2 re-issued the move.
+    Sort._settleHolds = (Sort._settleHolds or 0) + 1
+    -- The CEILING is the only way out. REJECTED ALTERNATIVE, recorded so it is not
+    -- retried: giving up early on a BAG_UPDATE_DELAYED "the burst is over" stamp, on the
+    -- reasoning that a container republished after we issued must have current contents.
+    -- It was implemented and measured, and it REINTRODUCED THE ORIGINAL BUG — 232
+    -- executed moves for a 72-move plan on the owner's fixture, 156 client refusals.
+    -- Bag updates arrive per landing move, not once per wave, so move A's burst-over
+    -- signal routinely lands after move B's lock cleared and before B's contents are
+    -- published, and the stamp then retires B as "did not land" while it is still in the
+    -- air. Any rule that infers settlement for slot X from an event about slot Y is the
+    -- same mistake as inferring it from the lock. Only X's own contents can answer for X.
+    if age >= (Sort._settleSecs or Sort.SETTLE_TTL) then
+        Sort._pred[key]  = nil
+        Sort._settleDrops = (Sort._settleDrops or 0) + 1
     end
 end
 
@@ -1434,8 +1743,15 @@ local function issueWave1(plan, cells, now)
     local issued = 0
     local wave = Sort.PartitionWaves(plan.moves)[1]
     local list = wave and wave.moves or {}
+    -- 2.0.3: IN-FLIGHT accounting is a hard ceiling, not just a per-tick burst cap. Each
+    -- outstanding move holds TWO cells out of the planner's reach, so an unbounded burst
+    -- freezes most of a large bag and every subsequent plan comes back unissuable. See
+    -- Sort.MAX_IN_FLIGHT for the sizing against the measured ~240ms round-trip.
+    local inFlightMoves = math.ceil(predCount() / 2)
+    if inFlightMoves > (Sort._inFlightPeak or 0) then Sort._inFlightPeak = inFlightMoves end
     for _, m in ipairs(list) do
         if issued >= Sort.MAX_MOVES_PER_TICK then break end
+        if (inFlightMoves + issued) >= Sort.MAX_IN_FLIGHT then break end
         if (Sort._moveCount or 0) >= (Sort._budget or 0) then break end
         local slots = Sort.MoveSlots(m)
         -- `claimed` keeps this pass's moves slot-disjoint (1.x's per-space locked flag).
@@ -1474,6 +1790,45 @@ local function issueWave1(plan, cells, now)
             Sort._moveCount = (Sort._moveCount or 0) + 1
         end
     end
+    return issued
+end
+
+-- Issue the compaction pass described at Sort.CompactMoves. Forward-declared above the
+-- abort path; defined here because it needs the same snapshot / lock / issue machinery.
+--
+-- SKIPPED for aborts where the bags are not ours to touch any more: combat (item moves
+-- are exactly the thing the player now needs the client for), a closed bank (the
+-- containers are gone), and a closed window (the user walked away — quietly rearranging
+-- their bags after they dismissed the frame is worse than a hole). Those three end the
+-- run where it stands, as they always have.
+function cleanupWave(reason)
+    if reason == "entered combat" or reason == "bank closed"
+       or reason == "window closed" or reason == "containers unavailable" then return 0 end
+    local CC = _G.C_Container
+    if not (CC and CC.PickupContainerItem) or not Sort._cids then return 0 end
+    local cells = snapshot(Sort._cids)
+    if not cells then return 0 end
+    local moves = Sort.CompactMoves(cells, Sort._canHold, function(c)
+        return slotLocked(c.cid, c.slot)
+            or (Sort._pred and Sort._pred[slotKey(c.cid, c.slot)] ~= nil) or false
+    end)
+    local claimed, issued = {}, 0
+    for _, m in ipairs(moves) do
+        if issued >= Sort.MAX_CLEANUP_MOVES then break end
+        local slots, blocked = Sort.MoveSlots(m), false
+        for _, r in ipairs(slots) do
+            local k = refKey(r)
+            if claimed[k] or (Sort._pred and Sort._pred[k]) or slotLocked(r.cid, r.slot)
+               or Sort._userLocked(r.cid, r.slot) then blocked = true; break end
+        end
+        if not blocked then
+            for _, r in ipairs(slots) do claimed[refKey(r)] = true end
+            if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
+            issued = issued + 1
+            Sort._moveCount = (Sort._moveCount or 0) + 1
+        end
+    end
+    Sort._cleanupMoves = issued
     return issued
 end
 
@@ -1659,6 +2014,7 @@ function Sort._tick()
     end
 
     Sort._lastIssued = issued
+    Sort._waitingRound = false
     if issued > 0 then
         Sort._idle = 0
         Sort._idleSince = nil
@@ -1668,6 +2024,17 @@ function Sort._tick()
         if predOutstanding() then
             Sort._idle = 0
             Sort._idleSince = nil
+            -- ── 2.0.3: THIS ROUND IS WAITING, NOT WORKING ────────────────────────
+            -- Every needed slot is held by one of our own un-acked moves, so there is
+            -- nothing this round can legally do. Re-planning at 20 Hz through a ~240ms
+            -- settle window buys nothing and — before the settle-aware retirement above
+            -- — was where the duplicate issues came from. Mark the round WAITING and
+            -- drop to the slow backstop cadence; the bag events re-arm it the instant
+            -- the contents land, which is strictly sooner than any timer.
+            Sort._waitingRound = true
+            Sort._settleWaits  = (Sort._settleWaits or 0) + 1
+            quietHeartbeat(now)
+            return scheduleTick(Sort.WAIT_TICK)
         else
             Sort._idle = (Sort._idle or 0) + 1
             Sort._idleSince = Sort._idleSince or now
@@ -1690,6 +2057,38 @@ local function ensureDriver()
     f:SetScript("OnEvent", function(_, event, a, b)
         if event == "PLAYER_REGEN_DISABLED" then abort("entered combat"); return end
         if event == "BANKFRAME_CLOSED" and Sort._needsBank then abort("bank closed"); return end
+        -- 2.0.3: OBSERVE the client's own refusals. Purely telemetry — the count rides
+        -- in the sort-log record so a future report says "the client refused N
+        -- operations" outright instead of leaving it to be inferred from a ratio.
+        if event == "UI_ERROR_MESSAGE" then
+            if Sort._running and Sort.IsBagError(a, b) then
+                Sort._bagErrors = (Sort._bagErrors or 0) + 1
+            end
+            return
+        end
+        -- 2.0.3: BAG_UPDATE is the event that publishes the CONTENTS a prediction is
+        -- waiting on, and BAG_UPDATE_DELAYED is Blizzard's own "that burst is over"
+        -- signal (Daseeki-Conduit's mail attach arms on exactly this pair). Without
+        -- them a settle-aware executor would sit out the whole window on the slow
+        -- backstop tick; with them the round re-arms the moment the contents land.
+        if event == "BAG_UPDATE" or event == "BAG_UPDATE_DELAYED" then
+            if not (Sort._running and Sort._pred) then return end
+            local now = nowSeconds()
+            local settled = false
+            for k in pairs(Sort._pred) do
+                releasePred(k, now)
+                if Sort._pred[k] == nil then
+                    settled = true
+                    if Sort._waiting then Sort._waiting[k] = nil end
+                end
+            end
+            -- Only a round that is actually WAITING gains anything from being pulled
+            -- forward, and only when something really settled. Everything else stays on
+            -- the cadence it was already on — a bag-update burst must not become a
+            -- re-plan storm (see the EVENT-DRIVEN ISSUING banner's measured cost).
+            if settled and Sort._waitingRound then kickTick(now) end
+            return
+        end
         if event == "ITEM_LOCK_CHANGED" then
             -- Use the (bag, slot) payload the event already carries to release exactly
             -- that prediction the moment the server confirms — no full re-scan, and the
@@ -1700,7 +2099,10 @@ local function ensureDriver()
             if not Sort._pred[k] then return end
             local now = nowSeconds()
             releasePred(k, now)
-            if Sort._pred[k] ~= nil then return end   -- still locked: nothing settled
+            -- 2.0.3: the prediction survives BOTH "still locked" and "unlocked but the
+            -- contents have not caught up". Either way nothing settled, so there is
+            -- nothing to arm — the BAG_UPDATE handler above owns the second case.
+            if Sort._pred[k] ~= nil then return end
             -- ── 2.0.2b: ISSUING IS EVENT-DRIVEN AT THE ROUND BOUNDARY ────────────
             -- 2.0.1 pulled the next round forward in exactly ONE case: the previous
             -- round had issued nothing (`_lastIssued == 0`). Every other confirmation —
@@ -1839,6 +2241,11 @@ function Sort.Run(cids, opts)
     Sort._peakNoProgress, Sort._busyRounds = 0, 0
     Sort._ackSum, Sort._ackN = 0, 0
     Sort._waiting    = {}            -- 2.0.2b: slots blocking a planned wave-1 move
+    -- 2.0.3 settle-aware accumulators.
+    Sort._bagErrors, Sort._settleWaits   = 0, 0
+    Sort._settleHolds, Sort._settleDrops = 0, 0
+    Sort._inFlightPeak, Sort._waitingRound = 0, false
+    Sort._cleanupMoves = 0
 
     -- Size this run's patience windows off the MEASURED round-trip from the log (2.0.2c).
     -- max(), never min(): the fixed windows are the floor, so an unmeasured or fast
@@ -1847,8 +2254,16 @@ function Sort.Run(cids, opts)
     Sort._idleSecs       = math.max(Sort.IDLE_SECONDS,        Sort.IDLE_ACKS        * ackSecs)
     Sort._noProgressSecs = math.max(Sort.NO_PROGRESS_SECONDS, Sort.NO_PROGRESS_ACKS * ackSecs)
     Sort._runawaySecs    = math.max(Sort.RUNAWAY_SECONDS,     Sort.RUNAWAY_ACKS     * ackSecs)
+    -- Same max() rule for the settle ceiling: 1.0s is ~4 acks at the owner's measured
+    -- 240ms, and a slower connection keeps that ratio rather than losing its patience.
+    Sort._settleSecs     = math.max(Sort.SETTLE_TTL,          Sort.SETTLE_ACKS      * ackSecs)
 
     Sort._driver:RegisterEvent("ITEM_LOCK_CHANGED")
+    -- 2.0.3: the SETTLE signals. ITEM_LOCK_CHANGED says "the server answered"; these two
+    -- say "the contents you predicted are now visible", which is what arms the next wave.
+    Sort._driver:RegisterEvent("BAG_UPDATE")
+    Sort._driver:RegisterEvent("BAG_UPDATE_DELAYED")
+    Sort._driver:RegisterEvent("UI_ERROR_MESSAGE")
     Sort._driver:RegisterEvent("PLAYER_REGEN_DISABLED")
     if needsBank then Sort._driver:RegisterEvent("BANKFRAME_CLOSED") end
 
@@ -2692,14 +3107,23 @@ for id in pairs(SIMCAT) do SIMIDS[#SIMIDS + 1] = id end
 table.sort(SIMIDS)
 
 -- The simulator. opts: { bags = { {cid, size, family}, ... }, latency, jitter,
---                        dropRate, seed }
+--                        dropRate, settleLag, seed }
+--
+-- ── settleLag: THE CLIENT'S TWO-PHASE SETTLE (2.0.3) ─────────────────────────
+-- ITEM_LOCK_CHANGED and BAG_UPDATE are DIFFERENT events, and BAG_UPDATE is the LATER
+-- one. When the server answers a container move the client first releases the slot
+-- lock; the slot's visible CONTENTS are only rewritten when the bag-update burst
+-- lands. `settleLag` is the width of that window. At 0 the sim publishes contents and
+-- releases the lock atomically — which is what it did through 2.0.2, and is exactly
+-- why the harness never saw the owner's live failure.
 local function makeSimulator(opts)
     opts = opts or {}
     local S = {
-        clock    = 0,
-        latency  = opts.latency or 0,
-        jitter   = opts.jitter or 0,
-        dropRate = opts.dropRate or 0,
+        clock     = 0,
+        latency   = opts.latency or 0,
+        jitter    = opts.jitter or 0,
+        dropRate  = opts.dropRate or 0,
+        settleLag = opts.settleLag or 0,
         rng      = newRng(opts.seed or 12345),
         timers   = {}, seq = 0,
         frames   = {},
@@ -2712,9 +3136,20 @@ local function makeSimulator(opts)
         held     = nil,         -- cursor { id, count }
         holdKey  = nil,         -- origin slot key of the held item
         combat   = false,
-        stats    = { pickups = 0, drops = 0, rejected = 0, applied = 0 },
+        -- `rejected` is every refusal of any cause (fault injection, family, lock).
+        -- `bagErrors`   — refusals the live client surfaces as "Internal Bag Error":
+        --                 the addon asked the server to move something the server no
+        --                 longer holds where the addon thought it did.
+        -- `lockedIssue` — THE PERMANENT GATE: a container op issued against a slot the
+        --                 client itself reports LOCKED. Asserted by the SIM, never by
+        --                 the engine, so the engine cannot grade its own homework.
+        stats    = { pickups = 0, drops = 0, rejected = 0, applied = 0,
+                     bagErrors = 0, lockedIssue = 0 },
         saved    = {},
     }
+    -- Stands in for ERR_INTERNAL_BAG_ERROR. The live numeric id is build-specific, so
+    -- the engine matches on the message text as well (see Sort.IsBagError).
+    S.BAG_ERROR_ID = 44
     for _, b in ipairs(opts.bags or {}) do
         S.bags[b.cid] = { n = b.size, family = b.family or 0, slots = {}, truth = {} }
     end
@@ -2771,24 +3206,49 @@ local function makeSimulator(opts)
         return S.latency + j
     end
 
-    -- The round-trip landing: publish server truth into the visible view for the slots
-    -- this move touched, unlock them, and fire ITEM_LOCK_CHANGED with its (bag, slot).
+    -- Publish server truth into the visible view for a set of slots.
+    local function publish(touched)
+        for _, k in ipairs(touched) do
+            local cid, slot = unkey(k)
+            local bag = S.bags[cid]
+            if bag then
+                local t = bag.truth[slot]
+                bag.slots[slot] = t and { id = t.id, count = t.count } or nil
+            end
+        end
+        S.stats.applied = S.stats.applied + 1
+    end
+
+    local function unlockAndAnnounce(touched)
+        for _, k in ipairs(touched) do S.locked[k] = nil end
+        for _, k in ipairs(touched) do
+            local cid, slot = unkey(k)
+            S.fire("ITEM_LOCK_CHANGED", cid, slot)
+        end
+    end
+
+    -- The round-trip landing. With `settleLag == 0` this is the 2.0.2 model: contents
+    -- and lock move together. With a settle lag it is the LIVE model — the lock clears
+    -- first (ITEM_LOCK_CHANGED) and the contents catch up later (BAG_UPDATE), and the
+    -- window between them is where a lock-only "is it settled?" test reads a stale bag.
     local function commit(touched)
         S.after(settleDelay(), function()
-            for _, k in ipairs(touched) do
-                local cid, slot = unkey(k)
-                local bag = S.bags[cid]
-                if bag then
-                    local t = bag.truth[slot]
-                    bag.slots[slot] = t and { id = t.id, count = t.count } or nil
+            if (S.settleLag or 0) <= 0 then
+                publish(touched)
+                unlockAndAnnounce(touched)
+                S.fire("BAG_UPDATE_DELAYED")
+                return
+            end
+            unlockAndAnnounce(touched)
+            S.after(S.settleLag, function()
+                publish(touched)
+                local seen = {}
+                for _, k in ipairs(touched) do
+                    local cid = unkey(k)
+                    if not seen[cid] then seen[cid] = true; S.fire("BAG_UPDATE", cid) end
                 end
-            end
-            S.stats.applied = S.stats.applied + 1
-            for _, k in ipairs(touched) do S.locked[k] = nil end
-            for _, k in ipairs(touched) do
-                local cid, slot = unkey(k)
-                S.fire("ITEM_LOCK_CHANGED", cid, slot)
-            end
+                S.fire("BAG_UPDATE_DELAYED")
+            end)
         end)
     end
 
@@ -2805,6 +3265,25 @@ local function makeSimulator(opts)
     local function isLocked(cid, slot)
         local k = key(cid, slot)
         return (S.locked[k] or (S.holdKey == k)) and true or false
+    end
+
+    -- The client refuses the operation and shows ERR_INTERNAL_BAG_ERROR. Fired as a
+    -- real UI_ERROR_MESSAGE so the engine can OBSERVE rejections (2.0.3 telemetry).
+    local function bagError()
+        S.stats.bagErrors = S.stats.bagErrors + 1
+        S.stats.rejected  = S.stats.rejected + 1
+        S.fire("UI_ERROR_MESSAGE", S.BAG_ERROR_ID, "Internal Bag Error")
+    end
+    -- THE PERMANENT GATE. Nothing in the engine reads this; the SIM raises it, and the
+    -- fixtures assert it stayed at zero.
+    local function lockedIssue()
+        S.stats.lockedIssue = S.stats.lockedIssue + 1
+        bagError()
+    end
+
+    local function sameItem(a, b)
+        if a == nil or b == nil then return a == b end
+        return a.id == b.id and a.count == b.count
     end
 
     local C_Container = {}
@@ -2839,8 +3318,11 @@ local function makeSimulator(opts)
         if S.held == nil then
             ----------------------------------------------------- pick up
             -- Client-side only: no server state changes until the DROP.
-            if S.locked[k] then S.stats.rejected = S.stats.rejected + 1; return end
-            local it = bag.truth[slot]
+            if isLocked(cid, slot) then lockedIssue(); return end
+            -- The client picks up WHAT IT CAN SEE, not what the server holds. Inside
+            -- the settle window those disagree, and the disagreement is only detected
+            -- at the drop — by the server, as an Internal Bag Error.
+            local it = bag.slots[slot]
             if not it then return end
             S.held, S.holdKey = { id = it.id, count = it.count }, k
             -- Nothing has left the slot yet: server truth still holds this item, so a
@@ -2853,7 +3335,7 @@ local function makeSimulator(opts)
         S.stats.drops = S.stats.drops + 1
         -- A locked destination is refused by the client (unless it is where the held
         -- item came from — that is the "put the merge residual back" case).
-        if S.locked[k] and k ~= S.holdKey then S.stats.rejected = S.stats.rejected + 1; return end
+        if S.locked[k] and k ~= S.holdKey then lockedIssue(); return end
         if not canHoldSim(cid, S.held.id) then S.stats.rejected = S.stats.rejected + 1; return end
 
         local srcKey = S.holdKey
@@ -2869,6 +3351,19 @@ local function makeSimulator(opts)
         -- into itself and invent items out of nothing.)
         if k == srcKey and not S.heldDetached then
             S.held, S.holdKey = nil, nil
+            return
+        end
+
+        -- ── SERVER-SIDE VALIDATION (2.0.3) ──────────────────────────────────────
+        -- The client sent "move what I SEE in `srcKey` onto what I SEE in `k`". The
+        -- server checks its OWN truth; if either end has moved on since the client's
+        -- view was written, the whole operation is refused and nothing changes. That
+        -- refusal is the live "Internal Bag Error", and it is what a settle window
+        -- turns a re-issued move into. Only a genuine two-slot move is validated —
+        -- returning a merge residual to its own origin is a client-side flow.
+        if srcKey ~= k and (not sameItem(sbag and sbag.truth[sslot], sbag and sbag.slots[sslot])
+                            or not sameItem(bag.truth[slot], bag.slots[slot])) then
+            bagError()   -- item stays on the cursor; the caller's ClearCursor restores it
             return
         end
 
@@ -3068,6 +3563,16 @@ local function makeSimulator(opts)
     function S:anyLocked()
         for _ in pairs(S.locked) do return true end
         return false
+    end
+    -- Force ONE slot all the way to settled: unlock it AND publish its truth, which is
+    -- what the client's ITEM_LOCK_CHANGED + BAG_UPDATE pair does between them. Tests that
+    -- drive events by hand must use this rather than clearing `S.locked` on its own —
+    -- an unlocked slot with stale contents is precisely the un-settled state the
+    -- executor is required to keep waiting through (see releasePred).
+    function S:settle(cid, slot)
+        local k = key(cid, slot)
+        S.locked[k] = nil
+        publish({ k })
     end
 
     return S
@@ -3982,7 +4487,10 @@ local function eventIssueAssertions()
             ck(key ~= nil, "found an in-flight slot to drive the event with")
 
             local function fire(k, c, s)
-                S.locked[k] = nil                       -- the server just confirmed it
+                -- 2.0.3: SETTLE the slot, do not merely unlock it. Clearing the lock
+                -- alone is the settle WINDOW, in which the executor is required to keep
+                -- waiting — so driving the event that way would be asserting the bug.
+                S:settle(c, s)                          -- the server confirmed AND published
                 local before = #S.timers
                 local floor = S.clock + (Sort.KICK_GAP or 0)
                 Sort._driver._script(Sort._driver, "ITEM_LOCK_CHANGED", c, s)
@@ -4194,6 +4702,397 @@ local function testEventIssueMutants(fails)
     ck(#eventIssueAssertions() == 0, "the real issuing rule passes the assertions it kills with")
 end
 
+-- =====================================================================
+-- 2.0.3 — THE OWNER'S LIVE FAILURE, AS FIXTURES
+--
+-- Two sortLog records from one live session on Aether, reproduced here so the executor
+-- can never regress into either of them again:
+--
+--   FAILING  planMoves=60 executedMoves=305 waves=82 busyFallbackTicks=24 stallTicks=62
+--            durationMs=5320 avgAckMs=240 aborted=true reason="not converging (move
+--            budget spent)" fillPct=74 cells=88 context="bags"
+--            — plus a client "Internal Bag Error" and a layout left scattered with holes.
+--
+--   HEALTHY  planMoves=5 executedMoves=15 waves=13 stallTicks=15 avgAckMs=212
+--            aborted=false — a run the owner would have called fine, executing THREE
+--            TIMES its plan. The same defect, small enough to go unnoticed.
+--
+-- What makes these fixtures able to see the bug when the 2.0.2 suite could not: the
+-- simulator now models the client's TWO-PHASE settle (see makeSimulator's settleLag
+-- banner). Through 2.0.2 the sim published a slot's contents and released its lock in
+-- the same instant, so "unlocked" and "settled" were the same fact and the whole failure
+-- mode was unreachable in the harness.
+--
+-- THE PERMANENT GATE is asserted by the SIMULATOR, not the engine: `stats.lockedIssue`
+-- counts every container operation aimed at a slot the client reports LOCKED, and
+-- `stats.bagErrors` counts every refusal the client would answer with "Internal Bag
+-- Error". Both must be ZERO. The engine has no idea these counters exist.
+-- =====================================================================
+
+-- Seed a simulator to an EXACT occupied-cell count. The owner's report is quoted as a
+-- fill percentage, so the fixture has to hit it rather than approximate it.
+local function seedToFill(S, rng, occupiedTarget)
+    local slots, cids = {}, {}
+    for cid in pairs(S.bags) do cids[#cids + 1] = cid end
+    table.sort(cids)
+    for _, cid in ipairs(cids) do
+        for slot = 1, S.bags[cid].n do slots[#slots + 1] = { cid = cid, slot = slot } end
+    end
+    local placed, guard = 0, 0
+    while placed < occupiedTarget and guard < 20000 do      -- ceilinged: headless discipline
+        guard = guard + 1
+        local id   = SIMIDS[1 + math.floor(rng() * #SIMIDS)]
+        local maxS = SIMCAT[id].maxStack or 1
+        local n    = (maxS > 1) and (1 + math.floor(rng() * (maxS - 1))) or 1
+        local p    = slots[1 + math.floor(rng() * #slots)]
+        if not S:at(p.cid, p.slot) and S.canHoldSim(p.cid, id) then
+            S:set(p.cid, p.slot, id, n)
+            placed = placed + 1
+        end
+    end
+    return placed
+end
+
+-- The owner's combined view: 88 cells across a backpack and four bags, all general
+-- family (the failing run's context was "bags"), at 74% fill, on a 240ms round-trip.
+-- `settleLag` is the gap between ITEM_LOCK_CHANGED and BAG_UPDATE — the window the whole
+-- defect lives in. 0.15s is ~0.6 of the measured round-trip: well within what the live
+-- client's coalesced bag updates cost, and short enough that it is not doing the work of
+-- the assertion by itself.
+local function ownerSim(seed)
+    return makeSimulator({
+        bags = { { cid = 0, size = 20 }, { cid = 1, size = 17 }, { cid = 2, size = 17 },
+                 { cid = 3, size = 17 }, { cid = 4, size = 17 } },      -- 88 cells
+        latency = 0.24, jitter = 0.24 * 0.4, settleLag = 0.15, seed = seed or 880574 })
+end
+
+-- The healthy contrast: a small run whose OPENING PLAN is a handful of moves, on the same
+-- session's 212ms round-trip. 2.0.2 executed 15 for a plan of 5; the target is parity.
+local function healthySim(seed)
+    return makeSimulator({
+        bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+        latency = 0.212, jitter = 0.212 * 0.4, settleLag = 0.13, seed = seed or 212212 })
+end
+
+-- Everything both fixtures assert about ONE run, so the mutation gate below can re-use
+-- them verbatim against a 2.0.2-shaped executor. `tol` is the allowed excess of executed
+-- moves over the opening plan.
+local function convergenceAssertions(S, cids, tag, tol, limit, roundCost)
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = tag .. ": " .. m end end
+
+    local before = S:totals()
+    local plan0  = Sort.Plan({ cells = S:cells(), meta = simMetaFn })
+    local nPlan  = #plan0.moves
+    local depth  = #Sort.PartitionWaves(plan0.moves)
+    local tally  = runSortInSim(S, cids, { limit = limit or 240 })
+    local rec    = Sort._lastRun or {}
+
+    ---------------------------------------------------------------- the permanent gate
+    ck(S.stats.lockedIssue == 0, string.format(
+        "ZERO moves issued against a locked slot (sim counted %d)", S.stats.lockedIssue))
+    ck(S.stats.bagErrors == 0, string.format(
+        "the client refused NOTHING — no Internal Bag Error (sim counted %d)",
+        S.stats.bagErrors))
+    ck((rec.bagErrors or 0) == S.stats.bagErrors,
+        "…and the engine OBSERVED the same count it caused (telemetry: "
+        .. tostring(rec.bagErrors) .. ")")
+
+    ---------------------------------------------------------------- convergence
+    local completed = false
+    for _, line in ipairs(tally.prints) do
+        if line:find("sort complete", 1, true) then completed = true end
+    end
+    ck(completed, "ran to completion rather than aborting")
+    ck(Sort._running == false, "the executor stopped")
+    local same, badId = sameTotals(before, S:totals())
+    ck(same, "every item conserved (id " .. tostring(badId) .. ")")
+    ck(S.held == nil, "cursor left empty")
+    ck(not S:anyLocked(), "no slot left locked")
+    local re = Sort.Plan({ cells = S:cells(), meta = simMetaFn })
+    ck(#re.moves == 0, "reached the planner's fixed point (" .. #re.moves .. " residual)")
+
+    ---------------------------------------------------------------- NO OVER-ISSUE
+    -- THE HEADLINE NUMBER. 2.0.2 executed 305 moves for a 60-move plan and 15 for a
+    -- 5-move plan. The contract is parity within `tol`, and `tol` is 0 wherever the plan
+    -- contains no merge (a pour that leaves a residual is legitimately re-planned).
+    local exec = rec.executedMoves or 0
+    ck(nPlan > 0, "the fixture actually has work to do (" .. nPlan .. " planned)")
+    ck(exec <= nPlan + tol, string.format(
+        "executed %d moves for a %d-move plan (tolerance +%d)", exec, nPlan, tol))
+    ck(exec >= nPlan, string.format(
+        "…and did not somehow do LESS than the plan (%d < %d)", exec, nPlan))
+
+    ---------------------------------------------------------------- cost model
+    -- What `waves` MEANS here is "rounds that issued at least one move", and issuing is
+    -- per-move event-driven — a round fires the instant one slot settles, so a healthy
+    -- run has many small rounds by design and the wave COUNT is not a churn signal.
+    -- (The owner's failing run had 82 waves for 305 moves: 3.7 moves/wave, the same
+    -- ratio a healthy run shows. Waves never were the tell; executed/planned is.)
+    -- What waves must not do is exceed the moves they carried.
+    ck((rec.waves or 0) <= exec, string.format(
+        "every wave issued at least one move (%d waves, %d moves)", rec.waves or 0, exec))
+    -- WALL CLOCK against the physics: the run cannot beat the dependency depth in
+    -- round-trips, nor the in-flight bound in batches, and `slack` rounds cover the
+    -- settle window and the opening/closing ticks.
+    if roundCost and roundCost > 0 then
+        local rounds = math.max(depth, math.ceil(nPlan / Sort.MAX_IN_FLIGHT)) + 6
+        local bound  = rounds * roundCost * 1000
+        ck((rec.durationMs or 0) <= bound, string.format(
+            "%dms against a %dms bound (%d rounds x %dms)",
+            rec.durationMs or 0, bound, rounds, roundCost * 1000))
+    end
+    ck((rec.inFlightPeak or 0) <= Sort.MAX_IN_FLIGHT, string.format(
+        "in-flight peak %d never exceeded MAX_IN_FLIGHT (%d)",
+        rec.inFlightPeak or 0, Sort.MAX_IN_FLIGHT))
+    ck((rec.cleanupMoves or 0) == 0, "a COMPLETED run needs no cleanup wave")
+    return fails, rec, nPlan, depth
+end
+
+local function ownerFixtureAssertions()
+    local fails = {}
+    local function add(list) for _, f in ipairs(list) do fails[#fails + 1] = f end end
+
+    ------------------------------------------------------------------ FAILING RUN
+    local S = ownerSim()
+    local filled = seedToFill(S, newRng(74074), 65)          -- 65/88 == 73.9%
+    if filled ~= 65 then fails[#fails + 1] = "owner fixture: seeded " .. filled .. "/65 cells" end
+    -- tol +8: this layout is full of partial stacks, and a pour that leaves a residual is
+    -- legitimately re-planned on a later round (MergePour's model, not churn). 2.0.2 ran
+    -- this same fixture at 232 executed / 72 planned with 156 client refusals, so the
+    -- headroom this leaves is a rounding error against the defect it pins.
+    -- roundCost = latency + mean jitter + settleLag + one tick.
+    local f1, rec = convergenceAssertions(S, { 0, 1, 2, 3, 4 }, "owner 88-cell @74%",
+                                          8, 240, 0.24 + 0.048 + 0.15 + Sort.TICK)
+    add(f1)
+    if rec then
+        if (rec.cells or 0) ~= 88 then
+            fails[#fails + 1] = "owner fixture: telemetry says " .. tostring(rec.cells) .. " cells, not 88"
+        end
+        if math.abs((rec.fillPct or 0) - 74) > 1 then
+            fails[#fails + 1] = "owner fixture: telemetry says " .. tostring(rec.fillPct) .. "% fill, not 74"
+        end
+        -- The settle window MUST have been exercised, or this fixture proves nothing:
+        -- settleHolds counts the checks that found a slot unlocked with stale contents,
+        -- i.e. exactly the instants 2.0.2 re-issued a move into.
+        if (rec.settleHolds or 0) <= 0 then
+            fails[#fails + 1] =
+                "owner fixture: the settle window was never entered (settleHolds=0) — "
+                .. "the fixture is not reproducing the live conditions"
+        end
+    end
+
+    ------------------------------------------------------------------ HEALTHY RUN
+    -- The owner's healthy record: planMoves=5, executedMoves=15, avgAckMs=212. Seeded
+    -- with GEAR ONLY (every item maxStack 1), so the plan is pure exchanges with no pour
+    -- that could legitimately leave a residual for a later round — which lets the
+    -- tolerance be ZERO. executedMoves == planMoves, exactly, or this fails.
+    local H = healthySim()
+    seedRandomBags(H, newRng(1212), 7, 0)
+    local hPlan = #Sort.Plan({ cells = H:cells(), meta = simMetaFn }).moves
+    if hPlan < 3 or hPlan > 9 then
+        fails[#fails + 1] = "healthy fixture: plan is " .. hPlan ..
+            " moves, not the handful the owner's record shows"
+    end
+    local f2 = convergenceAssertions(H, { 0, 1 }, "healthy contrast", 0, 120,
+                                     0.212 + 0.042 + 0.13 + Sort.TICK)
+    add(f2)
+    return fails
+end
+
+local function testOwnerLiveFailure(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ck(Sort.MAX_IN_FLIGHT and Sort.MAX_IN_FLIGHT > 0, "there is an in-flight bound")
+    ck(Sort.SETTLE_TTL >= 0.5,
+        "the settle ceiling is longer than any single round-trip (else a healthy move "
+        .. "would be re-planned mid-flight)")
+    ck(Sort.SETTLE_ACKS >= 3,
+        "…and scales to at least 3 measured round-trips on a slow connection")
+    ck(Sort.WAIT_TICK > Sort.TICK,
+        "a WAITING round backs off rather than re-planning at the working cadence")
+    ck(Sort.IsBagError(44, nil) and Sort.IsBagError(nil, "Internal Bag Error"),
+        "the bag-error classifier matches by id AND by message text")
+    ck(not Sort.IsBagError(1, "You are out of range"), "…and not by everything")
+
+    for _, f in ipairs(ownerFixtureAssertions()) do fails[#fails + 1] = f end
+end
+
+-- MUTATION GATE for the settle rule. Sort.PredSettled IS the fix, so the 2.0.2 executor
+-- is expressible as one replacement for it — which is what makes this a real red→green
+-- pin rather than a test that merely passes today.
+local function testSettleMutants(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local realSettled, realInFlight = Sort.PredSettled, Sort.MAX_IN_FLIGHT
+    local mutants = {
+        { name = "2.0.2 EXACTLY: unlocked is settled (the shipped defect)",
+          settled = function() return true end },
+        { name = "settles on the item id alone, ignoring the stack count",
+          settled = function(p)
+              local CC = _G.C_Container
+              if not (CC and CC.GetContainerItemInfo) then return true end
+              local info = CC.GetContainerItemInfo(p.cid, p.slot)
+              local id = (info and info.itemID) or nil
+              return id == p.id
+          end },
+        { name = "never settles (predictions only ever time out)",
+          settled = function() return false end },
+        { name = "the in-flight bound is removed (2.0.2's 24-move burst)",
+          inFlight = 9999 },
+    }
+    for _, mut in ipairs(mutants) do
+        if mut.settled then Sort.PredSettled = mut.settled end
+        if mut.inFlight then Sort.MAX_IN_FLIGHT = mut.inFlight end
+        local ok, res = pcall(ownerFixtureAssertions)
+        Sort.PredSettled, Sort.MAX_IN_FLIGHT = realSettled, realInFlight
+        local killed = (not ok) or (#res > 0)
+        ck(killed, "mutant SURVIVED the owner's live-failure fixtures: " .. mut.name)
+    end
+    ck(Sort.PredSettled == realSettled and Sort.MAX_IN_FLIGHT == realInFlight,
+        "the real settle rule and in-flight bound were restored after mutation")
+end
+
+-- =====================================================================
+-- 2.0.3 — THE GRACEFUL ABORT
+--
+-- The live failure did not merely stop: it stopped MID-LAYOUT, leaving the grid
+-- "scattered with holes". Convergence is one contract; ending tidily when convergence
+-- is impossible is a separate one, and it is the one the owner actually saw fail.
+-- =====================================================================
+local function testGracefulAbort(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------ the pure planner
+    -- CompactMoves on a deliberately holed layout: holes close, nothing is invented.
+    do
+        local cells = {}
+        for slot = 1, 12 do cells[#cells + 1] = { cid = 0, slot = slot, id = nil, count = 0 } end
+        local place = { [2] = 601, [5] = 602, [6] = 603, [11] = 604 }
+        for slot, id in pairs(place) do cells[slot].id, cells[slot].count = id, 1 end
+        local moves = Sort.CompactMoves(cells, nil, nil)
+        -- THREE moves, not four: 601 is already in cell 2 and the two-pointer pass
+        -- never moves an item that a hole in front of it has not claimed.
+        ck(#moves == 3, "the tail is pulled forward into the holes (" .. #moves .. " moves)")
+        local occupied, ids = {}, {}
+        for i, c in ipairs(cells) do
+            if c.id then occupied[#occupied + 1] = i; ids[c.id] = (ids[c.id] or 0) + 1 end
+        end
+        ck(#occupied == 4, "…the item count is unchanged")
+        local contiguous = true
+        for i, idx in ipairs(occupied) do if idx ~= i then contiguous = false end end
+        ck(contiguous, "…and they end up in cells 1..4 with no hole between them")
+        for _, id in pairs(place) do ck(ids[id] == 1, "…item " .. id .. " survived exactly once") end
+        -- Slot-disjoint: one wave, no move waiting on another.
+        ck(#Sort.PartitionWaves(moves) <= 1, "…and the whole compaction is ONE wave")
+    end
+
+    -- A locked / user-locked / in-flight cell is never touched, and a family bag never
+    -- receives something it cannot hold.
+    do
+        local cells = {}
+        for slot = 1, 8 do cells[#cells + 1] = { cid = 0, slot = slot, id = nil, count = 0 } end
+        cells[1].userLocked = true
+        cells[2].locked     = true
+        cells[6].id, cells[6].count = 601, 1
+        local moves = Sort.CompactMoves(cells, nil, function(c) return c.slot == 3 end)
+        ck(#moves == 1, "one item, one move")
+        ck(moves[1] and moves[1].b.slot == 4, string.format(
+            "…into the first cell that is neither user-locked, live-locked nor in flight (got %s)",
+            moves[1] and tostring(moves[1].b.slot) or "none"))
+        local blocked = Sort.CompactMoves(
+            { { cid = 0, slot = 1, id = nil, count = 0 },
+              { cid = 0, slot = 2, id = 700, count = 1 } },
+            function() return false end, nil)
+        ck(#blocked == 0, "a hole the item may not legally occupy is left alone")
+    end
+
+    ------------------------------------------------------------------ end to end
+    -- A server that refuses everything cannot converge, so the run MUST abort — and the
+    -- abort must close the holes it opened and say so in plain words.
+    do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+                                  latency = 0.05, dropRate = 1.0, settleLag = 0.05,
+                                  seed = 4242 })
+        seedRandomBags(S, newRng(2024), 9, 5)
+        local before = S:totals()
+        local tally  = runSortInSim(S, { 0, 1 }, { limit = 400 })
+        local rec    = Sort._lastRun or {}
+        local stopped
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort stopped", 1, true) then stopped = line end
+        end
+        ck(stopped ~= nil, "a fully-rejecting server aborts rather than spinning")
+        ck(S.stats.lockedIssue == 0,
+            "…and STILL never issued against a locked slot (" .. S.stats.lockedIssue .. ")")
+        local same = sameTotals(before, S:totals())
+        ck(same, "…with every item conserved")
+        ck(S.held == nil, "…and the cursor empty")
+        if stopped then
+            ck(stopped:find("still outstanding") ~= nil,
+                "…the abort says how much arranging is left: " .. stopped)
+        end
+        ck(rec.aborted == true, "…the telemetry record marks it aborted")
+        ck(Sort._running == false, "…and the run tore itself down")
+    end
+
+    -- The real shape of the owner's complaint: a run that aborts must not leave HOLES in
+    -- front of items. Deliberately holed opening layout (items on the ODD cells of a
+    -- 16-slot bag, in an order the planner will want to rearrange), aborted part way.
+    do
+        local S = makeSimulator({ bags = { { cid = 0, size = 16 } },
+                                  latency = 0.10, settleLag = 0.06, seed = 909 })
+        local ids = { 606, 601, 610, 603, 608, 602, 612, 604 }
+        for i, id in ipairs(ids) do S:set(0, i * 2 - 1, id, 1) end   -- 1,3,5,...,15
+        S:install()
+        local tally
+        local savedFactor, savedSlack = Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK
+        local ok = pcall(function()
+            tally = withFakeUI(function()
+                Sort.Run({ 0 })
+                S:pump(0.12)                     -- let the opening wave land
+                -- Force the abort the owner actually hit ("move budget spent") part way
+                -- through. Zeroing `_budget` alone would not do it: the budget RATCHETS
+                -- UP on every improvement (Sort._tick), so a progressing run rebuilds it
+                -- on the next round. Zeroing the ratchet's own terms first is what makes
+                -- the cut stick — and it aborts through the real code path, not a hook.
+                if Sort._running then
+                    Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK = 0, 0
+                    Sort._budget = Sort._moveCount or 0
+                end
+                S:pump(60)
+            end)
+        end)
+        Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK = savedFactor, savedSlack
+        if Sort._running then Sort._running = false end
+        S:restore()
+        ck(ok, "the mid-run abort fixture ran")
+        if ok then
+            local stoppedLine
+            for _, line in ipairs(tally.prints) do
+                if line:find("sort stopped", 1, true) then stoppedLine = line end
+            end
+            ck(stoppedLine ~= nil, "…the run really did abort (" ..
+                tostring(tally.prints[#tally.prints]) .. ")")
+            -- Every occupied cell must come before every empty one: no holes in front.
+            local cells, seenHole, holed = S:cells(), false, false
+            for _, c in ipairs(cells) do
+                if c.id == nil then seenHole = true
+                elseif seenHole then holed = true end
+            end
+            ck(not holed, "an aborted run leaves NO hole in front of an item "
+                .. "(the owner's 'scattered with holes')")
+            ck(S.stats.lockedIssue == 0, "…and the cleanup wave issued nothing at a locked slot")
+            ck(S.held == nil, "…and left the cursor empty")
+            local tidied
+            for _, line in ipairs(tally.prints) do
+                if line:find("Tidied up", 1, true) then tidied = line end
+            end
+            ck(tidied ~= nil, "…and said so plainly in chat: " .. tostring(tidied))
+        end
+    end
+end
+
 function Sort.RunSelfTests(verbose)
     local suites = {
         { name = "merge pour (exhaustive)", fn = testMergePour },
@@ -4221,6 +5120,9 @@ function Sort.RunSelfTests(verbose)
         { name = "telemetry: sort log ring",  fn = testSortLog },
         { name = "converge: event-driven issue", fn = testEventDrivenIssue },
         { name = "converge: issuing mutation gate", fn = testEventIssueMutants },
+        { name = "converge: owner's live failure (2.0.3)", fn = testOwnerLiveFailure },
+        { name = "converge: settle mutation gate", fn = testSettleMutants },
+        { name = "converge: graceful abort", fn = testGracefulAbort },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
