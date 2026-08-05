@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased — 2.0.3
+
+**Sorting a full bag no longer throws "Internal Bag Error" and stops half way. The sort
+now waits for the game to confirm each move before it plans the next one, which means it
+stops re-doing moves it has already done — and if it does have to stop early, it tidies
+the gaps away instead of leaving your bags scattered.**
+
+### The sort was doing the same moves over and over
+
+A sort on a full combined view (88 slots, three quarters full) planned 60 moves and then
+performed **305** of them, threw an Internal Bag Error, and gave up part way through with
+items scattered and holes everywhere. Even a sort that looked fine that same session
+performed 15 moves for a 5-move plan. The sort had been doing roughly three times the
+work it needed to for as long as 2.0 has existed; a big bag just made it fatal.
+
+The cause: the game tells an addon two separate things after it moves an item — first
+"the slot is free again", and only later "here is what is in that slot now". Bags treated
+the first message as the whole answer. In the gap between the two it looked at a slot,
+saw its *old* contents, decided the move still needed doing, and did it again. The server
+had already applied the original move, so it refused the duplicate — which is exactly what
+"Internal Bag Error" means — and the sort went round again, and again.
+
+Bags now waits for the second message. A move counts as done when the slot actually shows
+what the move was supposed to put there, not merely when it stops being busy. Alongside
+that:
+
+- **A move that is still in the air is never issued twice**, and the slots it touches are
+  off limits to the rest of that round.
+- **At most ten moves are in flight at once.** Each one takes two slots out of play, so the
+  old unlimited burst could freeze more than half a large bag and leave the sort with
+  nothing legal to do.
+- **A round with nothing legal to do now waits** for the game to say something, instead of
+  re-planning twenty times a second and burning through its move budget.
+
+On the reconstruction of your failing bag, the old behaviour performs 307 moves for a
+72-move plan with 233 refusals; the new one performs 78 with none. The small everyday
+sort goes from 30 moves for a 7-move plan to exactly 7.
+
+### If a sort has to stop, it tidies up first
+
+An interrupted sort used to leave the bag exactly as it was mid-shuffle — items parked in
+temporary places, gaps in front of them. Any sort that stops early now finishes with a
+single tidy-up pass that pulls items forward to close the gaps, and says so:
+
+> sort stopped: not converging (move budget spent) (78 moves in 46 waves, 4.23s). Tidied
+> up: 5 items pulled back to close the gaps. 12 moves still outstanding — run sort again
+> to finish.
+
+It does not try to finish the sort — that is the next run's job — it just makes sure you
+are never left looking at a bag full of holes. It is skipped when the bags are not Bags'
+to touch any more: in combat, with the bank closed, or after you have closed the window.
+
+### The sort log says more
+
+`/bags sortlog` records six new numbers per run, added alongside the existing ones so
+older logs still read correctly: how many operations the game refused (`err=` now appears
+on the log line when it is not zero), how many rounds spent waiting for the game to catch
+up, how often a slot was seen free but not yet updated, how many moves the server never
+confirmed, the peak number of moves in flight, and how many moves the tidy-up pass made.
+
+Bags now watches the game's own error messages during a sort, so a refusal is counted
+where it happens rather than inferred afterwards.
+
 ## 2.0.2 — 2026-08-04
 
 **Characters that only exist in Daseeki Nexus now show up in the character menu with a
