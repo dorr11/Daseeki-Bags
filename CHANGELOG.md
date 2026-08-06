@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.4 — 2026-08-05
 
 **You can swap your bank bags again. Drag a bag onto one of the numbered slots above the
 bank grid — or pick one up with a click — exactly as you always could in 1.x and as you
