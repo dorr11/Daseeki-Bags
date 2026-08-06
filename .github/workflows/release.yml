@@ -4,6 +4,10 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual fallback: dispatch AT a tag ref (gh workflow run release.yml --ref vX.Y.Z)
+  # for when a tag-push event is lost (first seen: the 2026-08-06 Actions outage
+  # swallowed v2.0.4's push events; re-pushing the tag did not regenerate them).
+  workflow_dispatch:
 
 jobs:
   release:
