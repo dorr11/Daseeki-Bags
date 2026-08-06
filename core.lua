@@ -192,6 +192,13 @@ local function dispatch(msg)
         elseif sub == "toolbar" then
             if ns.Frame and ns.Frame.DebugToolbar then ns.Frame.DebugToolbar()
             else ns:Print("toolbar diagnostic unavailable") end
+        elseif sub == "bankstrip" then
+            -- 2.0.4: the BANK bag-slot strip's sibling of `debug strip`. Added with the
+            -- bank-bag swap fix for exactly the reason the inventory one was added — the
+            -- defect it fixes was a SILENT behavioral report (no Lua error anywhere, the
+            -- cells simply did nothing), and a readout is what turns that into a fact.
+            if ns.Bank and ns.Bank.DebugStrip then ns.Bank.DebugStrip()
+            else ns:Print("bank strip diagnostic unavailable") end
         elseif sub == "money" then
             if ns.Frame and ns.Frame.DebugMoney then ns.Frame.DebugMoney()
             else ns:Print("money diagnostic unavailable") end
@@ -222,7 +229,7 @@ local function dispatch(msg)
         ns:Print("  /bags combined|split - switch layout")
         ns:Print("  /bags sortlog [clear] - the last 50 sort runs, newest first")
         ns:Print("  /bags debug selftest - run self-tests")
-        ns:Print("  /bags debug strip|toolbar|money - diagnose the open window")
+        ns:Print("  /bags debug strip|bankstrip|toolbar|money - diagnose the open window")
         ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
     else
         ns:Print("unknown command '" .. cmd .. "'. Try /bags help.")

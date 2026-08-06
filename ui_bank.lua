@@ -66,6 +66,10 @@ Bank.STRIP_H   = 22   -- bank-bag purchase/toggle strip
 -- minus the raid-prep glyph (1.x only ever put that on the inventory frame).
 Bank.FOOTER_H  = 22
 Bank.VGAP      = 6
+-- Accept-cue alpha for a purchased bank-bag cell while a bag rides the cursor. Deliberately
+-- softer than the inventory strip's 0.75 active-bag halo: this one is transient guidance,
+-- not a standing state, and it must not shout over a strip of otherwise-calm wells.
+Bank.ACCEPT_GLOW_ALPHA = 0.45
 
 ----------------------------------------------------------------------
 -- PURE: bank container ordering (bank main first, then bank bags ascending)
@@ -115,6 +119,103 @@ function Bank.PurchaseState(numPurchased, totalSlots)
         elseif i == numPurchased + 1 then state = "buyable"
         else state = "locked" end
         out[i] = { index = i, cid = Bank.BankBagCID(i), state = state }
+    end
+    return out
+end
+
+----------------------------------------------------------------------
+-- PURE: bank-bag STRIP CELL behaviour  (2.0.4 — owner-reported "the bank window
+-- in bags won't let me swap bags")
+--
+-- THE DEFECT this replaces: a PURCHASED cell rendered the equipped bag's icon and
+-- then set OnEnter/OnClick to nil. It was a picture. And because 2.0 SUPPRESSES
+-- Blizzard's bank panel (the override block further down), the native bank bag
+-- slots are unreachable too — so equipping or swapping a bank bag was not merely
+-- awkward, it was IMPOSSIBLE while our window was on. 1.x had this: its bank bag
+-- buttons were the same Bag class as the carried ones (frames/bank/bankBag.lua
+-- subclasses core/classes/bag.lua, whose OnClick does PutItemInBag(self.slot),
+-- OnDragStart does PickupBagFromSlot(self.slot), and OnReceiveDrag IS OnClick).
+-- This is 1.x parity, restored on the 2.0 surface.
+--
+-- The decision is pure so the whole cursor × state × view × combat matrix is
+-- harness-locked; the executor below it is the only impure half.
+--
+--   ctx = { state, live, isSelf, cursorItem, cursorBag, equipped, inCombat }
+--     state      "purchased" | "buyable" | "locked"
+--     live/isSelf   the exact pair Bank.RebuildStrip already gates the strip on —
+--                   cells are interactive ONLY on the live self view at the bank,
+--                   never on a cached or alt view.
+--     cursorItem    something is on the cursor at all
+--     cursorBag     ...and it is an equippable CONTAINER (INVTYPE_BAG). A non-bag
+--                   must be REFUSED, not eaten: we never call PutItemInBag with a
+--                   sword on the cursor, and we never ClearCursor it either.
+--     equipped      a bag currently occupies this bank bag slot
+--
+--   returns {
+--     interactive,      -- cell takes any handler at all
+--     clickAction,      -- "equip" | "pickup" | "buy" | "refuse" | "blocked-combat" | "none"
+--     dragAction,       -- "pickup" | "blocked-combat" | nil
+--     dropAction,       -- "equip"  | "refuse" | "blocked-combat" | nil
+--     acceptHighlight,  -- subtle "this cell will take that bag" cue
+--     tooltip,          -- "bag" | "empty-slot" | "buy" | nil
+--   }
+--
+-- NOTE on swapping onto an OCCUPIED slot: we do not pre-judge it. PutItemInBag is
+-- the same call the default UI makes; the client itself refuses a swap whose bag
+-- still holds items and prints its own error. Surfacing the client's refusal is
+-- honest; blocking a swap the client would have allowed is not.
+----------------------------------------------------------------------
+
+function Bank.StripCellState(ctx)
+    ctx = ctx or {}
+    local state      = ctx.state
+    local usable     = (ctx.live and ctx.isSelf) and true or false
+    local cursorItem = ctx.cursorItem and true or false
+    local cursorBag  = ctx.cursorBag  and true or false
+    local equipped   = ctx.equipped   and true or false
+    local inCombat   = ctx.inCombat   and true or false
+
+    local out = { interactive = false, clickAction = "none", dragAction = nil,
+                  dropAction = nil, acceptHighlight = false, tooltip = nil }
+
+    -- Cached / alt / bank-closed view: the strip is not even shown, and a stale
+    -- click must never reach an equip call. Locked cells are inert by definition.
+    if not usable or state == "locked" then return out end
+
+    if state == "buyable" then
+        -- Unchanged from 2.0.0: the one bronze "buy" well, its own confirm, its own
+        -- tooltip. It is NOT a bag slot yet, so it takes no drop and no drag.
+        out.interactive = true
+        out.clickAction = "buy"
+        out.tooltip     = "buy"
+        return out
+    end
+
+    if state ~= "purchased" then return out end
+
+    out.interactive = true
+    out.tooltip     = equipped and "bag" or "empty-slot"
+
+    if cursorItem and not cursorBag then
+        -- Something on the cursor that is not a container. Refuse it plainly and
+        -- leave the cursor holding it (eating it would be a silent item move).
+        out.clickAction = "refuse"
+        out.dropAction  = "refuse"
+        return out
+    end
+
+    if cursorBag then
+        out.acceptHighlight = not inCombat
+        out.clickAction = inCombat and "blocked-combat" or "equip"
+        out.dropAction  = inCombat and "blocked-combat" or "equip"
+        return out
+    end
+
+    -- Empty cursor: click or drag picks the equipped bag up so it can be moved or
+    -- swapped naturally. An empty purchased slot has nothing to take.
+    if equipped then
+        out.clickAction = inCombat and "blocked-combat" or "pickup"
+        out.dragAction  = inCombat and "blocked-combat" or "pickup"
     end
     return out
 end
@@ -628,6 +729,178 @@ function Bank.BuyNextSlot()
     })
 end
 
+----------------------------------------------------------------------
+-- BANK-BAG SLOT MANAGEMENT (the impure half of Bank.StripCellState)
+--
+-- Insecure + hardware-event-driven (OnClick / OnReceiveDrag / OnDragStart), exactly
+-- as ui_frame.lua's carried-bag strip: bags are NOT part of the secure action system
+-- on Classic Era, and PutItemInBag / PickupBagFromSlot need a hardware event, which
+-- those three handlers supply. NO protected op on any secure frame runs here.
+--
+-- Catalog-verified against wow-api-catalog/1.15.9.68808 (interface 11509):
+--   C_Container.ContainerIDToInventoryID(containerID) -> inventoryID  (functions.txt)
+--   PutItemInBag, PickupBagFromSlot, GetInventoryItemLink,
+--   GetInventoryItemTexture, IsInventoryItemLocked, CursorHasItem, GetCursorInfo,
+--   GetItemInfoInstant / C_Item.GetItemInfoInstant, InCombatLockdown  (globals.txt)
+--   Event.Cursor.CursorChanged == CURSOR_CHANGED,
+--   Event.Bank.PlayerbankbagslotsChanged == PLAYERBANKBAGSLOTS_CHANGED,
+--   Event.Container.BagUpdateDelayed == BAG_UPDATE_DELAYED  (events.txt)
+----------------------------------------------------------------------
+
+-- The inventory (equip) slot for a BANK BAG container id — the ONE mapping between a
+-- strip cell and the slot PutItemInBag / PickupBagFromSlot act on. It is the same call
+-- the cell's icon code has always made; hoisted to a named function so the paint and the
+-- handlers cannot drift apart, and public so the harness can lock cell index -> cid ->
+-- inventory slot end to end. Nil when the client API is absent (never guessed).
+function Bank.BagInventorySlot(cid)
+    if type(cid) ~= "number" then return nil end
+    local CC = _G.C_Container
+    if CC and CC.ContainerIDToInventoryID then return CC.ContainerIDToInventoryID(cid) end
+    if _G.ContainerIDToInventoryID then return _G.ContainerIDToInventoryID(cid) end
+    return nil
+end
+local function bankInvSlot(cid) return Bank.BagInventorySlot(cid) end
+
+-- Live "is a bag equipped in this bank bag slot" (authoritative before capture re-snapshots).
+local function bankSlotEquipped(invSlot)
+    if invSlot and _G.GetInventoryItemLink then
+        return _G.GetInventoryItemLink("player", invSlot) ~= nil
+    end
+    return false
+end
+
+-- Live cursor read -> (cursorItem, cursorBag). Classification reuses ui_frame's PURE
+-- Frame.CursorIsBag so both strips answer "is that a bag?" the same way. Permissive
+-- when an item cannot be classified yet (server-uncached): we would rather let the
+-- client refuse than refuse on the client's behalf.
+local function bankCursor()
+    if _G.GetCursorInfo then
+        local kind, id = _G.GetCursorInfo()
+        if kind == nil then return false, false end
+        if kind ~= "item" then return true, false end
+        local gii = (_G.C_Item and _G.C_Item.GetItemInfoInstant) or _G.GetItemInfoInstant
+        if gii and id then
+            local _, _, _, equipLoc = gii(id)
+            if equipLoc ~= nil then
+                local isBag = (ns.Frame and ns.Frame.CursorIsBag)
+                              and ns.Frame.CursorIsBag(kind, equipLoc)
+                              or (equipLoc == "INVTYPE_BAG")
+                return true, isBag and true or false
+            end
+        end
+        return true, true          -- item on cursor, unclassifiable: permissive
+    end
+    local has = (_G.CursorHasItem and _G.CursorHasItem()) and true or false
+    return has, has
+end
+
+local function bankInCombat()
+    return (_G.InCombatLockdown and _G.InCombatLockdown()) and true or false
+end
+
+-- Live facts for one strip cell -> the resolved pure state.
+local function bankCellStateNow(cell)
+    local cursorItem, cursorBag = bankCursor()
+    return Bank.StripCellState({
+        state      = cell._state,
+        live       = Bank._live,
+        isSelf     = cell._isSelf,
+        cursorItem = cursorItem,
+        cursorBag  = cursorBag,
+        equipped   = bankSlotEquipped(cell._slot),
+        inCombat   = bankInCombat(),
+    })
+end
+
+-- Plain deferred-in-combat notice; same copy shape as the inventory strip's.
+function Bank.NotifyBagCombatBlocked()
+    if ns and ns.Print then ns:Print("Can't equip or swap bank bags while in combat — try again after combat.") end
+    if _G.PlaySound and _G.SOUNDKIT then _G.PlaySound(_G.SOUNDKIT.IG_PLAYER_INVITE_DECLINE or 847) end
+end
+
+-- Execute one resolved action. The cursor is NEVER cleared here: a refusal leaves the
+-- held item exactly where it was so nothing can go missing.
+function Bank.RunStripCellAction(action, cell)
+    local slot = cell and cell._slot
+    if action == "equip" then
+        if slot and _G.PutItemInBag then _G.PutItemInBag(slot) end   -- equip/replace; the client rules on the swap
+    elseif action == "pickup" then
+        if slot and _G.PickupBagFromSlot then
+            if _G.PlaySound and _G.SOUNDKIT then _G.PlaySound(_G.SOUNDKIT.IG_BACKPACK_OPEN or 862) end
+            _G.PickupBagFromSlot(slot)
+        end
+    elseif action == "buy" then
+        Bank.BuyNextSlot()
+    elseif action == "refuse" then
+        if ns and ns.Print then ns:Print("Only a bag can go in a bank bag slot.") end
+        if _G.PlaySound and _G.SOUNDKIT then _G.PlaySound(_G.SOUNDKIT.IG_PLAYER_INVITE_DECLINE or 847) end
+    elseif action == "blocked-combat" then
+        Bank.NotifyBagCombatBlocked()
+    end
+    -- "none"/nil => inert
+end
+
+-- Tooltip for a purchased cell: the equipped bag itself (SetInventoryItem), or the
+-- empty-slot invitation, plus the one context instruction. Quiet until hovered.
+local function bankCellTooltip(cell)
+    local GT = _G.GameTooltip
+    if not GT then return end
+    local st = bankCellStateNow(cell)
+    if st.tooltip == "buy" then
+        GT:SetOwner(cell, "ANCHOR_RIGHT")
+        GT:ClearLines()
+        GT:AddLine("Buy bank bag slot", UI.Color("text"))
+        GT:AddLine(moneyString(nextBankSlotCost()), 1, 1, 1)
+        GT:Show()
+        return
+    end
+    if not st.tooltip then return end
+    GT:SetOwner(cell, "ANCHOR_RIGHT")
+    GT:ClearLines()
+    local cursorItem, cursorBag = bankCursor()
+    if st.tooltip == "bag" then
+        if cell._slot and GT.SetInventoryItem then GT:SetInventoryItem("player", cell._slot) end
+        if cursorItem and not cursorBag then
+            GT:AddLine("Only a bag can go in a bank bag slot", UI.Color("muted"))
+        elseif cursorBag then
+            GT:AddLine("Click to replace this bank bag", UI.Color("muted"))
+        else
+            GT:AddLine("Drag out or click to take this bag", UI.Color("muted"))
+        end
+    else
+        GT:SetText("Empty bank bag slot", UI.Color("text"))
+        if cursorItem and not cursorBag then
+            GT:AddLine("Only a bag can go in a bank bag slot", UI.Color("muted"))
+        elseif cursorBag then
+            GT:AddLine("Click to put the bag on your cursor here", UI.Color("muted"))
+        else
+            GT:AddLine("Drag a bag here to equip it", UI.Color("muted"))
+        end
+    end
+    GT:Show()
+end
+
+-- Re-evaluate ONLY the two per-cell CUES — the accept halo and the mid-pickup lock
+-- desaturation — across the shown cells. Deliberately not a Rebuild: CURSOR_CHANGED and
+-- ITEM_LOCK_CHANGED both fire on ordinary item handling all over the UI, and neither
+-- changes any bank DATA. Repainting the whole window on them would be a real cost for a
+-- texture flip (1.x made the same split: Bag:UpdateLock, not a frame update).
+function Bank.RefreshStripAffordance()
+    local win = Bank.window
+    if not win or not win._stripCells then return end
+    for _, cell in ipairs(win._stripCells) do
+        if cell.IsShown and cell:IsShown() then
+            local st = bankCellStateNow(cell)
+            if cell._accept then cell._accept:SetShown(st.acceptHighlight and true or false) end
+            if cell._state == "purchased" and cell._icon and cell._icon.SetDesaturated then
+                local locked = cell._slot and _G.IsInventoryItemLocked
+                               and _G.IsInventoryItemLocked(cell._slot)
+                cell._icon:SetDesaturated(locked and true or false)
+            end
+        end
+    end
+end
+
 -- Rebuild the purchase/toggle strip. Purchase controls appear only AT the bank
 -- (self + live); otherwise the strip is hidden (no stale cost away from the banker).
 function Bank.RebuildStrip(renderModelLive, isSelf)
@@ -649,6 +922,8 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
         if not cell then
             cell = _G.CreateFrame("Button", nil, win.strip, "BackdropTemplate")
             cell:SetSize(SIZE, SIZE)
+            cell:RegisterForClicks("LeftButtonUp")
+            cell:RegisterForDrag("LeftButton")
             -- Equipped bank-bag ICON (R3 design point 2): a PURCHASED bank-bag cell shows
             -- the equipped bag's item texture (trimmed to the suite icon treatment). Under
             -- the number; hidden for buyable/locked/empty cells. Pure insecure-child art.
@@ -659,16 +934,62 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
             icon:SetTexCoord(t, 1 - t, t, 1 - t)
             icon:Hide()
             cell._icon = icon
+            -- ACCEPT CUE: the additive halo the inventory strip already wears for its
+            -- active bag (ui_frame STRIP_GLOW_TEXTURE / _ALPHA), reused here as the
+            -- "this cell will take that bag" cue while a container is on the cursor.
+            -- Quiet-until-needed: hidden at rest, never standing decoration.
+            local accept = cell:CreateTexture(nil, "OVERLAY", nil, -2)
+            accept:SetTexture((ns.Frame and ns.Frame.STRIP_GLOW_TEXTURE)
+                              or "Interface\\Buttons\\CheckButtonHilight")
+            accept:SetBlendMode("ADD")
+            accept:SetPoint("TOPLEFT", cell, "TOPLEFT", -2, 2)
+            accept:SetPoint("BOTTOMRIGHT", cell, "BOTTOMRIGHT", 2, -2)
+            accept:SetAlpha(Bank.ACCEPT_GLOW_ALPHA)
+            accept:Hide()
+            cell._accept = accept
             local fs = cell:CreateFontString(nil, "OVERLAY")
             fs:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
             fs:SetPoint("CENTER", cell, "CENTER", 0, 0)
             cell._fs = fs
+            -- HANDLERS ARE BAKED ONCE, at creation, and dispatch through the PURE
+            -- decision (which reads cell._state / cell._isSelf). A cell that is not a
+            -- live purchased bag slot resolves to "none" and the handler does nothing —
+            -- so a buyable/locked cell, or any cell on a cached or alt view, is inert by
+            -- decision rather than by whether some earlier repaint remembered to nil the
+            -- script out. (Nilling scripts per state is exactly how the purchased cells
+            -- ended up display-only in the first place.)
+            cell:SetScript("OnEnter", function(self)
+                bankCellTooltip(self)
+                if self._accept then
+                    self._accept:SetShown(bankCellStateNow(self).acceptHighlight and true or false)
+                end
+            end)
+            cell:SetScript("OnLeave", function(self)
+                if _G.GameTooltip then _G.GameTooltip:Hide() end
+            end)
+            cell:SetScript("OnClick", function(self)
+                Bank.RunStripCellAction(bankCellStateNow(self).clickAction, self)
+            end)
+            cell:SetScript("OnReceiveDrag", function(self)
+                Bank.RunStripCellAction(bankCellStateNow(self).dropAction, self)
+            end)
+            cell:SetScript("OnDragStart", function(self)
+                Bank.RunStripCellAction(bankCellStateNow(self).dragAction, self)
+            end)
             win._stripCells[i] = cell
         end
+        -- Identity the baked handlers read. _isSelf is the SAME pair the strip is shown
+        -- under, carried onto the cell so the decision can re-assert it at click time.
+        cell._index  = s.index
+        cell._cid    = s.cid
+        cell._state  = s.state
+        cell._isSelf = isSelf and true or false
+        cell._slot   = (s.state == "purchased") and bankInvSlot(s.cid) or nil
         cell:ClearAllPoints()
         cell:SetPoint("LEFT", win.strip, "LEFT", x, 0)
         x = x + SIZE + GAP
         cell:SetBackdrop(UI.FLAT_BACKDROP)
+        cell._accept:Hide()
         if s.state == "purchased" then
             cell:SetBackdropColor(UI.Color("raised"))
             cell:SetBackdropBorderColor(UI.Color("border"))
@@ -676,9 +997,7 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
             cell._fs:SetTextColor(UI.Color("text"))
             -- Show the equipped bank bag's icon (its mapped inventory slot). Falls back
             -- to the index number if the texture can't be resolved.
-            local CC = _G.C_Container
-            local invSlot = (CC and CC.ContainerIDToInventoryID and CC.ContainerIDToInventoryID(s.cid))
-                         or (_G.ContainerIDToInventoryID and _G.ContainerIDToInventoryID(s.cid))
+            local invSlot = cell._slot
             local tex = invSlot and _G.GetInventoryItemTexture and _G.GetInventoryItemTexture("player", invSlot)
             if tex then
                 cell._icon:SetTexture(tex)
@@ -690,32 +1009,56 @@ function Bank.RebuildStrip(renderModelLive, isSelf)
                 cell._icon:Hide()
                 cell._fs:Show()
             end
-            cell:SetScript("OnEnter", nil)
-            cell:SetScript("OnClick", nil)
+            -- Lock feedback: a bank bag mid-pickup desaturates (1.x Bag:UpdateLock).
+            if invSlot and _G.IsInventoryItemLocked and _G.IsInventoryItemLocked(invSlot) then
+                if cell._icon:IsShown() and cell._icon.SetDesaturated then cell._icon:SetDesaturated(true) end
+                cell._fs:SetTextColor(UI.Color("faint"))
+            end
         elseif s.state == "buyable" then
             cell._icon:Hide(); cell._fs:Show()
             cell:SetBackdropColor(UI.Color("control"))
             cell:SetBackdropBorderColor(UI.Color("bronze"))   -- the one bronze "buy" well
             cell._fs:SetText("+")
             cell._fs:SetTextColor(UI.Color("bronze"))
-            cell:SetScript("OnEnter", function(self)
-                local GT = _G.GameTooltip; if not GT then return end
-                GT:SetOwner(self, "ANCHOR_RIGHT")
-                GT:AddLine("Buy bank bag slot", UI.Color("text"))
-                GT:AddLine(moneyString(nextBankSlotCost()), 1, 1, 1)
-                GT:Show()
-            end)
-            cell:SetScript("OnLeave", function() if _G.GameTooltip then _G.GameTooltip:Hide() end end)
-            cell:SetScript("OnClick", function() Bank.BuyNextSlot() end)
         else -- locked
             cell:SetBackdropColor(UI.Color("inset"))
             cell:SetBackdropBorderColor(UI.Color("controlBorder"))
             cell._icon:Hide(); cell._fs:Show()
             cell._fs:SetText("")
-            cell:SetScript("OnEnter", nil)
-            cell:SetScript("OnClick", nil)
         end
         cell:Show()
+    end
+end
+
+----------------------------------------------------------------------
+-- Diagnostics (/bags debug bankstrip) — print the LIVE decision for every bank-bag
+-- cell, so "the bank window won't let me swap bags" becomes a readout instead of a
+-- guess. Sibling of Frame.DebugStrip; guarded + in-game only (needs the built window).
+----------------------------------------------------------------------
+
+function Bank.DebugStrip()
+    if not (ns and ns.Print) then return end
+    local win = Bank.window
+    if not win then ns:Print("[bankstrip] window not built — walk up to a banker (or /bags bank)"); return end
+    local _, live, isSelf = bankRenderModel()
+    local cursorItem, cursorBag = bankCursor()
+    ns:Print(string.format("[bankstrip] Bank._live=%s modelLive=%s isSelf=%s purchased=%s/%s inCombat=%s cursorItem=%s cursorBag=%s",
+        tostring(Bank._live), tostring(live), tostring(isSelf),
+        tostring(numBankBagsPurchased()), tostring(Store.NumBankBagSlots()),
+        tostring(bankInCombat()), tostring(cursorItem), tostring(cursorBag)))
+    if not (live and isSelf) then
+        ns:Print("  NOTE: not the live self view at the bank -> every cell is inert by design.")
+    end
+    for i, cell in ipairs(win._stripCells or {}) do
+        if cell.IsShown and cell:IsShown() then
+            local st = bankCellStateNow(cell)
+            ns:Print(string.format("  cell%d cid=%s state=%s invSlot=%s equipped=%s | click=%s drop=%s drag=%s accept=%s | handlers onClick=%s onDrag=%s onRecv=%s",
+                i, tostring(cell._cid), tostring(cell._state), tostring(cell._slot),
+                tostring(bankSlotEquipped(cell._slot)), tostring(st.clickAction),
+                tostring(st.dropAction), tostring(st.dragAction), tostring(st.acceptHighlight),
+                tostring(cell:GetScript("OnClick") ~= nil), tostring(cell:GetScript("OnDragStart") ~= nil),
+                tostring(cell:GetScript("OnReceiveDrag") ~= nil)))
+        end
     end
 end
 
@@ -1068,6 +1411,29 @@ function Bank.OnLogin()
     end)
     -- Repaint when a capture lands (esp. the bank snapshot on open/close).
     if ns.On then ns:On("BAGS_CAPTURED", function() Bank.RequestRefresh() end) end
+
+    -- BAG-SLOT REFRESH (2.0.4). Equipping or swapping a bank bag has to repaint the
+    -- strip and the grid, and it must not wait on a capture round-trip: capture.lua
+    -- does listen to these two, but it repaints us only INDIRECTLY (RequestCapture ->
+    -- BAGS_CAPTURED -> RequestRefresh), and only if the capture is not throttled out.
+    -- Listening directly makes the refresh a property of the swap rather than a
+    -- side-effect of the snapshot. RequestRefresh coalesces on its own (one C_Timer.After(0)
+    -- per frame), so both paths landing in the same frame still paint once.
+    --   PLAYERBANKBAGSLOTS_CHANGED — the bank bag equip slots themselves (the swap)
+    --   PLAYERBANKSLOTS_CHANGED    — bank main slots (grid contents)
+    --   BAG_UPDATE_DELAYED         — coalesced container refresh (new bag's contents)
+    for _, evt in ipairs({ "PLAYERBANKBAGSLOTS_CHANGED", "PLAYERBANKSLOTS_CHANGED",
+                           "BAG_UPDATE_DELAYED" }) do
+        ns:RegisterEvent(evt, function() Bank.RequestRefresh() end)
+    end
+    -- CUE-ONLY events (no data change, so no Rebuild): the cursor picking a bag up or
+    -- putting it down flips the accept halo, and ITEM_LOCK_CHANGED flips the mid-pickup
+    -- desaturation. Both are per-cell texture work; see Bank.RefreshStripAffordance.
+    for _, evt in ipairs({ "CURSOR_CHANGED", "ITEM_LOCK_CHANGED" }) do
+        ns:RegisterEvent(evt, function()
+            if Bank.IsShown() then Bank.RefreshStripAffordance() end
+        end)
+    end
 end
 
 if ns.On then
@@ -1509,6 +1875,178 @@ local function testBankSummaryPreview(fails)
         "a Bags-store summary owner keeps the 2.0.1 empty-state bank")
 end
 
+----------------------------------------------------------------------
+-- BANK BAG SWAP (2.0.4) — the cursor-state decision table.
+--
+-- This is the suite that would have caught the shipped defect: 2.0.0-2.0.3 rendered a
+-- purchased cell's icon and then set its handlers to nil, and nothing asserted that a
+-- purchased cell was ever CLICKABLE. Every row below is a state the owner can put the
+-- window in; the pure decision answers all of them headless.
+----------------------------------------------------------------------
+local function testBankBagSwapDecision(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local S = Bank.StripCellState
+    -- the live-self-at-the-bank base every interactive row shares
+    local function at(t)
+        local ctx = { live = true, isSelf = true }
+        for k, v in pairs(t) do ctx[k] = v end
+        return S(ctx)
+    end
+
+    -- ── PURCHASED + EMPTY CURSOR ──────────────────────────────────────────────
+    local emptySlot = at({ state = "purchased", equipped = false })
+    ck(emptySlot.interactive == true, "purchased cell is interactive (THE 2.0.3 DEFECT)")
+    ck(emptySlot.clickAction == "none", "empty purchased slot, empty cursor -> nothing to take")
+    ck(emptySlot.dragAction == nil, "…and nothing to drag out")
+    ck(emptySlot.tooltip == "empty-slot", "…and it says so on hover")
+
+    local held = at({ state = "purchased", equipped = true })
+    ck(held.clickAction == "pickup", "equipped bank bag + empty cursor -> click picks it up")
+    ck(held.dragAction == "pickup", "…and dragging picks it up too")
+    ck(held.tooltip == "bag", "…with the equipped bag's own tooltip")
+    ck(held.acceptHighlight == false, "no accept cue with an empty cursor")
+
+    -- ── PURCHASED + A BAG ON THE CURSOR (the owner's Onyxia-bag case) ─────────
+    for _, equipped in ipairs({ false, true }) do
+        local c = at({ state = "purchased", equipped = equipped, cursorItem = true, cursorBag = true })
+        local where = equipped and "occupied" or "empty"
+        ck(c.clickAction == "equip", "bag on cursor -> click equips into the " .. where .. " slot")
+        ck(c.dropAction == "equip", "bag on cursor -> drop equips into the " .. where .. " slot")
+        ck(c.acceptHighlight == true, "bag on cursor -> the " .. where .. " cell shows the accept cue")
+    end
+
+    -- ── PURCHASED + A NON-CONTAINER ON THE CURSOR: REFUSED, NEVER EATEN ──────
+    local wrong = at({ state = "purchased", equipped = true, cursorItem = true, cursorBag = false })
+    ck(wrong.clickAction == "refuse", "sword on the cursor -> click refuses (never PutItemInBag)")
+    ck(wrong.dropAction == "refuse", "sword on the cursor -> drop refuses")
+    ck(wrong.acceptHighlight == false, "…and shows no accept cue")
+    ck(wrong.dragAction == nil, "…and does not turn into a pickup either")
+
+    -- ── BUYABLE / LOCKED CELLS ARE NOT BAG SLOTS ─────────────────────────────
+    local buy = at({ state = "buyable", cursorItem = true, cursorBag = true })
+    ck(buy.clickAction == "buy", "the buyable well still buys")
+    ck(buy.dropAction == nil and buy.dragAction == nil, "…and takes no bag drop/drag")
+    ck(buy.acceptHighlight == false, "…and never lights up as a drop target")
+    ck(buy.tooltip == "buy", "…and keeps its cost tooltip")
+    for _, ctx in ipairs({ { cursorBag = true, cursorItem = true }, {} }) do
+        ctx.state = "locked"
+        local lk = at(ctx)
+        ck(lk.interactive == false and lk.clickAction == "none", "a locked cell is inert")
+        ck(lk.dropAction == nil and lk.dragAction == nil and lk.acceptHighlight == false,
+            "…in every direction")
+    end
+
+    -- ── CACHED / ALT VIEW: INERT EVEN FOR A PURCHASED CELL ───────────────────
+    for _, v in ipairs({ { live = false, isSelf = true }, { live = true, isSelf = false },
+                         { live = false, isSelf = false } }) do
+        local st = S({ state = "purchased", equipped = true, cursorItem = true, cursorBag = true,
+                       live = v.live, isSelf = v.isSelf })
+        ck(st.interactive == false, string.format(
+            "live=%s isSelf=%s -> purchased cell is inert (never act on a cached/alt view)",
+            tostring(v.live), tostring(v.isSelf)))
+        ck(st.clickAction == "none" and st.dropAction == nil and st.dragAction == nil
+           and st.acceptHighlight == false, "…no click, drop, drag or cue")
+    end
+
+    -- ── COMBAT: DEFERRED, NOT ATTEMPTED ──────────────────────────────────────
+    local cEquip = at({ state = "purchased", equipped = true, cursorItem = true,
+                        cursorBag = true, inCombat = true })
+    ck(cEquip.clickAction == "blocked-combat" and cEquip.dropAction == "blocked-combat",
+        "combat: equip/swap is deferred with a message, never attempted")
+    ck(cEquip.acceptHighlight == false, "combat: no accept cue (it would promise a swap we refuse)")
+    local cPick = at({ state = "purchased", equipped = true, inCombat = true })
+    ck(cPick.clickAction == "blocked-combat" and cPick.dragAction == "blocked-combat",
+        "combat: pickup is deferred too (bag equip is protected in combat)")
+    local cBuy = at({ state = "buyable", inCombat = true })
+    ck(cBuy.clickAction == "buy", "combat: the buy path is unchanged (BuyNextSlot does its own gate)")
+
+    -- ── Nil-safety: no ctx at all must not error and must be inert. ──────────
+    local none = S()
+    ck(none.interactive == false and none.clickAction == "none", "no ctx -> inert, no error")
+end
+
+-- INVENTORY-SLOT MAPPING: cell index -> container id -> the inventory slot the equip and
+-- pickup calls act on. The whole feature is that one chain; if it is off by one the owner
+-- swaps the WRONG bag, which is worse than the bug we are fixing.
+local function testBankBagInvSlotMapping(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedCC, savedGlobal = _G.C_Container, _G.ContainerIDToInventoryID
+
+    -- The client's real Era mapping: inventoryID = ContainerID + 19 for carried bags
+    -- (cid 1 -> 20 == CONTAINER_BAG_1) and it continues straight on through the bank
+    -- bags (cid 5 -> 24 under the harness's NUM_BAG_SLOTS=4). We assert the CHAIN, not
+    -- the constant: whatever the client returns for that cid is what we act on.
+    _G.C_Container = { ContainerIDToInventoryID = function(cid) return cid + 19 end }
+
+    local states = Bank.PurchaseState(3, Store.NumBankBagSlots())
+    ck(#states == 7, "harness NUM_BANKBAGSLOTS=7 -> 7 strip cells")
+    for i, s in ipairs(states) do
+        ck(s.cid == Store.NumBagSlots() + i,
+            "cell " .. i .. " maps to cid " .. tostring(Store.NumBagSlots() + i))
+        ck(Bank.BagInventorySlot(s.cid) == s.cid + 19,
+            "cell " .. i .. " resolves its own inventory slot from its own cid")
+    end
+    -- Cell 1 is bank bag 1 (cid 5 here), NOT carried bag 1 (cid 1) — the off-by-N guard.
+    ck(states[1].cid ~= 1, "strip cell 1 is a BANK bag, never carried bag 1")
+    ck(Bank.BagInventorySlot(states[1].cid) ~= Bank.BagInventorySlot(1),
+        "…and resolves to a different inventory slot than carried bag 1")
+
+    -- Fallback to the pre-C_Container global, and honest nil when neither exists.
+    _G.C_Container = nil
+    _G.ContainerIDToInventoryID = function(cid) return cid + 19 end
+    ck(Bank.BagInventorySlot(5) == 24, "falls back to the bare ContainerIDToInventoryID global")
+    _G.ContainerIDToInventoryID = nil
+    ck(Bank.BagInventorySlot(5) == nil, "no client API -> nil, never a guessed slot")
+    ck(Bank.BagInventorySlot(nil) == nil, "nil cid -> nil (nil-safe)")
+    ck(Bank.BagInventorySlot("5") == nil, "non-number cid -> nil")
+
+    _G.C_Container, _G.ContainerIDToInventoryID = savedCC, savedGlobal
+end
+
+-- REFRESH WIRING: a swap that does not repaint looks like a swap that did not happen.
+-- Locks the event set Bank.OnLogin subscribes to, and which of them repaint vs. re-cue.
+local function testBankRefreshWiring(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local savedReg, savedOn = ns.RegisterEvent, ns.On
+    local seen = {}
+    ns.RegisterEvent = function(_, evt, fn) seen[evt] = fn end
+    ns.On            = function(_, name, fn) seen["@" .. name] = fn end
+    local ok, err = pcall(Bank.OnLogin)
+    ns.RegisterEvent, ns.On = savedReg, savedOn
+    ck(ok, "Bank.OnLogin ran: " .. tostring(err))
+
+    for _, evt in ipairs({ "BANKFRAME_OPENED", "BANKFRAME_CLOSED",
+                           "PLAYERBANKBAGSLOTS_CHANGED", "PLAYERBANKSLOTS_CHANGED",
+                           "BAG_UPDATE_DELAYED", "CURSOR_CHANGED", "ITEM_LOCK_CHANGED" }) do
+        ck(type(seen[evt]) == "function", "Bank.OnLogin subscribes to " .. evt)
+    end
+    ck(type(seen["@BAGS_CAPTURED"]) == "function", "…and still repaints on BAGS_CAPTURED")
+
+    -- The two cue-only events must NOT queue a full repaint (they fire on ordinary item
+    -- handling all over the UI). Window is not shown here, so both are no-ops either way;
+    -- the assertion is that neither leaves a queued rebuild behind.
+    Bank._refreshQueued = false
+    seen["CURSOR_CHANGED"]()
+    seen["ITEM_LOCK_CHANGED"]()
+    ck(Bank._refreshQueued == false, "CURSOR_CHANGED / ITEM_LOCK_CHANGED are cue-only, no rebuild queued")
+
+    -- …while the three data events do queue one (window closed -> the timer no-ops, but
+    -- the request is made, which is the wiring under test).
+    for _, evt in ipairs({ "PLAYERBANKBAGSLOTS_CHANGED", "PLAYERBANKSLOTS_CHANGED", "BAG_UPDATE_DELAYED" }) do
+        Bank._refreshQueued = false
+        local savedTimer = _G.C_Timer
+        _G.C_Timer = nil            -- no timer: RequestRefresh fires inline and clears the flag
+        local queued = false
+        local savedIsShown = Bank.IsShown
+        Bank.IsShown = function() queued = true; return false end
+        seen[evt]()
+        Bank.IsShown = savedIsShown
+        _G.C_Timer = savedTimer
+        ck(queued == true, evt .. " requests a repaint")
+    end
+    Bank._refreshQueued = false
+end
+
 function Bank.RunSelfTests(verbose)
     local suites = {
         { name = "blizzard panel override", fn = testBankOverride },
@@ -1517,6 +2055,9 @@ function Bank.RunSelfTests(verbose)
         { name = "money click (pickup)",   fn = testMoneyClick },
         { name = "title + slot counts",    fn = testBankTitleAndCounts },
         { name = "purchase-state matrix",  fn = testPurchaseStateMatrix },
+        { name = "bank bag swap decision", fn = testBankBagSwapDecision },
+        { name = "bank bag inv-slot map",  fn = testBankBagInvSlotMapping },
+        { name = "bank refresh wiring",    fn = testBankRefreshWiring },
         { name = "cached-view proxy",      fn = testCachedViewProxy },
         { name = "bank entries + sizing",  fn = testBankEntriesAndSizing },
         { name = "footer parity",          fn = testBankFooterParity },

@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+**You can swap your bank bags again. Drag a bag onto one of the numbered slots above the
+bank grid — or pick one up with a click — exactly as you always could in 1.x and as you
+can with your carried bags.**
+
+### The bank bag slots were pictures, not slots
+
+The little numbered wells along the top of the bank window showed the bag equipped in each
+bank slot, and that was all they did: they had no click and no drop handler at all. And
+because Bags takes over Blizzard's bank window, the game's own bank bag slots were behind
+ours and out of reach — so there was no way to equip or swap a bank bag while the Bags
+bank window was on. Not awkward: impossible.
+
+Every purchased bank bag slot is now a real bag slot:
+
+- **Drag a bag onto it, or click it while holding one**, to equip it there. If a bag is
+  already in that slot, this swaps it, and the game rules on whether the swap is allowed
+  exactly as it does for the default bank window (it will refuse to swap out a bag that
+  still has things in it, and it says so in its own words — we no longer stand in front
+  of that decision either way).
+- **Click or drag an occupied slot with an empty cursor** to pick the bag up, so you can
+  move it or swap it by hand.
+- **Hovering shows the bag itself**, with the one thing you can do with it right now.
+- **While a bag is on your cursor**, the slots that will take it light up faintly. Slots
+  you have not bought yet, and the "buy" well, do not — they are not bag slots.
+- **Something that is not a bag on your cursor is refused**, not swallowed: the item stays
+  on the cursor and Bags says why.
+- **In combat, nothing is attempted.** Equipping a bag is protected in combat, so Bags
+  says it will have to wait rather than firing an action the game will reject.
+- **Looking at another character, or at your own bank away from the banker**, the slots
+  stay inert — that view is a snapshot and there is nothing there to act on.
+
+Swapping a bank bag repaints the strip and the grid straight away rather than waiting on
+the next inventory snapshot.
+
+Carried bags were unaffected — that strip has been fully swappable since 2.0.0.
+
+`/bags debug bankstrip` prints what every bank bag cell thinks it can do right now, the
+bank counterpart of `/bags debug strip`.
+
 ## 2.0.3 — 2026-08-05
 
 **Sorting a full bag no longer throws "Internal Bag Error" and stops half way. The sort
