@@ -683,6 +683,79 @@ _G.NUM_BANKBAGSLOTS  = 7
 _G.geterrorhandler = function() return function(err) realprint("  !! routed error: " .. tostring(err)) end end
 
 ----------------------------------------------------------------------
+-- QUEUE-AND-PUMP TIMER  (2026-08-07 — simulator doctrine)
+--
+-- WHAT WAS HERE BEFORE: nothing at the top level, and `_G.C_Timer = { After = function() end }`
+-- — a NO-OP — inside the core-absent-login suite. With no C_Timer at all, every deferral in
+-- the addon takes its `else fire()` branch and runs INLINE; with the no-op, it never runs at
+-- all. Neither is a client. Both are KIND, in the specific sense the suite async audit
+-- names: they erase the gap between "scheduled" and "ran", and a whole defect class lives
+-- in that gap.
+--
+-- That is not theoretical here. BAG-1 — BANKFRAME_CLOSED scheduling a deferred capture and
+-- then clearing `_bankOpen` on the very next SYNCHRONOUS line — is invisible under an inline
+-- timer, because inline means the capture ran BEFORE the flag was cleared. Under a real
+-- queue the capture runs after, reads `{ bank = false }`, and silently skips the bank. The
+-- bug was structurally unobservable headless for as long as this stub existed.
+--
+-- So: a real queue with a virtual clock. Ports the shape the repo already trusts —
+-- sort.lua's in-file simulator (`S.after`) and capture.lua's equip sim — up to harness
+-- level, so every suite runs against it by default rather than each rig having to build its
+-- own. Sequence numbers break ties so equal-deadline callbacks fire in schedule order
+-- (Class 8: never let a retry loop depend on table order), and a callback that schedules
+-- another timer is picked up inside the same sweep.
+--
+-- `flush` is the between-suites broom: it drains the whole queue whatever the deadlines,
+-- so one suite's pending deferral can never fire in the middle of the next one. Suites that
+-- want to observe timing drive `advance` themselves.
+----------------------------------------------------------------------
+local HTIMER = { clock = 0, queue = {}, seq = 0, ran = 0, peak = 0 }
+
+function HTIMER.After(delay, fn)
+    if type(fn) ~= "function" then return end
+    HTIMER.seq = HTIMER.seq + 1
+    HTIMER.queue[#HTIMER.queue + 1] =
+        { at = HTIMER.clock + (tonumber(delay) or 0), fn = fn, seq = HTIMER.seq }
+    if #HTIMER.queue > HTIMER.peak then HTIMER.peak = #HTIMER.queue end
+end
+
+function HTIMER.pending() return #HTIMER.queue end
+
+-- Run every callback due at or before clock+dt, earliest-then-oldest first, and park the
+-- clock at the target. `dt` of nil/huge with `all` set drains everything.
+local function drain(target, all)
+    while true do
+        local best, bi
+        for i = 1, #HTIMER.queue do
+            local t = HTIMER.queue[i]
+            if (all or t.at <= target) and
+               (not best or t.at < best.at or (t.at == best.at and t.seq < best.seq)) then
+                best, bi = t, i
+            end
+        end
+        if not best then break end
+        table.remove(HTIMER.queue, bi)
+        if best.at > HTIMER.clock then HTIMER.clock = best.at end
+        HTIMER.ran = HTIMER.ran + 1
+        local ok, err = pcall(best.fn)
+        if not ok then realprint("  !! harness timer callback error: " .. tostring(err)) end
+    end
+    if target and target > HTIMER.clock then HTIMER.clock = target end
+end
+
+function HTIMER.advance(dt) drain(HTIMER.clock + (tonumber(dt) or 0), false) end
+function HTIMER.flush()     drain(nil, true) end
+function HTIMER.reset()
+    HTIMER.queue, HTIMER.seq = {}, 0
+end
+
+_G.C_Timer = { After = function(delay, fn) HTIMER.After(delay, fn) end }
+
+-- The harness handle. Deliberately a name no addon file mentions, so a suite reaching for
+-- it is obviously reaching for the RIG and not for a shipped API.
+_G.__DaseekiHarnessTimer = HTIMER
+
+----------------------------------------------------------------------
 -- ns namespace — the REAL runtime now comes from core.lua (loaded FIRST in
 -- TOC_ORDER below): Print / SafeCall / event dispatch / On-Fire bus / self-test
 -- registry. The harness no longer stubs those; it drives the real core. After
@@ -715,7 +788,18 @@ setmetatable(ns, {
                     registeredSuites[name] = true
                     suiteOrder[#suiteOrder + 1] = name
                 end
-                return v(self, name, fn)
+                -- Every suite runs between two timer flushes. Before: whatever the previous
+                -- suite left scheduled has already fired, so it cannot land in the middle of
+                -- this one's premise. After: this suite's own deferrals actually RUN, inside
+                -- its own world, rather than leaking into the next suite's.
+                -- (Real timers make deferrals real; that is the point, and it also makes
+                -- suite isolation something the rig has to state rather than assume.)
+                return v(self, name, function(...)
+                    HTIMER.flush()
+                    local r = fn(...)
+                    HTIMER.flush()
+                    return r
+                end)
             end)
         else
             rawset(t, k, v)
@@ -822,6 +906,7 @@ end
 -- by THIS file, below, which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
+    "bank-closeout",
     "borders", "capture", "cell-parity", "core", "equip-refresh", "features", "locks",
     "migrate", "migrate_settings", "nexus",
     "options", "rules2", "search", "sort", "store",
@@ -1206,7 +1291,11 @@ ns:RegisterSelfTest("core-absent-login", function(verbose)
     _G.UIParent         = newFrame()
     _G.UISpecialFrames  = {}
     _G.hooksecurefunc   = function() end
-    _G.C_Timer          = { After = function() end }
+    -- The REAL queue-and-pump timer, not the no-op this line used to install. A no-op here
+    -- meant "scheduled" and "ran" were the same word, which is exactly the blindness that
+    -- hid BAG-1. This suite exercises the login wiring, which schedules; the flush at the
+    -- end of the run drains whatever it left.
+    _G.C_Timer          = { After = function(d, fn) HTIMER.After(d, fn) end }
     _G.InCombatLockdown = function() return false end
 
     -- Sentinel Blizzard bag globals: distinct closures, so "was it replaced?" is an
@@ -1303,6 +1392,102 @@ ns:RegisterSelfTest("core-absent-login", function(verbose)
 end)
 
 ----------------------------------------------------------------------
+-- TIMER GATE — the rig proving itself
+--
+-- This gate exists because the thing it tests used to be a lie. A no-op C_Timer.After made
+-- "scheduled" and "ran" the same word, and a whole defect class (BAG-1) lived in the gap
+-- between them. A rig that can be wrong about its own clock cannot be trusted about
+-- anything downstream of one, so the clock is now a gate in its own right — alongside the
+-- toc parse gate and the suite roster, and before a single suite runs.
+--
+-- The last block is the one that matters: a REAL deferred capture, scheduled by the real
+-- Capture.RequestCapture, must be observably NOT DONE before the pump and DONE after.
+----------------------------------------------------------------------
+realprint("")
+realprint("=== queue-and-pump timer gate ===")
+local timerPass = true
+do
+    local function ck(c, m)
+        if not c then timerPass = false; realprint("  [FAIL] " .. m) end
+    end
+
+    HTIMER.flush()
+    HTIMER.reset()
+    local order = {}
+
+    -- 1. QUEUES rather than runs.
+    _G.C_Timer.After(0, function() order[#order + 1] = "a0" end)
+    ck(#order == 0, "C_Timer.After(0) QUEUES; it must not run inline (this is the whole point)")
+    ck(HTIMER.pending() == 1, "…and the callback is on the queue")
+
+    -- 2. Deadline order, with schedule order as the tiebreak (Class 8: never let equal
+    --    deadlines resolve by table order).
+    _G.C_Timer.After(0, function() order[#order + 1] = "b0" end)
+    _G.C_Timer.After(0.5, function()
+        order[#order + 1] = "c50"
+        -- 3. A callback that schedules another is picked up in the SAME sweep.
+        _G.C_Timer.After(0, function() order[#order + 1] = "d-nested" end)
+    end)
+    _G.C_Timer.After(0.1, function() order[#order + 1] = "e10" end)
+
+    HTIMER.advance(1.0)
+    ck(table.concat(order, ",") == "a0,b0,e10,c50,d-nested",
+       "callbacks fire earliest-deadline-first, ties in schedule order, nested picked up in " ..
+       "the same sweep (got: " .. table.concat(order, ",") .. ")")
+    ck(HTIMER.pending() == 0, "…and the queue drains")
+
+    -- 4. A deadline beyond the advance window does NOT fire; flush takes it regardless.
+    order = {}
+    _G.C_Timer.After(30, function() order[#order + 1] = "far" end)
+    HTIMER.advance(1.0)
+    ck(#order == 0, "a callback 30s out does not fire on a 1s advance (the clock is real)")
+    HTIMER.flush()
+    ck(order[1] == "far", "…and flush drains it whatever the deadline (the between-suites broom)")
+
+    -- 5. THE POINT: a real deferred capture actually runs.
+    local Capture, Store = ns.Capture, ns.Store
+    if not (Capture and Store) then
+        ck(false, "ns.Capture / ns.Store missing — the load order changed")
+    else
+        local savedData, savedDB, savedCC = _G.DaseekiBags2Data, _G.DaseekiBags2DB, _G.C_Container
+        local savedQueued, savedBank = Capture._captureQueued, Capture._bankOpen
+        local scans = 0
+        _G.DaseekiBags2Data, _G.DaseekiBags2DB = nil, nil
+        Store.Init()
+        _G.C_Container = {
+            GetContainerNumSlots = function(cid)
+                if cid == 0 then scans = scans + 1 end
+                return cid == 0 and 16 or 0
+            end,
+            GetContainerItemInfo     = function() return nil end,
+            ContainerIDToInventoryID = function(cid) return 19 + cid end,
+            GetContainerNumFreeSlots = function() return 0, 0 end,
+        }
+        Capture._captureQueued, Capture._bankOpen = false, false
+        HTIMER.reset()
+
+        Capture.RequestCapture()
+        ck(scans == 0,
+           "a requested capture has NOT run yet (scans=" .. scans .. ") — under the old no-op " ..
+           "stub this was indistinguishable from having run, which is exactly why BAG-1 was " ..
+           "structurally unobservable headless")
+        ck(HTIMER.pending() == 1, "…it is sitting on the queue")
+        HTIMER.advance(0.01)
+        ck(scans == 1, "…and it REALLY RUNS when the clock is pumped (scans=" .. scans .. ")")
+
+        _G.C_Container = savedCC
+        Capture._captureQueued, Capture._bankOpen = savedQueued, savedBank
+        _G.DaseekiBags2Data, _G.DaseekiBags2DB = savedData, savedDB
+        Store.Init()
+    end
+
+    HTIMER.flush()
+    HTIMER.reset()
+    realprint(string.format("  %d callback(s) run, queue peak %d", HTIMER.ran, HTIMER.peak))
+end
+realprint("=== queue-and-pump timer gate: " .. (timerPass and "PASS" or "FAIL") .. " ===")
+
+----------------------------------------------------------------------
 -- Run all suites
 ----------------------------------------------------------------------
 realprint("")
@@ -1314,11 +1499,12 @@ if not ok then
     os.exit(3)
 end
 
-local overall = pass and rosterPass
+local overall = pass and rosterPass and timerPass
 realprint("")
 realprint("############################################################")
 realprint("# toc parse gate (compiles)   : PASS (else we exited 1 above)")
 realprint("# expected-suite roster       : " .. (rosterPass and "PASS" or "FAIL"))
+realprint("# queue-and-pump timer gate   : " .. (timerPass and "PASS" or "FAIL"))
 realprint("# registered self-test suites : " .. (pass and "PASS" or "FAIL"))
 realprint("# Daseeki-Bags 2.0 self-tests : " .. (overall and "ALL PASS" or "RED (see above)"))
 realprint("############################################################")
