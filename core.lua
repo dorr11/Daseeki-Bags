@@ -202,6 +202,13 @@ local function dispatch(msg)
         elseif sub == "money" then
             if ns.Frame and ns.Frame.DebugMoney then ns.Frame.DebugMoney()
             else ns:Print("money diagnostic unavailable") end
+        elseif sub == "equiptrace" then
+            -- 2.0.5: the equip-swap capture trace. Same reasoning as `debug bankstrip` and
+            -- the sort log — the defect it diagnoses is SILENT (no Lua error, the cell just
+            -- keeps drawing the old item), so the only way to answer a repeat report is a
+            -- record the owner already has in his SavedVariables.
+            if ns.Capture and ns.Capture.PrintTrace then ns.Capture.PrintTrace(rest:match("^%S*%s*(.-)%s*$"))
+            else ns:Print("equip trace unavailable") end
         elseif sub == "nexus" then
             if ns.Nexus and ns.Nexus.Debug then ns.Nexus.Debug()
             else ns:Print("Nexus bridge diagnostic unavailable") end
@@ -230,6 +237,7 @@ local function dispatch(msg)
         ns:Print("  /bags sortlog [clear] - the last 50 sort runs, newest first")
         ns:Print("  /bags debug selftest - run self-tests")
         ns:Print("  /bags debug strip|bankstrip|toolbar|money - diagnose the open window")
+        ns:Print("  /bags debug equiptrace [clear] - what the last equip swaps did to your bag cells")
         ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
     else
         ns:Print("unknown command '" .. cmd .. "'. Try /bags help.")

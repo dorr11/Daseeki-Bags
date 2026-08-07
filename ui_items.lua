@@ -1266,9 +1266,21 @@ local function applyLockLayer(button)
     local active = (action == "lock") and button._cid ~= nil and button._slot ~= nil
     if not active then
         if button._dsLockMark then button._dsLockMark:Hide() end
-        if button._dsLockCatch then button._dsLockCatch:Hide() end
+        -- _dsLockCatch is a FRAME parented to a live item button, so hiding it is a frame
+        -- op on something the client may treat as protected. paintButton runs this on every
+        -- repaint, and 2.0.5 lets repaints happen in combat — so skip the call entirely when
+        -- it would change nothing, which is the case on every ordinary paint (the catcher
+        -- only exists at all once lock-configuration mode has been opened once).
+        local catch = button._dsLockCatch
+        if catch and not (catch.IsShown and catch:IsShown() == false) then catch:Hide() end
         return
     end
+    -- Building the layer CREATES a frame parented to a live item button, which is
+    -- structural work and must never happen in combat (2.0.5, with the in-combat repaint:
+    -- paintButton reaches this line during a fight now, where before it could not). Lock
+    -- mode is a deliberate out-of-combat gesture, so if it is genuinely open the cells
+    -- already carry their layer and this guard is not reached.
+    if _G.InCombatLockdown and _G.InCombatLockdown() and not button._dsLockCatch then return end
     ensureLockLayer(button)
     if not button._dsLockCatch then return end   -- headless
     local r, g, b = lockDangerRGB()
@@ -1950,24 +1962,107 @@ local function combatFlush(G)
     G._combatFrame = f
 end
 
+----------------------------------------------------------------------
+-- IN-COMBAT REPAINT  (2.0.5) — the other half of the stale-cell defect
+--
+-- 2.0.4 deferred EVERY live relayout in combat, wholesale, "for simplicity". The comment
+-- was right about the danger and wrong about the scope, and the gap is exactly the owner's
+-- report: equip a shield mid-fight and the bag cell that now holds your off-hand keeps
+-- drawing the shield, because during combat NOTHING is drawn at all. Fixing capture alone
+-- would not have moved that icon by one pixel.
+--
+-- What is actually unsafe in combat is the STRUCTURAL work: CreateFrame for a new live
+-- button (ContainerFrameItemButtonTemplate), SetParent onto a different bag holder,
+-- ClearAllPoints/SetPoint, SetSize, Show/Hide. What is safe is a DATA repaint of buttons
+-- that already exist, are already anchored and are already shown — SetItemButtonTexture,
+-- SetItemButtonCount, SetItemButtonQuality, the border tint chain and the cooldown sweep.
+-- That is precisely what Blizzard's own ContainerFrame_Update does on every in-combat
+-- BAG_UPDATE, and what 1.x did here for years with no combat gate whatsoever (its
+-- core/classes/itemGroup.lua has no InCombatLockdown branch at all) — which is why 1.x
+-- never had this bug.
+--
+-- So the gate is narrowed to the thing it protects: when the layout is STRUCTURALLY
+-- IDENTICAL to the one already on screen — same cell count, same (cid, slot, live) per
+-- index, same grid geometry — combat takes a repaint-only pass that touches no frame
+-- geometry. Anything else still defers to PLAYER_REGEN_ENABLED, unchanged.
+--
+-- The signature is a pure function so the decision can be pinned by a self-test without a
+-- client, and Items.LastPaintMode() publishes what actually happened so capture.lua's
+-- equip trace can distinguish "captured stale" from "never repainted".
+----------------------------------------------------------------------
+
+-- Structural identity of a laid-out grid: cell count, per-cell (cid, slot, live) and the
+-- geometry the cells were placed with. DATA is deliberately absent — a slot whose item
+-- changed is the case we want to repaint, not relayout.
+function Items.LayoutSig(entries, cols, size, gap, runSplit)
+    entries = entries or {}
+    local parts = { #entries, cols or 0, size or 0, gap or 0, runSplit and 1 or 0 }
+    for i = 1, #entries do
+        local e = entries[i]
+        parts[#parts + 1] = tostring(e.cid) .. ":" .. tostring(e.slot) ..
+                            (Items.IsLive(e.owner) and "L" or "c")
+    end
+    return table.concat(parts, "|")
+end
+
+-- The combat decision, factored out as one named rule (same treatment as
+-- Sort.PredSettled): "repaint" when the grid on screen already has this exact structure
+-- and a button for every cell, "defer" otherwise. `nButtons` is how many buttons the group
+-- has actually built.
+function Items.CombatLayoutMode(prevSig, nextSig, nButtons, nEntries)
+    if prevSig == nil or prevSig ~= nextSig then return "defer" end
+    if (nButtons or 0) < (nEntries or 0) then return "defer" end
+    return "repaint"
+end
+
+-- What the last live layout DID. Read by capture.lua's equip trace.
+Items._lastPaint = "idle"
+function Items.LastPaintMode() return Items._lastPaint end
+
+local function repaintGroup(G, entries)
+    for i = 1, #entries do
+        local e = entries[i]
+        local button = G._buttons[i]
+        if button then
+            -- Data only: no SetParent, no anchors, no SetSize, no Show/Hide. The button is
+            -- already where it belongs and already visible; only its contents changed.
+            button._owner, button._cid, button._slot = e.owner, e.cid, e.slot
+            button._data = e.data
+            if button._dsRepaint then button:_dsRepaint() end
+        end
+    end
+end
+
 local function layoutGroup(G, entries)
     entries = entries or {}
     local n = #entries
 
-    -- Secure item buttons are protected frames — never create/reparent them in combat.
-    -- Defer the whole relayout to PLAYER_REGEN_ENABLED (repaint of existing buttons is
-    -- safe, but a structural rebuild is not, so we defer wholesale for simplicity).
+    local cols, size, gap = G._columns, G._size, G._gap
+
+    -- Secure item buttons are protected frames — never create/reparent/anchor them in
+    -- combat. A structurally identical grid takes the data-only repaint instead of being
+    -- deferred; see the IN-COMBAT REPAINT banner above.
     if _G.InCombatLockdown and _G.InCombatLockdown() then
+        local anyLive = false
         for _, e in ipairs(entries) do
-            if Items.IsLive(e.owner) then
-                G._pendingEntries = entries
-                combatFlush(G)
+            if Items.IsLive(e.owner) then anyLive = true; break end
+        end
+        if anyLive then
+            local sig  = Items.LayoutSig(entries, cols, size, gap, G._runSplit)
+            local mode = Items.CombatLayoutMode(G._sig, sig, #G._buttons, n)
+            if mode == "repaint" then
+                G._pendingEntries = nil   -- this pass fully applied the entries
+                repaintGroup(G, entries)
+                Items._lastPaint = "repaint"
                 return
             end
+            G._pendingEntries = entries
+            combatFlush(G)
+            Items._lastPaint = "defer"
+            return
         end
     end
 
-    local cols, size, gap = G._columns, G._size, G._gap
     -- Run-split geometry (keyring row-break). OFF unless the caller opted in, so split
     -- groups (one cid each), category sections (deliberately mixed-cid) and the bank keep
     -- exactly the flat flow they had; with one run the math is identical to the old path.
@@ -1998,7 +2093,19 @@ local function layoutGroup(G, entries)
 
     local m = L or Items.GridMetrics(n, cols, size, gap)
     G:SetSize(math.max(m.width, size), math.max(m.height, size))  -- never zero-size
+
+    -- Remember the structure we just built, so the next in-combat pass can tell a data
+    -- change (repaintable) from a structural one (still deferred).
+    G._sig = Items.LayoutSig(entries, cols, size, gap, G._runSplit)
+    for _, e in ipairs(entries) do
+        if Items.IsLive(e.owner) then Items._lastPaint = "layout"; break end
+    end
 end
+
+-- Exported for the equip-refresh suite, which drives the in-combat branch against a
+-- synthetic group. Neither is part of the module's surface.
+Items._layoutGroup  = layoutGroup
+Items._repaintGroup = repaintGroup
 
 -- Split-view bag header text: the bag item's real name when a link resolves, else a
 -- class label. `group` is the descriptor { cid, class, size, link }.

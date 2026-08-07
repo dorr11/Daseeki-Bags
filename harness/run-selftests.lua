@@ -822,7 +822,8 @@ end
 -- by THIS file, below, which is deliberately after this gate runs.
 ----------------------------------------------------------------------
 local EXPECTED_SUITES = {
-    "borders", "capture", "cell-parity", "core", "features", "locks", "migrate", "migrate_settings", "nexus",
+    "borders", "capture", "cell-parity", "core", "equip-refresh", "features", "locks",
+    "migrate", "migrate_settings", "nexus",
     "options", "rules2", "search", "sort", "store",
     "ui_bank", "ui_find", "ui_frame", "ui_items", "ui_owner",
 }
