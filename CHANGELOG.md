@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased — 2.0.5
+
+**Equip something from your bags in the middle of a fight and the bag cell updates. It
+used to keep showing the item you just put on.**
+
+### The bag cell kept the old picture
+
+Equip a shield from your bags while in combat and the off-hand weapon it displaced lands
+back in that bag slot — but the cell went on drawing the shield, sometimes for the rest of
+the fight. The item really was equipped and your bags really did hold the weapon; only the
+picture was wrong, which is the worst kind of wrong, because everything you might do next
+you decide by looking at it.
+
+Two separate things had to go wrong together, and both did.
+
+**Bags read your bags a fraction too early.** The game tells an addon two separate things
+after an item moves — first "that slot is free again", and only later "here is what is in
+it now". This is the same client behaviour that made sorting re-do its own moves in 2.0.3.
+Bags re-read your bags on the first signal and got the *old* contents, and nothing then
+told it to look again, so that early reading was the last word. It now listens to the
+signals an equip actually sends (`ITEM_LOCK_CHANGED`, `PLAYER_EQUIPMENT_CHANGED`,
+`UNIT_INVENTORY_CHANGED`) and, whenever it notices the game is still mid-move, takes
+another look a fraction of a second later — up to three, over 0.6 seconds. It never waits
+or blocks; it just does not assume the first answer is the final one.
+
+**And in combat, Bags was not redrawing the grid at all.** Rebuilding the grid means
+creating and re-anchoring item buttons, which is not allowed in combat, so 2.0.0 deferred
+*every* redraw until the fight ended. That was heavier than it needed to be: changing a
+cell's picture is perfectly safe in combat — it is exactly what the game's own bag window
+does. When the grid's shape has not changed (same cells, same bags, same layout) Bags now
+repaints in place during combat and only defers the redraws that really do restructure the
+window. 1.x had no combat gate here at all, which is why this never happened before 2.0.
+
+Nothing changes out of combat, and nothing changes about what Bags is allowed to touch
+mid-fight — the structural work is still deferred exactly as before.
+
+### `/bags debug equiptrace`
+
+If a cell ever goes stale again, this is what tells us why instead of us guessing. Bags now
+keeps a small record of the last few equip swaps — what the game announced and in what
+order, what each slot held before and after, whether the slot was still mid-move when Bags
+looked, and whether the grid actually repainted. Sixty entries, oldest dropped, saved with
+your settings, cleared with `/bags debug equiptrace clear`. It costs nothing until you
+equip something.
+
 ## 2.0.4 — 2026-08-05
 
 **You can swap your bank bags again. Drag a bag onto one of the numbered slots above the
