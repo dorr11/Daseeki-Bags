@@ -795,16 +795,54 @@ local function iconOf(button)
 end
 
 ----------------------------------------------------------------------
--- Async pending registry (GET_ITEM_INFO_RECEIVED)
+-- The grid's own event frame.
+--
+-- GET_ITEM_INFO_RECEIVED — the cold-item registry below.
+--
+-- BAG_UPDATE_COOLDOWN (BAG-2, 2026-08-07) — the missing cooldown signal. Catalog-verified
+-- against interface 11509 / build 1.15.9.68808 as `Event.Container.BagUpdateCooldown`,
+-- payload NONE; it sits in the same Container family as `BagUpdate` and `BagUpdateDelayed`,
+-- which this addon has listened to since 2.0.0.
+--
+-- WHAT WAS BROKEN: the string BAG_UPDATE_COOLDOWN appeared NOWHERE in the Daseeki-Bags
+-- tree. Use a NON-CONSUMED on-use item straight out of a bag — an engineering trinket, a
+-- Gnomish Death Ray, a trinket parked in a bag rather than worn — and the client fires
+-- BAG_UPDATE_COOLDOWN and nothing else: the stack count did not change, so there is no
+-- BAG_UPDATE and no BAG_UPDATE_DELAYED either. Nobody was listening, and the grid has no
+-- ticker and no OnUpdate anywhere to heal it, so the cell got NO COOLDOWN SWIPE AT ALL for
+-- the whole duration. CONSUMABLES masked the bug for years: their count changes, so their
+-- BAG_UPDATE repaints the cell and the swipe appears as a side effect.
+--
+-- Class 7 (capture event sets missing the settle signal), in its simplest form: the state
+-- exists, the API to read it was already wired (updateCooldown ->
+-- C_Container.GetContainerItemCooldown), and only the signal that says "read it again"
+-- was absent.
+--
+-- CUE-ONLY, deliberately. This event carries no bag id and means no data changed — only a
+-- timer started or ended. So it drives Items.RefreshCooldowns (a sweep of the cooldown
+-- regions of buttons that already exist) and NOT RequestRefresh / a rebuild / a relayout.
+-- Same classification ui_bank.lua already gives CURSOR_CHANGED and ITEM_LOCK_CHANGED:
+-- repaint the affordance, do not rebuild the model. It is therefore also combat-safe by
+-- construction — CooldownFrame_Set on an existing region is a data op, no frame geometry
+-- is touched, which is exactly the line 2.0.5's combat paint gate draws.
 ----------------------------------------------------------------------
 
 Items._pending = Items._pending or {}   -- [itemID] = weak set of buttons awaiting data
 
+-- The grid's event roster, published so a self-test can assert it rather than trust the
+-- wiring. A future refactor that drops BAG_UPDATE_COOLDOWN turns the roster row red.
+Items.GRID_EVENTS = { "GET_ITEM_INFO_RECEIVED", "BAG_UPDATE_COOLDOWN" }
+
 local function ensureEventFrame()
     if Items._evt or not _G.CreateFrame then return end
     local f = _G.CreateFrame("Frame")
-    f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
-    f:SetScript("OnEvent", function(_, _, itemID)
+    for _, evt in ipairs(Items.GRID_EVENTS) do f:RegisterEvent(evt) end
+    f:SetScript("OnEvent", function(_, event, itemID)
+        if event == "BAG_UPDATE_COOLDOWN" then
+            Items.RefreshCooldowns()
+            return
+        end
+        -- GET_ITEM_INFO_RECEIVED
         local set = Items._pending[itemID]
         if not set then return end
         Items._pending[itemID] = nil
@@ -814,6 +852,7 @@ local function ensureEventFrame()
     end)
     Items._evt = f
 end
+Items._ensureEventFrame = ensureEventFrame
 
 local function watchPending(button, itemID)
     Items._pending[itemID] = Items._pending[itemID] or setmetatable({}, { __mode = "k" })
@@ -1328,6 +1367,33 @@ local function updateCooldown(button)
         if (enable or 0) ~= 0 and (duration or 0) > 0 then cd:SetCooldown(start, duration)
         elseif cd.Clear then cd:Clear() end
     end
+end
+Items._updateCooldown = updateCooldown
+
+-- BAG-2. The BAG_UPDATE_COOLDOWN sweep: re-read the swipe on every LIVE cell that is
+-- actually on screen. Sibling of RefreshLockLayer above, over the same weak registry, and
+-- with the same three refusals:
+--
+--   * CACHED cells are skipped. An offline/remote owner's slot has no live cooldown to
+--     read; GetContainerItemCooldown would answer for whatever (cid, slot) the button
+--     happens to be pointing at on THIS character, i.e. a lie.
+--   * HIDDEN cells are skipped. A button in a closed window has nothing to show, and the
+--     cooldown is re-read on its next paint anyway (paintButton calls updateCooldown), so
+--     skipping costs nothing and keeps the sweep proportional to what the owner can see.
+--   * EMPTY cells are NOT skipped: updateCooldown clears a stale swipe as readily as it
+--     sets a new one, and a slot whose item left mid-cooldown must not keep swiping.
+--
+-- Returns how many cells it touched — the self-test's handle, and cheap to log.
+function Items.RefreshCooldowns()
+    local n = 0
+    for b in pairs(Items._buttons) do
+        if b._live and (not b.IsShown or b:IsShown()) then
+            updateCooldown(b)
+            n = n + 1
+        end
+    end
+    Items._lastCooldownSweep = n
+    return n
 end
 
 -- CELL PARITY: the stack-count numeral is the TEMPLATE's, untouched — 1.x never restyles
@@ -1864,7 +1930,12 @@ function Items.CreateButton(parent, opts)
     local template = live and "ContainerFrameItemButtonTemplate" or "ItemButtonTemplate"
     local button = _G.CreateFrame("Button", nextButtonName(), parent, template)
     button._live = live
-    Items._buttons[button] = true   -- weak registry; only the lock-layer sweep reads it
+    Items._buttons[button] = true   -- weak registry; the lock-layer and cooldown sweeps read it
+    -- The grid's event frame has to exist BEFORE the first BAG_UPDATE_COOLDOWN can arrive,
+    -- and the first cell is the earliest moment there is anything for it to refresh
+    -- (BAG-2). Still lazy — a session that never opens the bags builds no frame — and
+    -- ensureEventFrame is idempotent and headless-safe.
+    ensureEventFrame()
     local cell = Items.ClampCell(opts.size)
     button:SetSize(cell, cell)
     button._dsRepaint = function(self) paintButton(self) end
@@ -3419,6 +3490,110 @@ local function testCellClickAction(fails)
     ns.Store.db, L._self, L._mode = savedDB, savedSelf, savedMode
 end
 
+-- BAG-2 — THE COOLDOWN SWIPE.
+--
+-- The defect in one sentence: BAG_UPDATE_COOLDOWN appeared nowhere in this addon, so a
+-- non-consumed on-use bag item (an engineering trinket, a Gnomish Death Ray) got no swipe
+-- at all — its stack count does not change, so no BAG_UPDATE or BAG_UPDATE_DELAYED follows
+-- to repaint the cell as a side effect, and there is no ticker anywhere to heal it.
+--
+-- Three things are pinned here: the event is in the roster and reaches the sweep; the sweep
+-- refuses the cells it must refuse; and the routing is CUE-ONLY — a cooldown event must
+-- never rebuild the model or relayout the grid.
+local function testCooldownRefresh(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------ the roster
+    local roster = {}
+    for _, e in ipairs(Items.GRID_EVENTS or {}) do roster[e] = true end
+    ck(roster.BAG_UPDATE_COOLDOWN,
+       "the grid registers BAG_UPDATE_COOLDOWN (catalog-verified on 11509 as " ..
+       "Event.Container.BagUpdateCooldown) — this is the whole of BAG-2")
+    ck(roster.GET_ITEM_INFO_RECEIVED,
+       "…without losing GET_ITEM_INFO_RECEIVED, which shares the frame")
+
+    ------------------------------------------------------------------ the sweep
+    local savedButtons, savedCC, savedSet = Items._buttons, _G.C_Container, _G.CooldownFrame_Set
+    Items._buttons = setmetatable({}, { __mode = "k" })
+
+    local asked = {}
+    _G.C_Container = {
+        GetContainerItemCooldown = function(cid, slot)
+            asked[#asked + 1] = tostring(cid) .. ":" .. tostring(slot)
+            return 1000, 60, 1
+        end,
+    }
+    local applied = {}
+    _G.CooldownFrame_Set = function(cd, start, duration, enable)
+        applied[#applied + 1] = { cd = cd, start = start, duration = duration, enable = enable }
+    end
+
+    local function cell(live, shown, cid, slot)
+        local b = { _live = live, _cid = cid, _slot = slot, Cooldown = {} }
+        b.IsShown = function() return shown end
+        Items._buttons[b] = true
+        return b
+    end
+    local trinket = cell(true,  true,  0, 5)     -- the engineering trinket, on screen
+    local hidden  = cell(true,  false, 0, 6)     -- a cell in a closed window
+    local cached  = cell(false, true,  0, 7)     -- an offline owner's cell
+
+    local n = Items.RefreshCooldowns()
+    ck(n == 1, "the sweep touched exactly the one visible LIVE cell (got " .. tostring(n) .. ")")
+    ck(#asked == 1 and asked[1] == "0:5",
+       "…and it asked the container API for THAT slot (asked: " ..
+       table.concat(asked, ", ") .. ")")
+    ck(#applied == 1 and applied[1].cd == trinket.Cooldown and applied[1].duration == 60,
+       "…and drove the swipe onto that cell's own cooldown region")
+    ck(hidden ~= nil and cached ~= nil, "…leaving the hidden and cached cells alone")
+
+    ------------------------------------------------------------------ end to end, via the event
+    -- Not "we can call the function" but "the event reaches it": build the real event frame
+    -- against a stub CreateFrame, then deliver BAG_UPDATE_COOLDOWN through its own OnEvent.
+    local savedCreate, savedEvt = _G.CreateFrame, Items._evt
+    Items._evt = nil
+    local registered, handler = {}, nil
+    _G.CreateFrame = function()
+        local f = {}
+        function f:RegisterEvent(e) registered[e] = true end
+        function f:SetScript(_, fn) handler = fn end
+        return f
+    end
+    Items._ensureEventFrame()
+    ck(registered.BAG_UPDATE_COOLDOWN, "the built frame really registers the event")
+    ck(type(handler) == "function", "…with an OnEvent handler")
+
+    asked, applied = {}, {}
+    -- The event carries NO payload on 11509; the handler must not need one.
+    if handler then handler(nil, "BAG_UPDATE_COOLDOWN") end
+    ck(#applied == 1, "BAG_UPDATE_COOLDOWN alone repaints the swipe — no bag id, no item id, " ..
+       "no stack change, which is exactly the signal set a non-consumed on-use item emits")
+
+    -- CUE-ONLY: it must not have asked for a rebuild. Frame.RequestRefresh is the one call
+    -- that would turn a cooldown tick into a full model rebuild + relayout.
+    local rebuilds = 0
+    if ns.Frame then
+        local savedReq = ns.Frame.RequestRefresh
+        ns.Frame.RequestRefresh = function() rebuilds = rebuilds + 1 end
+        if handler then handler(nil, "BAG_UPDATE_COOLDOWN") end
+        ns.Frame.RequestRefresh = savedReq
+    end
+    ck(rebuilds == 0,
+       "CUE-ONLY: a cooldown tick repaints the affordance and does NOT rebuild the grid " ..
+       "(got " .. rebuilds .. " rebuild request(s)) — same classification ui_bank gives " ..
+       "CURSOR_CHANGED")
+
+    -- ...and the other half of the frame still works.
+    local repainted = 0
+    local waiter = { _dsRepaint = function() repainted = repainted + 1 end }
+    Items._pending[12345] = { [waiter] = true }
+    if handler then handler(nil, "GET_ITEM_INFO_RECEIVED", 12345) end
+    ck(repainted == 1, "GET_ITEM_INFO_RECEIVED still repaints its waiting cells")
+
+    _G.CreateFrame, Items._evt = savedCreate, savedEvt
+    Items._buttons, _G.C_Container, _G.CooldownFrame_Set = savedButtons, savedCC, savedSet
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -3442,6 +3617,7 @@ function Items.RunSelfTests(verbose)
         { name = "slot substrate (1.x profile)", fn = testSlotSubstrate },
         { name = "sort-lock cell layer", fn = testLockLayer },
         { name = "cell click action (use path)", fn = testCellClickAction },
+        { name = "cooldown swipe (BAG_UPDATE_COOLDOWN)", fn = testCooldownRefresh },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

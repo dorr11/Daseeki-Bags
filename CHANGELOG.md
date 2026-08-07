@@ -3,7 +3,8 @@
 ## Unreleased — 2.0.5
 
 **Equip something from your bags in the middle of a fight and the bag cell updates. It
-used to keep showing the item you just put on.**
+used to keep showing the item you just put on. Your last deposit before closing the bank
+is saved now too, and on-use items in your bags show their cooldown.**
 
 ### The bag cell kept the old picture
 
@@ -44,6 +45,55 @@ order, what each slot held before and after, whether the slot was still mid-move
 looked, and whether the grid actually repainted. Sixty entries, oldest dropped, saved with
 your settings, cleared with `/bags debug equiptrace clear`. It costs nothing until you
 equip something.
+
+### The last thing you did at the bank now actually gets saved
+
+Put something in the bank and close the bank in the same breath — the ordinary way a bank
+visit ends — and that last move was not being recorded. Walk away, look at your bank in the
+Bags window, and it showed you the state from *before* your final deposit, right up until
+the next time you physically stood at a bank.
+
+The reason is worth stating plainly, because the code has always *claimed* to do the right
+thing. Your bank is only readable while the bank window is open; the instant it closes, the
+game stops answering questions about it. Bags knew that, and had a line whose comment said
+"capture the final state while it is still readable" — but that line only *scheduled* the
+reading for the next frame, and then shut the door on the very next line. By the time the
+reading happened the bank was already unreadable, so it quietly skipped the bank and saved
+nothing. It never once did what its own comment described.
+
+It now reads the bank right there on the closing frame, while the game is still willing to
+answer — the same thing Daseeki Nexus has always done. Your carried bags are unaffected;
+they were never part of this.
+
+Alongside it, a smaller piece of hardening with the same shape: if Bags ever asks about
+your bank and gets no answer at all, it now treats that as *"I could not look"* rather than
+*"your bank is empty"*, and keeps what it already had. An empty answer and an unavailable
+one look identical at the game's interface, and only one of them is a reason to forget
+what you own.
+
+### On-use items in your bags show their cooldown again
+
+Use something straight out of your bags that does not get consumed — an engineering
+trinket, a Gnomish Death Ray, a trinket you keep in a bag rather than worn — and the cell
+now sweeps through its cooldown like everything else. It never did before: the game
+announces a bag cooldown on its own dedicated signal, and Bags was not listening to it.
+Consumables hid the problem for the whole life of 2.0, because using one changes its stack
+count, and *that* made the cell redraw for an unrelated reason and pick the cooldown up as
+a side effect. Anything that did not change a stack count got no sweep at all.
+
+### Under the hood
+
+- **The bags window no longer competes with Daseeki Raid Prep for its own open/close
+  handlers.** Raid Prep attaches to the Bags window to open its checklist alongside it.
+  Bags attached to the same two handlers in a way that *replaces* rather than *adds*, which
+  worked only because Bags happened to get there first — and would have silently deleted
+  Raid Prep's checklist behaviour the first time anything rebuilt the window. Bags now
+  attaches additively, so neither addon can knock the other off, in either order.
+- **The headless test rig got a real clock.** Its timer used to run everything instantly
+  (or not at all), which is exactly the condition under which the bank bug above cannot be
+  seen: "we scheduled it" and "we did it" were the same event. Deferred work is now queued
+  against a virtual clock and pumped, and the rig's own clock is a release gate. The bank
+  defect is now reproduced on the old code and fixed on the new one, on every run.
 
 ## 2.0.4 — 2026-08-05
 

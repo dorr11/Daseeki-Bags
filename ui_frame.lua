@@ -1239,6 +1239,75 @@ function Frame.RefreshFooter(win)
     win.raidPrepBtn:SetShown(Frame.RaidPrepLoaded())
 end
 
+----------------------------------------------------------------------
+-- THE WINDOW'S OnShow/OnHide CONTRACT  (2026-08-07)
+--
+-- RAID-PREP COMPANION PAIRING (1.x button.lua parity): the checklist opens with the bags
+-- when the user has asked for that in Raid Prep's own options, and always closes with them.
+-- In 1.x the companion hooked the frame itself; 2.0 owns the surface, so 2.0 drives it.
+--
+-- WHY THIS IS NOT `SetScript` ANY MORE. Daseeki-Raid-Prep ALSO attaches to this exact
+-- frame — button.lua:55-66 does `parent:HookScript('OnShow', ...)` and
+-- `parent:HookScript('OnHide', ...)` on our window. HookScript CHAINS onto whatever script
+-- is installed; SetScript REPLACES it, hook chain and all. The two therefore compose in
+-- exactly one order:
+--
+--     ours installed FIRST (window build) -> theirs hooked SECOND (their button is
+--     created during our Layout) -> both run.        <- what happens today
+--
+--     ours installed SECOND, for any reason         -> Raid Prep's hook is silently
+--                                                      DESTROYED. The checklist stops
+--                                                      opening with the bags and there is
+--                                                      no error, no warning, nothing to
+--                                                      grep for.
+--
+-- That ordering was never written down and nothing enforced it. It held only because
+-- Frame.Ensure happens to run once, before Layout. Any future rebuild — re-skinning that
+-- re-runs the script install, a second Ensure after a window teardown, a profile switch
+-- that recreates chrome — silently drops a sibling addon's feature.
+--
+-- THE FIX, two independent halves:
+--
+--  1. HOOKSCRIPT, NOT SETSCRIPT. HookScript is additive whether or not a script is already
+--     present (with none, it simply becomes the script), so OUR install can no longer
+--     clobber ANYONE — Raid Prep, a future Daseeki addon, or a third party who got here
+--     first. We give up nothing: this window has never had a competing OnShow of its own.
+--
+--  2. INSTALL-ONCE, ASSERTED. `win._dsScriptsInstalled` makes a second call a no-op, so
+--     even a re-entrant rebuild cannot stack a second copy of our handlers (which would
+--     double-fire CloseRaidPrepWithBags and SetLockMode). The flag is on the FRAME, not
+--     the module, so a genuinely new window gets its own scripts.
+--
+-- Returns true when it installed, false when it declined — the self-test's handle on
+-- "install-once" without needing a live client.
+----------------------------------------------------------------------
+function Frame.InstallWindowScripts(win)
+    if not win or win._dsScriptsInstalled then return false end
+
+    -- HookScript is the contract. A frame stub without it (harness) falls back to
+    -- SetScript, which is correct there precisely because nothing else is hooking it.
+    local attach = win.HookScript and
+        function(script, fn) win:HookScript(script, fn) end or
+        function(script, fn) win:SetScript(script, fn) end
+
+    attach("OnShow", function() Frame.MaybeOpenRaidPrepWithBags() end)
+    attach("OnHide", function()
+        Frame.CloseRaidPrepWithBags()
+        -- CLOSING THE WINDOW LEAVES THE LOCK MODE. One of the three exits the owner
+        -- asked for, and the safety one: the mode suspends normal item interaction, so
+        -- it must never be able to outlive the window that explains it.
+        Frame.SetLockMode(false)
+        -- ...and so must the CHARACTER MENU (2.0.2, owner-reported): the flyout is
+        -- parented to UIParent so it can hang outside this window, which is exactly why
+        -- hiding this window did not take it with it. Escape left a floating menu with
+        -- nothing behind it. Guarded — ui_owner is optional to this file.
+        if ns.Owner and ns.Owner.CloseAllMenus then ns.Owner.CloseAllMenus() end
+    end)
+
+    win._dsScriptsInstalled = true
+    return true
+end
+
 -- Build the window chrome once. Returns the window frame.
 function Frame.Ensure()
     if Frame.window then return Frame.window end
@@ -1656,24 +1725,9 @@ function Frame.Ensure()
     -- control; settings now live on the gear in the title row beside the ✕, matching the
     -- Nexus dashboard. The corner it vacated is now the owner selector's.)
 
-    -- RAID-PREP COMPANION PAIRING (1.x button.lua parity): the checklist opens with the
-    -- bags when the user has asked for that in Raid Prep's own options, and always closes
-    -- with them. In 1.x the companion hooked the frame itself to do this; 2.0 owns the
-    -- surface, so 2.0 drives it. Scripts, not HookScripts — the window has none of its own.
-    win:SetScript("OnShow", function() Frame.MaybeOpenRaidPrepWithBags() end)
-    win:SetScript("OnHide", function()
-        Frame.CloseRaidPrepWithBags()
-        -- CLOSING THE WINDOW LEAVES THE LOCK MODE. One of the three exits the owner
-        -- asked for, and the safety one: the mode suspends normal item interaction, so
-        -- it must never be able to outlive the window that explains it.
-        Frame.SetLockMode(false)
-        -- ...and so must the CHARACTER MENU (2.0.2, owner-reported): the flyout is
-        -- parented to UIParent so it can hang outside this window, which is exactly why
-        -- hiding this window did not take it with it. Escape left a floating menu with
-        -- nothing behind it. Guarded — ui_owner is optional to this file.
-        if ns.Owner and ns.Owner.CloseAllMenus then ns.Owner.CloseAllMenus() end
-    end)
-
+    -- Companion pairing + lock-mode/menu teardown. Additive by contract — see
+    -- Frame.InstallWindowScripts.
+    Frame.InstallWindowScripts(win)
 
     Frame.RefreshFooter(win)
     Frame.window = win
@@ -3908,6 +3962,108 @@ local function testSummaryViewSizing(fails)
         "the close-every-menu verb this window's OnHide calls is published")
 end
 
+-- THE OnShow/OnHide CONTRACT with Daseeki-Raid-Prep.
+--
+-- Raid Prep HookScripts OnShow and OnHide on THIS window (its button.lua:55-66). Until
+-- 2026-08-07 we SetScript'ed the same two handlers, which works only because our install
+-- happens first, at window build, and theirs second, during Layout. Nothing wrote that
+-- ordering down and nothing enforced it, so any future rebuild that re-installed our
+-- scripts would have deleted a sibling addon's feature with no error and no symptom
+-- except "the checklist stopped opening with my bags".
+--
+-- These rows make that unfalsifiable: our install is ADDITIVE, it is ONCE, and a hook
+-- placed either side of it survives.
+local function testWindowScriptContract(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A frame that distinguishes the two verbs, exactly as the client does: SetScript
+    -- REPLACES, HookScript CHAINS onto whatever is there.
+    local function fakeWindow()
+        local w = { scripts = {}, setCalls = {}, hookCalls = {} }
+        function w:SetScript(name, fn)
+            self.setCalls[#self.setCalls + 1] = name
+            self.scripts[name] = fn
+        end
+        function w:HookScript(name, fn)
+            self.hookCalls[#self.hookCalls + 1] = name
+            local prev = self.scripts[name]
+            self.scripts[name] = prev and function(...) prev(...) ; fn(...) end or fn
+        end
+        function w:Run(name, ...) if self.scripts[name] then self.scripts[name](self, ...) end end
+        return w
+    end
+
+    -- Our OnHide calls the REAL Frame.SetLockMode (headless-safe; the lock-mode suite drives
+    -- the same path) and the character-menu closer. Only the closer is instrumented, and
+    -- only its ONE method — swapping the whole ns.Owner module out from under a suite that
+    -- errors mid-way is how you poison every suite downstream, which is the mistake the
+    -- equip sim's SIM_GLOBALS comment already records.
+    local Owner = ns.Owner
+    local savedCloseAll = Owner and Owner.CloseAllMenus
+    local closedMenus = 0
+    if Owner then Owner.CloseAllMenus = function() closedMenus = closedMenus + 1 end end
+    local function restore()
+        if Owner then Owner.CloseAllMenus = savedCloseAll end
+    end
+    local okBody, errBody = pcall(function()
+
+    ------------------------------------------------------------------ additive, not replacing
+    local w = fakeWindow()
+    local companion = 0
+    -- A companion that got here FIRST (the case SetScript would have destroyed outright).
+    w:SetScript("OnShow", function() companion = companion + 1 end)
+
+    ck(Frame.InstallWindowScripts(w) == true, "the install reports that it installed")
+    ck(#w.setCalls == 1, "…using HookScript, not SetScript — the only SetScript on this " ..
+       "frame is the pre-existing companion's (got " .. #w.setCalls .. ")")
+    ck(#w.hookCalls == 2, "…for both OnShow and OnHide (got " .. #w.hookCalls .. ")")
+
+    w:Run("OnShow")
+    ck(companion == 1,
+       "THE CONTRACT: a script that was already on the frame SURVIVES our install. " ..
+       "SetScript would have deleted it silently — no error, no warning, nothing to grep.")
+
+    ------------------------------------------------------------------ a LATER hook survives too
+    local later = 0
+    w:HookScript("OnShow", function() later = later + 1 end)
+    w:Run("OnShow")
+    ck(later == 1 and companion == 2,
+       "…and a hook added AFTER us (Raid Prep's real ordering: its button is built during " ..
+       "our Layout) runs alongside ours, both directions covered")
+
+    ------------------------------------------------------------------ install-once
+    local hooksBefore = #w.hookCalls
+    ck(Frame.InstallWindowScripts(w) == false, "a second install DECLINES")
+    ck(#w.hookCalls == hooksBefore,
+       "…and attaches nothing — a re-entrant rebuild cannot stack a second copy of our " ..
+       "handlers (which would double-fire CloseRaidPrepWithBags and SetLockMode)")
+    ck(Frame.InstallWindowScripts(nil) == false, "…and a nil frame is a no-op, not an error")
+
+    ------------------------------------------------------------------ ours still does its job
+    closedMenus = 0
+    w:Run("OnHide")
+    ck(closedMenus == (Owner and 1 or 0),
+       "our OnHide still runs the whole teardown (the character menu closes with the window)")
+    ck(pcall(w.Run, w, "OnShow"), "and OnShow is a safe no-op headless")
+
+    ------------------------------------------------------------------ a fresh window is fresh
+    local w2 = fakeWindow()
+    ck(Frame.InstallWindowScripts(w2) == true,
+       "the once-flag lives on the FRAME, so a genuinely new window still gets its scripts")
+
+    ------------------------------------------------------------------ no SetScript fallback drift
+    -- A frame with no HookScript (only the harness has one) must still get its handlers,
+    -- because on such a frame there is by definition nothing to chain onto.
+    local w3 = fakeWindow()
+    w3.HookScript = nil
+    ck(Frame.InstallWindowScripts(w3) == true and w3.scripts.OnShow ~= nil,
+       "a frame without HookScript falls back to SetScript and still gets both handlers")
+
+    end)
+    restore()
+    if not okBody then fails[#fails + 1] = "error: " .. tostring(errBody) end
+end
+
 function Frame.RunSelfTests(verbose)
     local suites = {
         { name = "1.0 anatomy",         fn = testParityAnatomy },
@@ -3934,6 +4090,7 @@ function Frame.RunSelfTests(verbose)
         { name = "triage bits (§4.5/§9.4/§9.8)", fn = testTriageBits },
         { name = "lock-mode exit routes",  fn = testLockModeExits },
         { name = "summary view sizing",    fn = testSummaryViewSizing },
+        { name = "OnShow/OnHide hook contract", fn = testWindowScriptContract },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

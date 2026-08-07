@@ -97,10 +97,20 @@ function Capture.ScanContainer(cid, api, stats)
     local n = api.numSlots and api.numSlots(cid)
     if not n or n <= 0 then
         -- A zero-size result means "no bag here". We still return an empty
-        -- container for real storage ids (backpack/bank/keyring) so their
+        -- container for real storage ids (backpack/keyring) so their
         -- emptiness is recorded; for unowned bag slots we return nil.
         local class = Store.ContainerClass(cid)
         if class == "bag" or class == "bankbag" then return nil end
+        -- ...and for the BANK MAIN container, a zero size is never "the bank is empty":
+        -- its slot count is a property of the CHARACTER (24 on Era, fixed), so the only
+        -- way the API answers 0 is that the bank is NOT READABLE — the frame is shut, or
+        -- it shut a hair earlier than our close-frame read (BAG-1, 2026-08-07).
+        -- Class 4 ("partial/cold reads presented as complete"): an empty read may only
+        -- DELETE state when the emptiness is provable, and this one is provably not.
+        -- Returning nil PRESERVES the parked bank snapshot instead of overwriting it with
+        -- an empty container — which is the difference between "we could not look" and
+        -- "we looked and your bank is gone".
+        if class == "bank" then return nil end
         n = n or 0
     end
     local link   = api.bagLink   and api.bagLink(cid)   or nil
@@ -649,6 +659,80 @@ function Capture.RequestCapture()
     end
 end
 
+-- Capture RIGHT NOW, on this frame, bypassing the coalescer. Error-routed exactly like the
+-- deferred path (standing rule: never a silent pcall), and it deliberately does NOT touch
+-- _captureQueued — a coalesced capture already in flight is still allowed to run, it just
+-- finds the store already current.
+--
+-- The ONLY caller is the bank close-out below, and that is on purpose: everything else in
+-- this file wants the coalescer. See the block comment there for why the bank cannot.
+function Capture.CaptureNow()
+    if ns.SafeCall then ns:SafeCall(Capture.Capture) else Capture.Capture() end
+end
+
+----------------------------------------------------------------------
+-- BANK CLOSE-OUT  (BAG-1, 2026-08-07) — the last bank move of a session
+--
+-- 2.0.4's handler read:
+--
+--     ns:RegisterEvent("BANKFRAME_CLOSED", function()
+--         Capture.RequestCapture()      -- capture the final state while still readable
+--         Capture._bankOpen = false
+--     end)
+--
+-- The comment states the requirement correctly and the code cannot meet it. RequestCapture
+-- DEFERS to C_Timer.After(0); `_bankOpen = false` runs SYNCHRONOUSLY on the very next line.
+-- So by the time the deferred Capture.Capture() actually runs — one frame later — the scope
+-- it builds is `{ bank = false }` and the bank half of the snapshot is skipped entirely.
+-- The "final capture while still readable" was dead code from the day it was written: it
+-- never once read the bank. Deposit an item and shut the bank in the same breath and the
+-- stored bank is one move stale until your NEXT visit.
+--
+-- It also could not be seen headless, because the harness's C_Timer.After was a no-op stub
+-- (fixed in the same pass): every deferral in the addon fired inline, which is precisely
+-- the ordering under which this bug does not exist.
+--
+-- THE DONOR SHAPE already existed one repo over. Nexus inventory.lua:1310 does:
+--
+--     ns:RegisterEvent("BANKFRAME_CLOSED", function()
+--         if Inventory.IsEnabled() then
+--             Inventory.RefreshBank()   -- the slots are still warm on the close frame
+--             ...
+--         end
+--         Inventory._bankOpen = false
+--     end)
+--
+-- i.e. read the bank SYNCHRONOUSLY, on the close frame, while the client still answers for
+-- container -1, and only then close the window. Same fix here.
+--
+-- Two deliberate details:
+--
+--  * the deferred RequestCapture is KEPT, after the flag clears. The close frame is also
+--    when a coincident carried-bag change (the deposit's source slot) may still be landing,
+--    and that one heals on the normal coalesced path at carried scope. Cheap and correct:
+--    with _bankOpen already false it cannot touch the bank we just parked.
+--
+--  * a mid-flight deposit — bank slots still LOCKED on the close frame — cannot be healed
+--    by asking again later, because the bank is cold by then. The settle ladder still arms
+--    (Capture.Capture does that whenever a scan sees a lock), and its rungs correctly run at
+--    carried scope. The bank half's protection is the Class 4 guard in ScanContainer: a
+--    cold bank reads as "could not look", never as "empty", so the parked snapshot survives.
+--
+-- Registered through an indirection (`function() Capture.OnBankClosed() end`) so the
+-- self-test's 2.0.4 mutant can swap the function and prove the old chain loses the move.
+----------------------------------------------------------------------
+
+function Capture.OnBankOpened()
+    Capture._bankOpen = true
+    Capture.RequestCapture()
+end
+
+function Capture.OnBankClosed()
+    Capture.CaptureNow()          -- the bank slots are still warm ON THIS FRAME
+    Capture._bankOpen = false
+    Capture.RequestCapture()      -- ...and the carried bags get their normal coalesced look
+end
+
 ----------------------------------------------------------------------
 -- Event wiring
 ----------------------------------------------------------------------
@@ -702,17 +786,12 @@ function Capture.OnLogin()
             end)
         end
     end
-    -- Bank window gating: open enables bank scanning, close disables it after a
-    -- final capture so the just-seen bank state is stored.
+    -- Bank window gating: open enables bank scanning, close takes the final SYNCHRONOUS
+    -- capture (BAG-1) and only then disables it. Both go through named functions so the
+    -- self-tests can drive — and mutate — the real handler.
     if ns.RegisterEvent then
-        ns:RegisterEvent("BANKFRAME_OPENED", function()
-            Capture._bankOpen = true
-            Capture.RequestCapture()
-        end)
-        ns:RegisterEvent("BANKFRAME_CLOSED", function()
-            Capture.RequestCapture()      -- capture the final state while still readable
-            Capture._bankOpen = false
-        end)
+        ns:RegisterEvent("BANKFRAME_OPENED", function() Capture.OnBankOpened() end)
+        ns:RegisterEvent("BANKFRAME_CLOSED", function() Capture.OnBankClosed() end)
     end
     -- First snapshot once the world is up.
     Capture.RequestCapture()
@@ -848,9 +927,9 @@ end
 local SHIELD, OHWEAPON = 90001, 90002
 local SWAP_CID, SWAP_SLOT = 0, 3
 
-local function newSim()
+local function newSim(bags)
     local S = { clock = 0, timers = {}, seq = 0, handlers = {}, combat = true }
-    S.bags = {
+    S.bags = bags or {
         [0]  = { size = 16, items = {
                     [1] = { itemID = 6948,   stackCount = 1 },
                     [3] = { itemID = SHIELD, stackCount = 1 },
@@ -858,6 +937,15 @@ local function newSim()
         [1]  = { size = 14, link = "item:14046", items = {} },
         [-2] = { size = 12, items = {} },
     }
+
+    -- How many slots the CLIENT admits to for a container right now. The default is "the
+    -- fixture's size", i.e. everything is always readable; the bank sim overrides this to
+    -- model the one client fact BAG-1 turns on — the bank answers 0 the moment its frame is
+    -- shut, and 0 is indistinguishable from "no such container" at the API.
+    function S:numSlots(cid)
+        local c = self.bags[cid]
+        return c and c.size or 0
+    end
 
     function S:set(cid, slot, itemID)
         local c = self.bags[cid]
@@ -908,14 +996,22 @@ local SIM_GLOBALS = { "C_Container", "C_Timer", "GetTime", "GetMoney",
                       "GetInventoryItemID", "GetInventoryItemLink", "InCombatLockdown" }
 
 -- Install the sim as the live client. Returns a restore function.
-local function installSim(S, legacy)
+--
+-- `mutant` names a 2.0.4 REGRESSION to re-create, so a fix cannot be quietly deleted:
+--   "equip"  the 2.0.4 capture chain — bag events only, no settle ladder (the equip suite)
+--   "bank"   the 2.0.4 BANKFRAME_CLOSED handler — defer the capture, clear the flag
+--            synchronously (the bank close-out suite)
+-- `true` is accepted as a legacy spelling of "equip".
+local function installSim(S, mutant)
+    if mutant == true then mutant = "equip" end
     local saved = {}
     for _, k in ipairs(SIM_GLOBALS) do saved[k] = _G[k] end
     local savedRegister, savedArm = ns.RegisterEvent, Capture.ArmSettle
+    local savedBankClosed = Capture.OnBankClosed
     _G.C_Container = {
         GetContainerNumSlots = function(cid)
             if cid == 0 then S.scans = (S.scans or 0) + 1 end   -- one per full snapshot
-            local c = S.bags[cid]; return c and c.size or 0
+            return S:numSlots(cid)
         end,
         GetContainerItemInfo = function(cid, slot)
             local c = S.bags[cid]; return c and c.items[slot] or nil
@@ -938,18 +1034,27 @@ local function installSim(S, legacy)
         S.handlers[evt] = S.handlers[evt] or {}
         S.handlers[evt][#S.handlers[evt] + 1] = fn
     end
-    -- THE MUTANT: 2.0.4's chain exactly — bag events only, no settle ladder.
-    if legacy then
+    -- THE EQUIP MUTANT: 2.0.4's capture chain exactly — bag events only, no settle ladder.
+    if mutant == "equip" then
         Capture.EQUIP_EVENTS_SAVED = Capture.EQUIP_EVENTS
         Capture.EQUIP_EVENTS = {}
         Capture.ArmSettle = function() end
     end
+    -- THE BANK MUTANT: 2.0.4's BANKFRAME_CLOSED handler, transcribed. The comment is the
+    -- one that shipped, and the two lines under it are why it was never true.
+    if mutant == "bank" then
+        Capture.OnBankClosed = function()
+            Capture.RequestCapture()      -- capture the final state while still readable
+            Capture._bankOpen = false
+        end
+    end
 
     return function()
-        if legacy then
+        if mutant == "equip" then
             Capture.EQUIP_EVENTS = Capture.EQUIP_EVENTS_SAVED
             Capture.EQUIP_EVENTS_SAVED = nil
         end
+        Capture.OnBankClosed = savedBankClosed
         for _, k in ipairs(SIM_GLOBALS) do _G[k] = saved[k] end
         ns.RegisterEvent, Capture.ArmSettle = savedRegister, savedArm
     end
@@ -1291,6 +1396,252 @@ local function testEventRoster(fails)
     Capture._win = nil
 end
 
+----------------------------------------------------------------------
+-- THE BANK CLOSE-OUT SIMULATOR  (suite "bank-closeout") — BAG-1
+--
+-- Same rig as the equip sim, same real chain: scripted client events -> OUR registered
+-- handlers -> Capture.Capture -> Store. Nothing between the event and the store is stubbed
+-- except the client.
+--
+-- THE ONE CLIENT FACT THIS SIM ADDS, and the whole reason BAG-1 exists: the bank is
+-- READABLE ONLY WHILE ITS FRAME IS OPEN. C_Container.GetContainerNumSlots(-1) answers 24
+-- between BANKFRAME_OPENED and BANKFRAME_CLOSED, and 0 outside that window — and 0 at this
+-- API is indistinguishable from "no such container". So the close event is not a
+-- notification that something has happened; it is the LAST INSTANT the data exists.
+--
+-- THE FIXTURE IS THE AUDIT'S SCENARIO: deposit an item and shut the bank in the same
+-- breath. Runecloth moves from backpack slot 1 into bank slot 2, and BANKFRAME_CLOSED
+-- arrives IN THE SAME FRAME as the deposit's own events — before any C_Timer.After(0) has
+-- had a chance to run. That is not a contrived ordering: clicking the bank's close button
+-- while the deposit is still resolving is the ordinary way a session ends.
+--
+-- Every profile runs TWICE, against the shipping chain and against the "bank" MUTANT (a
+-- verbatim transcription of the 2.0.4 handler). The mutant must LOSE the deposit and the
+-- shipping chain must keep it — the permanent red-to-green record for this defect.
+----------------------------------------------------------------------
+
+local RUNECLOTH, SILK, MAGEWEAVE = 14047, 4306, 4338
+local BANK_CID, BANK_SLOT = -1, 2       -- where the deposit lands
+local SRC_CID,  SRC_SLOT  = 0, 1        -- where it comes from
+local BANKBAG_CID         = 5           -- first bank bag (NUM_BAG_SLOTS 4 + 1)
+
+-- A client with a bank. `S.bankReadable` is the frame-open window, and it is the client's
+-- own state — the addon never sets it; the sim flips it in the client's close handler,
+-- exactly like the real one does.
+local function newBankSim()
+    local S = newSim({
+        [0]  = { size = 16, items = { [SRC_SLOT] = { itemID = RUNECLOTH, stackCount = 20 } } },
+        [1]  = { size = 14, link = "item:14046", items = {} },
+        [-2] = { size = 12, items = {} },
+        [-1] = { size = 24, items = { [1] = { itemID = SILK, stackCount = 20 } } },
+        [BANKBAG_CID] = { size = 16, link = "item:14156",
+                          items = { [1] = { itemID = MAGEWEAVE, stackCount = 8 } } },
+    })
+    S.combat = false
+    S.bankReadable = false
+    function S:numSlots(cid)
+        local c = self.bags[cid]
+        if not c then return 0 end
+        -- The bank main container and every bank bag vanish from the API with the frame.
+        if cid == BANK_CID or cid >= BANKBAG_CID then
+            if not self.bankReadable then return 0 end
+        end
+        return c.size
+    end
+    return S
+end
+
+-- Drive one bank session. Returns what the store ended up holding.
+local function runBankSession(mutant, steps)
+    _G.DaseekiBags2Data, _G.DaseekiBags2DB = nil, nil
+    Store.Init()
+    Capture._win, Capture._settleArmed, Capture._captureQueued = nil, false, false
+    Capture._settleChain, Capture._bankOpen = 0, false
+
+    local S = newBankSim()
+    local restore = installSim(S, mutant)
+    local ok, err = pcall(function()
+        Capture.OnLogin()
+        S:advance(0.01)                 -- the login capture's After(0)
+        steps(S)
+        S:advance(5.0)                  -- a long quiet tail: anything that heals, has healed
+    end)
+    restore()
+    if not ok then error(err, 0) end
+
+    local owner = Store.GetOwner(Store.MakeNameRealm("Tester", "TestRealm"))
+    local function slotID(cid, slot)
+        local c = owner and Store.GetContainer(owner, cid)
+        return c and c.slots[slot] and c.slots[slot].id or nil
+    end
+    return {
+        owner    = owner,
+        deposit  = slotID(BANK_CID, BANK_SLOT),      -- the move under test
+        bankKept = slotID(BANK_CID, 1),              -- the bank's pre-existing contents
+        bankBag  = slotID(BANKBAG_CID, 1),           -- ...and a bank BAG's
+        source   = slotID(SRC_CID, SRC_SLOT),        -- the carried half (must be empty)
+        sim      = S,
+    }
+end
+
+-- THE SCENARIO. One frame, in client order: the deposit resolves, then the bank shuts.
+local function depositThenClose(S)
+    S.bankReadable = true
+    S:fire("BANKFRAME_OPENED")
+    S:advance(0.02)                                  -- the open's capture lands: bank parked
+
+    -- ── the deposit, all inside one frame ────────────────────────────────────────
+    S:lock(SRC_CID, SRC_SLOT, true)
+    S:fire("ITEM_LOCK_CHANGED", SRC_CID, SRC_SLOT)
+    S:set(SRC_CID, SRC_SLOT, nil)                    -- contents land...
+    S:set(BANK_CID, BANK_SLOT, RUNECLOTH)
+    S.bags[BANK_CID].items[BANK_SLOT].stackCount = 20
+    S:fire("ITEM_LOCK_CHANGED", SRC_CID, SRC_SLOT)   -- ...and the lock releases
+    S:fire("BAG_UPDATE", SRC_CID)
+    S:fire("PLAYERBANKSLOTS_CHANGED", BANK_SLOT)
+
+    -- ── ...and he shuts the bank, same frame, before any deferral has run ────────
+    S:fire("BANKFRAME_CLOSED")
+    S.bankReadable = false                           -- the client's own close: bank goes cold
+end
+
+local function testBankCloseout(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ------------------------------------------------------------------ GREEN: shipping
+    local now = runBankSession(nil, depositThenClose)
+    ck(now.deposit == RUNECLOTH, string.format(
+        "THE FIX: the close-frame capture RECORDS the last deposit — bank slot %d holds " ..
+        "runecloth (got %s)", BANK_SLOT, tostring(now.deposit)))
+    ck(now.bankKept == SILK, "…and the rest of the bank is intact (slot 1 still silk)")
+    ck(now.bankBag == MAGEWEAVE, "…and the bank BAGS were read on the same close frame too")
+    ck(now.source == nil, "…and the carried half is empty, as the client says it is")
+
+    ------------------------------------------------------------------ RED: the 2.0.4 chain
+    local old = runBankSession("bank", depositThenClose)
+    ck(old.deposit == nil, string.format(
+        "THE DEFECT, reproduced: 2.0.4 defers the close capture and clears _bankOpen on the " ..
+        "next SYNCHRONOUS line, so the deferred scan runs at carried scope and never sees " ..
+        "bank slot %d (expected nil, got %s — if this went green the mutant is not the old " ..
+        "code any more)", BANK_SLOT, tostring(old.deposit)))
+    ck(old.bankKept == SILK,
+        "…and it is specifically the LAST MOVE that is lost, not the whole bank: the " ..
+        "snapshot parked at BANKFRAME_OPENED survives, which is why this reads as staleness " ..
+        "rather than as breakage")
+    ck(old.source == nil,
+        "…while the CARRIED half updates fine on both chains — the asymmetry that makes the " ..
+        "defect look like a bank-side display bug")
+    Capture._BANK_MUTANT_REPORT =
+        "deposit-then-close: 2.0.5=" .. (now.deposit == RUNECLOTH and "recorded" or "LOST") ..
+        " | 2.0.4=" .. (old.deposit == RUNECLOTH and "recorded" or "LOST")
+
+    ------------------------------------------------------------------ ordering, stated
+    -- The property the fix actually rests on, asserted directly rather than inferred from
+    -- the outcome: when OnBankClosed hands control to Capture.Capture, the window flag is
+    -- still open. If a later refactor moves the clear back above the capture, this is the
+    -- row that says so in one line.
+    local sawOpen, savedCapture = nil, Capture.Capture
+    Capture.Capture = function() sawOpen = Capture._bankOpen end
+    Capture._bankOpen = true
+    Capture.OnBankClosed()
+    Capture.Capture = savedCapture
+    ck(sawOpen == true,
+        "ORDERING CONTRACT: the close-frame capture runs while _bankOpen is still TRUE " ..
+        "(got " .. tostring(sawOpen) .. ")")
+    ck(Capture._bankOpen == false, "…and the window is closed immediately afterwards")
+
+    ------------------------------------------------------------------ synchronous, proven
+    -- CaptureNow must not be a RequestCapture in disguise: with a real timer installed and
+    -- NOTHING pumped, the scan has to have already happened.
+    local S = newBankSim()
+    local restore = installSim(S, nil)
+    local okSync, errSync = pcall(function()
+        Store.Init()
+        S.bankReadable = true
+        S.scans = 0
+        Capture._bankOpen, Capture._captureQueued = true, false
+        Capture.CaptureNow()
+        ck((S.scans or 0) == 1,
+            "CaptureNow scans SYNCHRONOUSLY, with no timer pumped (scans=" ..
+            tostring(S.scans) .. ")")
+        -- ...and the coalesced path must still be the deferred one, or the fix would have
+        -- quietly turned every bag event into an inline full scan.
+        S.scans = 0
+        Capture._captureQueued = false
+        Capture.RequestCapture()
+        ck((S.scans or 0) == 0, "RequestCapture is still DEFERRED (scans before the pump=" ..
+            tostring(S.scans) .. ")")
+        S:advance(0.01)
+        ck((S.scans or 0) == 1, "…and the queued capture really does RUN once pumped " ..
+            "(scans after the pump=" .. tostring(S.scans) .. ") — the no-op timer stub " ..
+            "this rig used to ship could not have told us that")
+    end)
+    restore()
+    if not okSync then fails[#fails + 1] = "sync/defer probe: " .. tostring(errSync) end
+end
+
+-- The Class 4 half of the fix: a bank-scoped scan against a client that has ALREADY gone
+-- cold must preserve the parked bank, never overwrite it with an empty container. Without
+-- this, moving the capture onto the close frame would trade a stale bank for a WIPED one on
+-- any client that shuts the door a hair early.
+local function testColdBankPreserved(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    _G.DaseekiBags2Data = nil; Store.Init()
+    local o = Store.EnsureOwner("Tester-TestRealm")
+
+    local warm = fakeAPI({
+        [0]  = { size = 16, items = {} },
+        [-2] = { size = 12, items = {} },
+        [-1] = { size = 24, items = { [1] = { itemID = SILK, stackCount = 20 } } },
+        [BANKBAG_CID] = { size = 16, link = "item:14156",
+                          items = { [1] = { itemID = MAGEWEAVE, stackCount = 8 } } },
+    })
+    Capture.BuildSnapshot(o, warm, { bank = true }, 100)
+    ck(Store.GetContainer(o, BANK_CID) ~= nil, "PREMISE: a warm bank is parked")
+
+    -- Same scope, cold client: -1 and the bank bags now answer 0 slots.
+    local cold = fakeAPI({ [0] = { size = 16, items = {} }, [-2] = { size = 12, items = {} } })
+    Capture.BuildSnapshot(o, cold, { bank = true }, 200)
+    local bank = Store.GetContainer(o, BANK_CID)
+    ck(bank ~= nil and bank.slots[1] and bank.slots[1].id == SILK,
+        "a COLD bank read preserves the parked snapshot — 0 slots means 'could not look', " ..
+        "never 'your bank is empty' (Class 4)")
+    ck(Store.GetContainer(o, BANKBAG_CID) ~= nil, "…and the bank bags survive it too")
+
+    -- The rule is scoped: it must not have made every empty container un-recordable.
+    ck(Capture.ScanContainer(0, fakeAPI({})) ~= nil,
+        "…while a backpack that reports 0 is still stored (its size is not a readability " ..
+        "signal, and an empty backpack is a real state)")
+    ck(Capture.ScanContainer(BANK_CID, fakeAPI({})) == nil,
+        "…and ScanContainer states the bank rule on its own")
+end
+
+function Capture.RunBankTests(verbose)
+    Capture._BANK_MUTANT_REPORT = nil
+    local suites = {
+        { name = "close-out red/green",   fn = testBankCloseout },
+        { name = "cold bank preserved",   fn = testColdBankPreserved },
+    }
+    local allPass = true
+    for _, suite in ipairs(suites) do
+        local fails = {}
+        local ok, err = pcall(suite.fn, fails)
+        if not ok then fails[#fails + 1] = "error: " .. tostring(err) end
+        if #fails > 0 then allPass = false end
+        if verbose and ns and ns.Print then
+            if #fails == 0 then ns:Print("  PASS bank-closeout/" .. suite.name)
+            else for _, f in ipairs(fails) do
+                ns:Print("  FAIL bank-closeout/" .. suite.name .. " :: " .. f) end end
+        end
+    end
+    if verbose and ns and ns.Print and Capture._BANK_MUTANT_REPORT then
+        ns:Print("  bank-closeout: " .. Capture._BANK_MUTANT_REPORT)
+    end
+    _G.DaseekiBags2Data, _G.DaseekiBags2DB = nil, nil
+    Store.Init()
+    return allPass
+end
+
 function Capture.RunEquipTests(verbose)
     Capture._MUTANT_REPORT = nil
     local suites = {
@@ -1357,6 +1708,7 @@ end
 if ns.RegisterSelfTest then
     ns:RegisterSelfTest("capture", Capture.RunSelfTests)
     ns:RegisterSelfTest("equip-refresh", Capture.RunEquipTests)
+    ns:RegisterSelfTest("bank-closeout", Capture.RunBankTests)
 end
 
 return Capture
