@@ -330,31 +330,54 @@ Owner.SUMMARY_SORTS = { "name", "count" }
 -- owner    = a summary owner record (itemCounts map; no containers)
 -- resolver = { instant = <GetItemInfoInstant>, info = <GetItemInfo> } (ui_find's shape)
 -- opts     = { sortBy = "name" | "count" }
--- Returns an array of { itemID, itemName, quality, icon, count }.
+-- Returns an array of { itemID, itemName, quality, icon, count, pending }, AND a sorted
+-- array of the itemIDs whose name did not answer.
+--
+-- BAG-2 (data honesty, async class 4). This browsed a Nexus-only alt's aggregate — items
+-- you have by definition not touched this session — and rendered a large fraction of them
+-- as the raw placeholder "item:22785", uncoloured, SORTED UNDER "i", on a surface that
+-- registered no events and therefore never repainted when the names landed. The comment
+-- above knew names arrive late and picked name-ordering because of it; this is the half
+-- that listens. Two changes: an unresolved row is FLAGGED and sorts after every named row
+-- (so a placeholder cannot claim a place in the alphabet it will vacate), and the
+-- unresolved ids come back to the caller, which hands them to ui_find's shared cold-item
+-- watch — one watch and one event frame for this surface and the Find window both.
 function Owner.SummaryRows(owner, resolver, opts)
     opts = opts or {}
-    local rows = {}
-    if type(owner) ~= "table" or type(owner.itemCounts) ~= "table" then return rows end
+    local rows, pending = {}, {}
+    if type(owner) ~= "table" or type(owner.itemCounts) ~= "table" then return rows, pending end
     for id, n in pairs(owner.itemCounts) do
         id, n = tonumber(id), tonumber(n)
         if id and n and id > 0 and n > 0 then
             local name, quality, icon
+            local isPending = false
             if resolver then
                 if resolver.instant then local _, _, _, _, ic = resolver.instant(id); icon = ic end
-                if resolver.info then local nm, _, q = resolver.info(id); name, quality = nm, q end
+                if resolver.info then
+                    local nm, _, q = resolver.info(id); name, quality = nm, q
+                    -- We asked and got no answer. With NO resolver there is nothing to
+                    -- wait for, so an absent resolver is never reported pending.
+                    if nm == nil then isPending = true end
+                end
             end
+            if isPending then pending[#pending + 1] = id end
             rows[#rows + 1] = { itemID = id, itemName = name or ("item:" .. id),
-                                quality = quality, icon = icon, count = n }
+                                quality = quality, icon = icon, count = n,
+                                pending = isPending or nil }
         end
     end
     local byCount = (opts.sortBy == "count")
     table.sort(rows, function(a, b)
+        local ap, bp = a.pending and 1 or 0, b.pending and 1 or 0
+        if ap ~= bp then return ap < bp end        -- unresolved names last, always
         if byCount and a.count ~= b.count then return a.count > b.count end
         local an, bn = tostring(a.itemName):lower(), tostring(b.itemName):lower()
         if an ~= bn then return an < bn end
         return a.itemID < b.itemID
     end)
-    return rows
+    -- Sorted: this list drives a retry loop (async class 8).
+    table.sort(pending)
+    return rows, pending
 end
 
 -- The standing caption above the list. `opts.bank` adds the bags/bank sentence, because
@@ -378,6 +401,19 @@ function Owner.SummaryCaption(owner, now, opts)
         local who = (type(owner) == "table" and owner.name) or "this character"
         line = line .. ". Bags and bank are not separated in synced data, so this is "
                     .. "everything " .. who .. " is carrying and storing."
+    end
+    -- BAG-2: the cold-item tail, ALWAYS last, so the bank caption stays the inventory
+    -- caption extended (both surfaces tell one story about one record). A list part of
+    -- which is still a row of raw ids must say so rather than let the reader assume the
+    -- names are the data.
+    local pending = tonumber(opts.pending) or 0
+    if pending > 0 then
+        local phrase = (pending == 1) and "1 item" or (tostring(pending) .. " items")
+        if opts.exhausted then
+            line = line .. " \194\183 " .. phrase .. " never sent their names"
+        else
+            line = line .. " \194\183 still loading " .. phrase .. "\226\128\166"
+        end
     end
     return line
 end
@@ -1760,9 +1796,46 @@ local function testSummaryViewModel(fails)
         itemCounts = { [0] = 5, [7] = -1, ["x"] = 2, [9] = 3 } }), resolver)
     ck(#dirty == 1 and dirty[1].itemID == 9,
         "itemID 0, negative counts and non-numeric keys are dropped (got " .. #dirty .. ")")
-    local noRes = Owner.SummaryRows(owner, nil)
+    local noRes, noResPending = Owner.SummaryRows(owner, nil)
     ck(#noRes == 3 and noRes[1].itemName:find("item:", 1, true) == 1,
         "with no resolver the rows still render, named by id")
+    ck(#noResPending == 0,
+        "…and report NOTHING pending: with no resolver there is nothing to wait for")
+
+    ------------------------------------------------------- BAG-2: cold names
+    -- The Nexus-only alt on a fresh login: every id is one you have not touched this
+    -- session, so GetItemInfo answers nil for all of them. Before this round the panel
+    -- rendered a list of raw "item:<id>" placeholders SORTED UNDER "i", on a surface that
+    -- registered no events and so never repainted when the names landed.
+    local coldResolver = {
+        instant = function(id) return nil, nil, nil, "", 5000 + id end,
+        info    = function() return nil end,          -- nothing is cached yet
+    }
+    local coldRows, coldPending = Owner.SummaryRows(owner, coldResolver)
+    ck(#coldRows == 3, "a cold client still lists every item the alt holds (got " .. #coldRows .. ")")
+    ck(#coldPending == 3, "…and reports all three ids as PENDING (got " .. #coldPending .. ")")
+    ck(coldPending[1] == 11 and coldPending[2] == 12 and coldPending[3] == 13,
+        "…sorted, because that list drives a retry loop (class 8)")
+    ck(coldRows[1].pending == true, "…each unresolved row is flagged rather than silently placeholdered")
+    ck(coldRows[1].icon == 5011, "…the icon still resolves (GetItemInfoInstant is synchronous)")
+
+    -- HALF WARM: the resolved names hold the alphabet; the unresolved one sorts LAST
+    -- instead of wedging itself in under "i".
+    local halfResolver = {
+        instant = coldResolver.instant,
+        info    = function(id) if id == 13 then return nil end return NAMES[id], nil, (id % 5), 0 end,
+    }
+    local halfRows, halfPending = Owner.SummaryRows(owner, halfResolver)
+    ck(#halfPending == 1 and halfPending[1] == 13, "only the unresolved id is pending")
+    ck(halfRows[1].itemName == "Arcane Powder" and halfRows[2].itemName == "Zephyr Cloak",
+        "the NAMED rows keep their alphabetical order")
+    ck(halfRows[3].itemID == 13 and halfRows[3].pending == true,
+        "…and the placeholder sorts last, not under 'i' (BAG-2)")
+    -- sortBy=count obeys the same rule: an unknown name is not a count you can trust to
+    -- sit anywhere in particular, so it still goes last.
+    local halfByCount = Owner.SummaryRows(owner, halfResolver, { sortBy = "count" })
+    ck(halfByCount[1].count == 40 and halfByCount[3].itemID == 13,
+        "sortBy=count still orders by count, with the unresolved row last")
 
     ------------------------------------------------------------------ caption
     local now = 1700000000 + 3 * 86400
@@ -1785,6 +1858,26 @@ local function testSummaryViewModel(fails)
         "the bank caption states that bags and bank are not separated: " .. bankCap)
     ck(bankCap:find("Rin", 1, true) ~= nil, "…and names the character")
     ck(#bankCap > #cap, "…and is the longer of the two captions")
+
+    -- BAG-2 (data honesty): while ids are still unnamed the caption SAYS SO, so a list of
+    -- "item:22785" placeholders is never mistaken for what the alt actually holds. The
+    -- tail is always LAST, so the bank caption stays the inventory caption extended and
+    -- the two surfaces cannot drift into telling different stories about one record.
+    local loading = Owner.SummaryCaption(owner, now, { pending = 3 })
+    ck(loading:find("still loading 3 items", 1, true) ~= nil,
+        "a pending caption states what is still coming: " .. loading)
+    ck(loading:sub(1, #cap) == cap, "…as a tail on the standing caption, not a replacement")
+    ck(Owner.SummaryCaption(owner, now, { pending = 1 }):find("still loading 1 item", 1, true) ~= nil,
+        "…singular reads '1 item'")
+    local stalled = Owner.SummaryCaption(owner, now, { pending = 2, exhausted = true })
+    ck(stalled:find("never sent their names", 1, true) ~= nil,
+        "…and once the bounded ladder is spent it stops claiming to be loading: " .. stalled)
+    ck(stalled:find("still loading", 1, true) == nil, "…the two states are mutually exclusive")
+    ck(Owner.SummaryCaption(owner, now, { pending = 0 }) == cap,
+        "nothing pending -> the caption is unchanged (a warm client sees no tail)")
+    local bankLoading = Owner.SummaryCaption(owner, now, { bank = true, pending = 3 })
+    ck(bankLoading:sub(1, #bankCap) == bankCap,
+        "…and the bank form is still the bank caption extended, tail last")
 
     ------------------------------------------------------------------ empty state
     local empty = Owner.SummaryEmptyText(nexusOwner("Rin", { itemCounts = {} }))

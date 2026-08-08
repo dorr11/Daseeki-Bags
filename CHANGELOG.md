@@ -4,7 +4,55 @@
 
 **Equip something from your bags in the middle of a fight and the bag cell updates. It
 used to keep showing the item you just put on. Your last deposit before closing the bank
-is saved now too, and on-use items in your bags show their cooldown.**
+is saved now too, on-use items in your bags show their cooldown, and Find no longer says
+"no matches" on a fresh login for an item three of your characters are holding.**
+
+### Find said "no matches" for things you definitely own
+
+Log in, open Find, type "songflower" — and get *"No character has a matching item"*, for a
+flower three of your alts are carrying. Log in, go about your evening, come back an hour
+later, and the same search works perfectly. This is the signature Daseeki feature, and it
+was failing in precisely the state it exists for: the moment you sit down and ask "which
+one of you has it?"
+
+Here is the mechanism, because it is a small thing with a large shadow. The game does not
+keep your alts' item names in memory; it fetches them from the server the first time
+something needs one. On a fresh login, your alts' stored items are — by definition — the
+ones nothing has needed yet, so the game answers "I don't know" for nearly all of them.
+Bags' matcher has always reported that answer honestly: it says *matched: no, and by the
+way, I could not actually check this one*. Every other search surface in the addon listens
+to that second half. The Find window threw it away and read "could not check" as "does not
+match", so every holder scored zero, every holder was dropped, and the window announced a
+confident nothing. It also registered no game events at all, so when the names did arrive
+seconds later, nothing re-ran the search. That "nothing" was permanent until you typed
+again.
+
+Find now does what the rest of Bags does. Items it cannot check yet are **held, not
+counted as misses**; it asks the game for them; and when the answers arrive it re-runs the
+search on its own and the matches appear. While it is waiting it *says so* — "Still loading
+item data for 37 items" instead of a false "no matches", and a small "still loading…" tag
+in the title bar when it has some results but not all of them yet. If some items never
+answer at all, it stops after a few seconds and tells you that too, rather than pretending
+either that they matched or that they did not. An unanswered question is not a no.
+
+The same fix reaches the **summary list for a Nexus-only character** — the item list you
+get when you browse a character that lives on your other account. It had the identical
+hole: a large part of the list rendered as raw `item:22785` placeholders filed under "i",
+and nothing ever repainted them. Those rows now sort to the bottom instead of wedging
+themselves into the alphabet, the caption says how many are still coming, and the list
+fills itself in as the names land. Both surfaces share one waiting list and one listener,
+so neither can be fixed without the other.
+
+### Gear you can wear was showing as gear you cannot
+
+A rarer one, from the same family. Items you are too low a level to equip get a red border.
+The check was written to never mark an item red while your level is unknown — but it asked
+the game for your level in a way that answers **0** for the first instant after you log in
+or reload, and "0" is not the same as "unknown" to a computer. So a bag window that painted
+in that instant washed *every* level-gated item in your bags red at once. It corrected
+itself on the next redraw, so it read as a flicker rather than a bug. Unknown now means
+unknown, and Bags also remembers your real level rather than re-asking a question that can
+come back blank.
 
 ### The bag cell kept the old picture
 
@@ -94,6 +142,13 @@ a side effect. Anything that did not change a stack count got no sweep at all.
   seen: "we scheduled it" and "we did it" were the same event. Deferred work is now queued
   against a virtual clock and pumped, and the rig's own clock is a release gate. The bank
   defect is now reproduced on the old code and fixed on the new one, on every run.
+- **A fresh-login test fixture for Find.** The rig now runs a simulated client that
+  answers item names only when the test says so, and drives the whole Find chain against
+  it: the old code is reproduced saying "no character has a matching item" for an item
+  three characters hold, the new code shows the loading state and then the matches as the
+  simulated client warms up, and the waiting is proved to give up after a fixed number of
+  tries rather than retrying forever. A warm client is proved to take exactly one pass and
+  ask the game for nothing, so none of this costs anything once your session is going.
 
 ## 2.0.4 — 2026-08-05
 
