@@ -7,6 +7,26 @@ used to keep showing the item you just put on. Your last deposit before closing 
 is saved now too, on-use items in your bags show their cooldown, and Find no longer says
 "no matches" on a fresh login for an item three of your characters are holding.**
 
+### Turning Daseeki Nexus off could take your cross-account characters with it
+
+If you upgraded from Bags 1.x while Daseeki Nexus was installed and providing your
+cross-account characters, Bags deliberately did not import its own second copy of them —
+two sources for one character's gold is worse than one. That part was right. What was
+wrong is that Bags then marked the one-time 1.x import "done" anyway, with half of it
+never run. Turn the Nexus inventory module off months later and those characters — and
+their gold, and their contribution to your account total — were simply gone, with nothing
+able to bring them back.
+
+Bags now writes down the half it held back, and settles it the first time you log in
+without Nexus providing those characters: they come back automatically, and you get one
+line in chat saying so. Nothing already in your list is touched — the import only adds
+characters that are missing, so anything you have captured since is safe.
+
+If you upgraded before this build, there is no note in your saved data to settle, and
+Bags cannot tell a character it never imported from one you removed on purpose. So if
+cross-account alts are missing from your list, `/bags mesh import` does it on request.
+`/bags debug nexus` now says whether anything is outstanding.
+
 ### Find said "no matches" for things you definitely own
 
 Log in, open Find, type "songflower" — and get *"No character has a matching item"*, for a
