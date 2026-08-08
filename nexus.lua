@@ -195,17 +195,46 @@ function Nexus.EntryTimestamp(entry)
     return tonumber(entry.updatedAt) or 0
 end
 
+-- BAG-4 (honesty brief) — ABSENT IS ABSENT, NOT ZERO.
+--
+-- A payload that does not carry a number is saying NOTHING about it; it is not saying
+-- zero. That distinction only becomes load-bearing because MergeOwners rule 3 replaces
+-- a summary record WHOLESALE, so a coerced default does not sit beside the stored figure
+-- — it destroys it. A relayed inventory payload with no `money` in it (an older Nexus
+-- build, a trimmed wire frame, a scan that ran before GetMoney answered), stamped newer,
+-- used to blank that alt's gold to 0g and shorten the cross-account Total by its whole
+-- balance, with nothing on screen looking broken.
+--
+-- So: the payload wins whenever it can be read as a number — INCLUDING 0, because an alt
+-- genuinely at 0g is a real state and has to be able to say so. Otherwise the figure we
+-- already hold stands, and only when nothing is held anywhere does the record default
+-- apply (it must: the money tooltip sums these and nil is not addable).
+--
+-- migrate.lua:238 is the same rule on the 1.x mesh side: "backfill only genuinely-missing
+-- fields; never overwrite the fuller record."
+local function carryNumber(fromPayload, fromCurrent)
+    local v = tonumber(fromPayload)
+    if v ~= nil then return v end            -- present and readable (0 INCLUDED) -> payload wins
+    local c = tonumber(fromCurrent)
+    if c ~= nil then return c end            -- absent or unreadable -> the stored figure stands
+    return 0                                 -- nothing known anywhere -> the record default
+end
+
 -- Convert { rev, updatedAt, data = <wire payload> } into a store-shaped owner record.
 -- Always source = "summary": the wire contract carries aggregate itemCounts and money,
 -- never per-slot containers, which is precisely what "summary" means here (store.lua
 -- NewOwner). Returns nil for anything unconvertible.
 --
+-- `cur` is the record this one is about to REPLACE, when there is one (MergeOwners rule
+-- 3). It is read-only here and used for nothing but the carry-forward above.
+--
 -- `nexus = true` is a VIEW-ONLY provenance marker. Merged views are built on demand
 -- and never written back to DaseekiBags2Data, so this field never reaches disk.
-function Nexus.ToOwnerRecord(ownerKey, entry)
+function Nexus.ToOwnerRecord(ownerKey, entry, cur)
     if type(ownerKey) ~= "string" or ownerKey == "" then return nil end
     if type(entry) ~= "table" or type(entry.data) ~= "table" then return nil end
     local d = entry.data
+    if type(cur) ~= "table" then cur = EMPTY end
 
     local name, realm = Store.SplitNameRealm(ownerKey)
     local o = Store.NewOwner(ownerKey, name, realm)
@@ -215,8 +244,8 @@ function Nexus.ToOwnerRecord(ownerKey, entry)
     o.race    = d.race
     o.sex     = tonumber(d.sex)
     o.faction = d.faction
-    o.level   = tonumber(d.level) or 0
-    o.money   = tonumber(d.money) or 0
+    o.level   = carryNumber(d.level, cur.level)
+    o.money   = carryNumber(d.money, cur.money)
     o.rev     = tonumber(entry.rev) or 0
     o.ts      = Nexus.EntryTimestamp(entry)
     if type(d.itemCounts) == "table" then
@@ -249,6 +278,10 @@ end
 --      STRICTLY greater, so a tie leaves the Bags record in place — ties are the
 --      normal case for the same snapshot reaching both stores, and a stable
 --      tiebreak keeps the money tooltip from flickering between two equal copies.
+--      The replacement is WHOLESALE, which is why the record being replaced is handed
+--      to ToOwnerRecord: a number the winning payload does not carry is UNKNOWN and
+--      carries forward from the record it displaces (BAG-4). "Newer" means the payload
+--      supersedes what it actually says, not that it erases what it never mentioned.
 --
 -- KEY ALIASING (gold is sacred): two graphs that disagree about realm spacing or
 -- capitalisation for the SAME character would merge as two owners, and the money
@@ -298,7 +331,10 @@ function Nexus.MergeOwners(localOwners, nexusOwners)
                 if cur ~= nil and ts <= (tonumber(cur.ts) or 0) then
                     stats.keptLocal = stats.keptLocal + 1        -- rule 3, local is fresher
                 else
-                    local rec = Nexus.ToOwnerRecord(target, entry)
+                    -- BAG-4: `cur` goes in so the replacement can carry forward the
+                    -- numbers this payload does not carry. Rule 3 replaces wholesale;
+                    -- without this, an omitted field is not "unchanged", it is erased.
+                    local rec = Nexus.ToOwnerRecord(target, entry, cur)
                     if rec then
                         if cur == nil then stats.added = stats.added + 1        -- rule 1
                         else stats.refreshed = stats.refreshed + 1 end          -- rule 3, Nexus is fresher
@@ -509,7 +545,114 @@ local function testConversion(fails)
         .itemCounts[9] == 3, "junk item counts dropped, the good one kept")
     local junk = Nexus.ToOwnerRecord("A-R", { data = { itemCounts = { [0] = 5, [7] = -1 } } })
     ck(junk.itemCounts[0] == nil and junk.itemCounts[7] == nil, "itemID 0 and negative counts dropped")
-    ck(junk.money == 0 and junk.level == 0, "absent numbers default to 0, never nil")
+
+    -- BAG-4 (honesty brief) — THIS ROW IS RE-BASED. It used to read
+    --   ck(junk.money == 0 and junk.level == 0, "absent numbers default to 0, never nil")
+    -- which pinned the coercion as if it were the contract. It is not: an absent
+    -- number is UNKNOWN, and the only reason a fresh record still lands on 0 is that
+    -- there is nothing stored to carry forward and the money total has to stay
+    -- arithmetic-safe. Said honestly, the rule has three cases, and all three are here.
+    ck(junk.money == 0 and junk.level == 0,
+        "with NO current record to carry forward, an absent number falls to the record default 0")
+    local carried = Nexus.ToOwnerRecord("A-R", { data = { itemCounts = {} } },
+        { money = 40000000, level = 60 })
+    ck(carried.money == 40000000 and carried.level == 60,
+        "absent is ABSENT, not zero: the stored figure carries forward past a payload that omits it")
+    local realZero = Nexus.ToOwnerRecord("A-R", { data = { money = 0, level = 0 } },
+        { money = 40000000, level = 60 })
+    ck(realZero.money == 0 and realZero.level == 0,
+        "a PRESENT zero still writes — an alt genuinely at 0g is a real state, not an absence")
+end
+
+-- BAG-4 — ABSENT IS ABSENT, NOT ZERO, through the real merge path.
+--
+-- MergeOwners rule 3 replaces a Bags summary record WHOLESALE the moment the Nexus
+-- stamp is newer, and ToOwnerRecord builds that replacement out of the payload alone.
+-- So a peer relaying an inventory payload whose `data` omits `money` — an older Nexus
+-- build, a trimmed wire frame, a scan that ran before GetMoney answered — used to land
+-- as a hard 0: that alt's gold read 0g in the money tooltip and the cross-account Total
+-- silently dropped by its whole balance. Nothing reached disk, which is exactly what
+-- made it invisible; the numbers were simply wrong on screen and no state looked broken.
+--
+-- migrate.lua:238 already gets this right for the 1.x mesh half ("backfill only
+-- genuinely-missing fields"). This is the same rule on the Nexus side.
+local function testAbsentIsAbsent(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local FOURK = 4000 * 10000          -- 4,000g, in copper as the store holds it
+
+    -- A relayed payload that simply has no `money` and no `level` in it.
+    local function omitting(key, ts)
+        return { rev = 9, updatedAt = ts + 100, data = {
+            key = key, class = "MAGE", race = "Gnome", sex = 2, faction = "Alliance",
+            itemCounts = { [6948] = 1 }, currency = {}, ts = ts,
+        } }
+    end
+    local function bagsSummary(key, money, level, ts)
+        return { nameRealm = key, name = key:match("^[^-]+"), source = "summary",
+                 money = money, level = level, ts = ts,
+                 containers = {}, equip = {}, itemCounts = {} }
+    end
+
+    -- ── THE RED CONTROL ──────────────────────────────────────────────────────
+    -- Under the old chain this alt's 4,000g was wiped to 0 by a payload that never
+    -- mentioned money at all.
+    local localOwners = {
+        ["Banker-Whitemane"] = bagsSummary("Banker-Whitemane", FOURK, 60, 1700000000),
+    }
+    local merged = Nexus.MergeOwners(localOwners, {
+        ["Banker-Whitemane"] = omitting("Banker-Whitemane", 1700009000),   -- strictly NEWER
+    })
+    local rec = merged["Banker-Whitemane"]
+    ck(rec ~= nil and rec.nexus == true, "the newer Nexus payload still supersedes (rule 3 unchanged)")
+    ck(rec.money == FOURK, "a payload that OMITS money leaves the stored 4,000g standing")
+    ck(rec.level == 60, "...and an omitted level does not reset the character to 0")
+    ck(rec.itemCounts[6948] == 1, "...while the fields the payload DOES carry are taken")
+    ck(localOwners["Banker-Whitemane"].money == FOURK, "...and the local store was not written")
+
+    -- The consequence the audit named, stated as arithmetic.
+    local total = 0
+    for _, o in pairs(merged) do total = total + (o.money or 0) end
+    ck(total == FOURK, "the cross-account total is not silently short by that alt's balance")
+
+    -- ── THE OTHER HALF: a PRESENT zero is an answer, and it writes ───────────
+    local spent = Nexus.MergeOwners(
+        { ["Broke-Whitemane"] = bagsSummary("Broke-Whitemane", FOURK, 60, 1700000000) },
+        { ["Broke-Whitemane"] = entry("Broke-Whitemane", 0, 1700009000) })
+    ck(spent["Broke-Whitemane"].money == 0,
+        "an alt that genuinely spent down to 0g reports 0 — a present zero is not an absence")
+    ck(spent["Broke-Whitemane"].nexus == true, "...through the same rule-3 replacement")
+
+    -- Field by field: what the payload carries is overwritten, what it skips carries over.
+    local partial = Nexus.MergeOwners(
+        { ["Half-Whitemane"] = bagsSummary("Half-Whitemane", FOURK, 60, 1700000000) },
+        { ["Half-Whitemane"] = { rev = 3, updatedAt = 1700009100, data = {
+              key = "Half-Whitemane", money = 12345, ts = 1700009000 } } })
+    ck(partial["Half-Whitemane"].money == 12345, "a carried field is overwritten outright")
+    ck(partial["Half-Whitemane"].level == 60, "...while the field the same payload skipped carries forward")
+
+    -- Rule 1 is untouched: with nothing stored there is no figure to carry, and the
+    -- record default keeps the money total arithmetic-safe.
+    local fresh = Nexus.MergeOwners({}, { ["New-Faerlina"] = omitting("New-Faerlina", 1700009000) })
+    ck(fresh["New-Faerlina"].money == 0 and fresh["New-Faerlina"].level == 0,
+        "a brand-new Nexus-only owner still lands on the record default 0")
+
+    -- Rule 2 is untouched: a full local owner is never converted at all.
+    local full = Nexus.MergeOwners(
+        { ["Main-Whitemane"] = { nameRealm = "Main-Whitemane", name = "Main", source = "full",
+              money = FOURK, level = 60, ts = 1700000000,
+              containers = {}, equip = {}, itemCounts = {} } },
+        { ["Main-Whitemane"] = omitting("Main-Whitemane", 1700009000) })
+    ck(full["Main-Whitemane"].money == FOURK and full["Main-Whitemane"].source == "full",
+        "a full local owner is still untouchable")
+
+    -- A stale payload that omits money never reaches the conversion at all (rule 3,
+    -- local-is-fresher) — the stored figure stands for the older reason, not this one.
+    local stale = Nexus.MergeOwners(
+        { ["Old-Whitemane"] = bagsSummary("Old-Whitemane", FOURK, 60, 1700009000) },
+        { ["Old-Whitemane"] = omitting("Old-Whitemane", 1700000000) })
+    ck(stale["Old-Whitemane"].money == FOURK and stale["Old-Whitemane"].nexus == nil,
+        "a staler omitting payload is refused before conversion, as before")
 end
 
 -- THE PRECEDENCE RULE, in both directions.
@@ -668,6 +811,7 @@ function Nexus.RunSelfTests(verbose)
     local suites = {
         { name = "presence + enablement probes", fn = testProbes },
         { name = "wire payload -> owner record", fn = testConversion },
+        { name = "absent is absent, not zero",   fn = testAbsentIsAbsent },
         { name = "newest-wins precedence",       fn = testNewestWins },
         { name = "key aliasing (no phantom gold)", fn = testKeyAliasing },
         { name = "live fallback + cache",        fn = testLiveFallback },

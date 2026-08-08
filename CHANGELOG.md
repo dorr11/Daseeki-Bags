@@ -7,6 +7,22 @@ used to keep showing the item you just put on. Your last deposit before closing 
 is saved now too, on-use items in your bags show their cooldown, and Find no longer says
 "no matches" on a fresh login for an item three of your characters are holding.**
 
+### An update that didn't mention an alt's gold could set it to zero
+
+When Daseeki Nexus is providing your cross-account characters, Bags takes the newer of
+the two copies it holds for each one. "Newer wins" is right. What was wrong is what
+"newer" was allowed to mean: the incoming copy replaced the old one *entirely*, so a
+character update that simply didn't include a gold figure — a peer on an older build, a
+trimmed update, a scan taken a moment before the game answered with the balance — was
+read as "this character has 0g". That alt showed 0g in the money tooltip and your
+cross-account **Total quietly dropped by their whole balance**. Nothing was damaged and
+nothing was saved wrong; the number on screen was just short, and there was no sign of it.
+
+An update now only changes what it actually says. A figure the update doesn't carry is
+unknown, not zero, and the balance you already had stands. A figure it *does* carry wins
+outright — including a zero, because a character who genuinely spent down to nothing is
+entitled to say so.
+
 ### Turning Daseeki Nexus off could take your cross-account characters with it
 
 If you upgraded from Bags 1.x while Daseeki Nexus was installed and providing your
