@@ -223,11 +223,23 @@ local function dispatch(msg)
         if ns.Sort and ns.Sort.PrintLog then ns.Sort.PrintLog(rest)
         else ns:Print("the sort engine is not loaded, so there is no sort log") end
     elseif cmd == "mesh" then
-        -- 1.x's cross-account sync commands (/dbg mesh, mesh send, mesh clear). The
-        -- feature moved to Daseeki-Nexus; say so once, here, where it is missed.
-        ns:Print("cross-account sync moved to Daseeki Nexus. Your 1.x mesh data was " ..
-                 "imported and those characters are in the character list; the live " ..
-                 "sync itself is now the Nexus Inventory module.")
+        local sub = (rest or ""):match("^(%S*)"):lower()
+        if sub == "import" then
+            -- BAG-5's explicit release path. The automatic settlement needs a
+            -- deferral recorded at migration time; a store that migrated before
+            -- that existed carries none, and whether it owes anything is not
+            -- decidable from the data. So the owner can say so. Additive-only.
+            if ns.Migrate and ns.Migrate.MeshImportCommand then ns.Migrate.MeshImportCommand()
+            else ns:Print("the 1.x import is not loaded") end
+        else
+            -- 1.x's cross-account sync commands (/dbg mesh, mesh send, mesh clear). The
+            -- feature moved to Daseeki-Nexus; say so once, here, where it is missed.
+            ns:Print("cross-account sync moved to Daseeki Nexus. Your 1.x mesh data was " ..
+                     "imported and those characters are in the character list; the live " ..
+                     "sync itself is now the Nexus Inventory module.")
+            ns:Print("  /bags mesh import - re-import cross-account characters from your " ..
+                     "1.x data if they are missing from the list")
+        end
     elseif cmd == "help" then
         ns:Print("commands (/bags, short /dbags; 1.x's /dbg and /Daseeki-Bags still work):")
         ns:Print("  /bags [toggle]      - show/hide the bag window")
@@ -239,6 +251,7 @@ local function dispatch(msg)
         ns:Print("  /bags debug strip|bankstrip|toolbar|money - diagnose the open window")
         ns:Print("  /bags debug equiptrace [clear] - what the last equip swaps did to your bag cells")
         ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
+        ns:Print("  /bags mesh import   - re-import cross-account characters from your 1.x data")
     else
         ns:Print("unknown command '" .. cmd .. "'. Try /bags help.")
     end
@@ -439,8 +452,23 @@ local function testSlashRoster(fails)
     ns.Print = function(_, ...) said[#said + 1] = table.concat({ ... }, " ") end
     ns.SlashDispatch("mesh")
     ns.Print = realPrint
-    ck(#said == 1 and said[1]:lower():find("nexus", 1, true) ~= nil,
+    ck(#said == 2 and said[1]:lower():find("nexus", 1, true) ~= nil,
        "/dbg mesh points at Daseeki Nexus instead of failing as unknown")
+    -- BAG-5: the bare notice also advertises the explicit re-import gesture, because
+    -- a release path nobody is told about is the same as no release path (CDT-3's
+    -- Unblock() with zero live callers is the suite's cautionary tale).
+    ck(#said == 2 and said[2]:find("mesh import", 1, true) ~= nil,
+       "...and names /bags mesh import as the way back for a missing cross-account alt")
+
+    -- `mesh import` reaches the migration, not the notice.
+    local reached = false
+    local realMig = ns.Migrate
+    ns.Migrate = { MeshImportCommand = function() reached = true end }
+    said = {}
+    ns.Print = function(_, ...) said[#said + 1] = table.concat({ ... }, " ") end
+    ns.SlashDispatch("mesh import")
+    ns.Print, ns.Migrate = realPrint, realMig
+    ck(reached and #said == 0, "/bags mesh import routes to the 1.x re-import, not the notice")
 
     -- 2.0.2a: `sortlog` is a TOP-LEVEL subcommand on the same dispatcher, so it answers
     -- on all four command strings. Pinned here because it is the coordinator's read

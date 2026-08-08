@@ -188,6 +188,66 @@ function Migrate.ConvertSummaryChar(realm, name, oldMesh)
 end
 
 ----------------------------------------------------------------------
+-- How many 1.x character records a source global actually holds. READ-ONLY.
+-- Declared here (rather than beside Migrate.CountSourceChars, which closes over
+-- it) because Migrate.Run needs it to answer "is there a mesh half to owe?".
+----------------------------------------------------------------------
+
+local function countChars(src)
+    local n = 0
+    if type(src) ~= "table" then return n end
+    for _, chars in pairs(src) do
+        if type(chars) == "table" then
+            for _, rec in pairs(chars) do
+                if type(rec) == "table" then n = n + 1 end
+            end
+        end
+    end
+    return n
+end
+
+----------------------------------------------------------------------
+-- The SUMMARY (mesh) half of the import, factored out because it now has TWO
+-- callers: the migration pass itself, and the deferred-completion pass below.
+-- One implementation, so the two can never drift apart — the audit's dominant
+-- shape suite-wide is "the sibling got the guard and I didn't".
+--
+-- STRICTLY ADDITIVE. A nameRealm already in the store is never replaced: our own
+-- converted characters keep their per-slot data rather than being downgraded to a
+-- summary, and — the part that matters for the completion pass — six months of
+-- live 2.0 captures can never be overwritten by a 1.x snapshot. The only write
+-- to an existing record is the money backfill, and only into a zero.
+----------------------------------------------------------------------
+
+local function importMeshSummaries(data, oldMesh, counts)
+    if type(oldMesh) ~= "table" then return counts end
+    counts.backfilled = counts.backfilled or 0
+    for realm, chars in pairs(oldMesh) do
+        if type(chars) == "table" then
+            for name, oldMeshChar in pairs(chars) do
+                if type(oldMeshChar) == "table" then
+                    local nameRealm = Store.MakeNameRealm(name, realm)
+                    local existing = data.owners[nameRealm]
+                    if not existing then
+                        data.owners[nameRealm] = Migrate.ConvertSummaryChar(realm, name, oldMeshChar)
+                        counts.owners  = counts.owners + 1
+                        counts.summary = counts.summary + 1
+                    elseif existing.source == "full" then
+                        -- Backfill only genuinely-missing fields; never
+                        -- overwrite the fuller record.
+                        if (existing.money or 0) == 0 and oldMeshChar.money then
+                            existing.money = oldMeshChar.money
+                            counts.backfilled = counts.backfilled + 1
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return counts
+end
+
+----------------------------------------------------------------------
 -- The migration pass. Operates directly on `data` (the store cache DB), so
 -- tests can pass a standalone table. READ-ONLY on oldAccount / oldMesh.
 --
@@ -239,28 +299,8 @@ function Migrate.Run(data, oldAccount, oldMesh, opts)
     --    a newest-wins merge. Importing our own second copy here would give the
     --    money tooltip two sources for one character and put Bags in the business
     --    of ageing remote data it no longer receives.
-    if type(oldMesh) == "table" and not deferMesh then
-        for realm, chars in pairs(oldMesh) do
-            if type(chars) == "table" then
-                for name, oldMeshChar in pairs(chars) do
-                    if type(oldMeshChar) == "table" then
-                        local nameRealm = Store.MakeNameRealm(name, realm)
-                        local existing = data.owners[nameRealm]
-                        if not existing then
-                            data.owners[nameRealm] = Migrate.ConvertSummaryChar(realm, name, oldMeshChar)
-                            counts.owners = counts.owners + 1
-                            counts.summary = counts.summary + 1
-                        elseif existing.source == "full" then
-                            -- Backfill only genuinely-missing fields; never
-                            -- overwrite the fuller record.
-                            if (existing.money or 0) == 0 and oldMeshChar.money then
-                                existing.money = oldMeshChar.money
-                            end
-                        end
-                    end
-                end
-            end
-        end
+    if not deferMesh then
+        importMeshSummaries(data, oldMesh, counts)
     end
 
     -- Marker discipline (AT-RISK-1c): set ONLY on a non-empty result. Zero owners
@@ -272,8 +312,87 @@ function Migrate.Run(data, oldAccount, oldMesh, opts)
         return counts
     end
 
+    -- BAG-5. The marker above spans BOTH passes, but `deferMesh` can suppress the
+    -- second one entirely — so a run that converted local characters and skipped
+    -- every mesh summary latched exactly as if it had imported both. The debt was
+    -- invisible: six months later the user disables Nexus (or its inventory
+    -- module), Nexus.Owners() falls back to Store.data.owners, and every
+    -- cross-account character and their gold is simply gone, with no code path
+    -- able to re-import them — Migrate.SelfHeal bails on a non-empty owners table.
+    --
+    -- So the deferral is RECORDED, on the same proven-before-written rule as the
+    -- marker itself: a debt is only written down when there really is one. A
+    -- deferMesh run with no mesh source owes nothing, and says so by clearing.
+    if deferMesh and countChars(oldMesh) > 0 then
+        data.meshImportDeferred = true
+        counts.meshDeferredRecorded = true
+    elseif not deferMesh then
+        -- The mesh half just ran (or there was nothing to run): no debt stands.
+        data.meshImportDeferred = nil
+    end
+
     data.migratedFrom1x = true
     counts.markerSet = true
+    return counts
+end
+
+----------------------------------------------------------------------
+-- BAG-5: pay the recorded mesh debt.
+--
+-- Triggered on any later login where the deferral was recorded and Nexus is no
+-- longer taking the remote owners. Runs ONLY the summary half — never the
+-- account pass, which is emphatically NOT idempotent against a live 2.0 store:
+-- ConvertFullChar rebuilds an owner from the 1.x snapshot and replaces it
+-- wholesale, so forcing it months later would overwrite current bag contents with
+-- a year-old copy. That is why this is its own pass and not a `force = true`
+-- re-run of Migrate.Run.
+--
+-- One-shot, stamped, additive-only:
+--   * one-shot   — the flag is cleared on completion and never re-armed except by
+--                  another genuinely deferred migration run;
+--   * stamped    — meshImportCompletedAt records when the debt was settled;
+--   * additive   — importMeshSummaries never replaces an existing owner, so a
+--                  character the user deliberately removed stays removed if it is
+--                  still in the store's shape, and live records are untouchable.
+--
+--   opts : { deferMesh=<bool>, force=<bool>, quiet=<bool> }
+--          `force` is the explicit user gesture (/bags mesh import) for installs
+--          that latched before this build and so carry no recorded flag.
+-- Returns counts, or nil when there was nothing to do.
+----------------------------------------------------------------------
+
+function Migrate.CompleteDeferredMesh(data, oldMesh, opts)
+    opts = opts or {}
+    if type(data) ~= "table" then return nil end
+    if type(data.owners) ~= "table" then data.owners = {} end
+    if not (data.meshImportDeferred or opts.force) then return nil end
+
+    -- Still deferring: Nexus owns those owners right now, and importing our own
+    -- second copy is the exact double-source the deferral exists to prevent.
+    -- The debt stands; do not clear it.
+    if opts.deferMesh then
+        return { skipped = true, reason = "nexus-active" }
+    end
+
+    -- A debt is only payable against a source that is actually there. An absent
+    -- DaseekiBagsMesh may simply not be attached on this client, so REFUSE rather
+    -- than clear the flag — absence of the source is not proof there is no debt.
+    if countChars(oldMesh) == 0 then
+        return { skipped = true, reason = "no-source" }
+    end
+
+    local counts = { skipped = false, owners = 0, full = 0, summary = 0,
+                     containers = 0, slots = 0, backfilled = 0, meshCompleted = true }
+    importMeshSummaries(data, oldMesh, counts)
+
+    data.meshImportDeferred   = nil
+    data.meshImportCompletedAt = Store.Now and Store.Now() or nil
+
+    if not opts.quiet and counts.owners > 0 and ns and ns.Print then
+        ns:Print(("1.x cross-account import completed: %d character(s) restored from your " ..
+                  "saved 1.x data. They were held back while Daseeki Nexus was providing " ..
+                  "them."):format(counts.owners))
+    end
     return counts
 end
 
@@ -294,19 +413,7 @@ end
 -- source is DaseekiBagsMesh censused as 0 and could never be self-healed.
 ----------------------------------------------------------------------
 
-local function countChars(src)
-    local n = 0
-    if type(src) ~= "table" then return n end
-    for _, chars in pairs(src) do
-        if type(chars) == "table" then
-            for _, rec in pairs(chars) do
-                if type(rec) == "table" then n = n + 1 end
-            end
-        end
-    end
-    return n
-end
-
+-- countChars is declared above Migrate.Run (it needs it too); this closes over it.
 function Migrate.CountSourceChars(oldAccount, oldMesh, deferMesh)
     local n = countChars(oldAccount)
     if not deferMesh then n = n + countChars(oldMesh) end
@@ -401,6 +508,14 @@ function Migrate.Migrate()
         if healed then counts = healed end
     end
 
+    -- BAG-5: settle a mesh half a previous run deferred. Checked on EVERY login,
+    -- not only the migrating one, because the trigger is Nexus going away — which
+    -- happens long after the marker latched. A no-op unless a debt was recorded.
+    local completed = Migrate.CompleteDeferredMesh(Store.data, _G.DaseekiBagsMesh, opts)
+    if completed and not completed.skipped then counts.meshCompletion = completed end
+    -- (No Nexus.Invalidate here: core.lua fires STORE_READY immediately after this
+    -- returns, and nexus.lua invalidates on it.)
+
     -- The SETTINGS + custom-rules pass (audit NW-1) runs at this same migration
     -- moment, against a different source global with its own marker. Optional by
     -- design: if migrate_settings.lua is absent the owner data still converts.
@@ -408,6 +523,52 @@ function Migrate.Migrate()
         counts.settings = ns.MigrateSettings.Migrate()
     end
     return counts
+end
+
+----------------------------------------------------------------------
+-- `/bags mesh import` — the EXPLICIT release path for BAG-5.
+--
+-- The automatic settlement above needs a recorded deferral, and a store that
+-- latched before this build carries none: nothing was written down at the time.
+-- That gap is not decidable from the data (a mesh character missing from the
+-- store is indistinguishable from one the owner deliberately removed through the
+-- character list), so it is answered the same way Conduit's staging latch is —
+-- with a live release path the OWNER drives. The user's gesture is the proof.
+--
+-- Still additive-only and still refuses while Nexus is providing those owners,
+-- so the worst case of running it is that it reports adding nothing.
+----------------------------------------------------------------------
+
+function Migrate.MeshImportCommand()
+    if not (ns and ns.Print) then return end
+    if not Store.data then
+        ns:Print("the bag store is not ready yet — try again in a moment.")
+        return
+    end
+    local deferMesh = (ns.Nexus and ns.Nexus.DeferMeshImport and ns.Nexus.DeferMeshImport()) and true or false
+    local res = Migrate.CompleteDeferredMesh(Store.data, _G.DaseekiBagsMesh,
+                                             { deferMesh = deferMesh, force = true })
+    if not res then return end
+
+    if res.skipped then
+        if res.reason == "nexus-active" then
+            ns:Print("Daseeki Nexus is providing your cross-account characters right now, so " ..
+                     "Bags deliberately holds its 1.x copies back — importing them would give " ..
+                     "the money tooltip two sources for one character. Turn the Nexus " ..
+                     "inventory module off first if you want Bags to keep its own copy.")
+        else
+            ns:Print("no 1.x cross-account data is attached on this client, so there is " ..
+                     "nothing to import.")
+        end
+        return
+    end
+
+    if res.owners == 0 then
+        ns:Print("every character in your 1.x cross-account data is already in the list; " ..
+                 "nothing was added.")
+    end
+    if ns.Nexus and ns.Nexus.Invalidate then ns.Nexus.Invalidate() end
+    if ns.Frame and ns.Frame.RequestRefresh then ns.Frame.RequestRefresh() end
 end
 
 ----------------------------------------------------------------------
@@ -626,6 +787,9 @@ local function testMeshDeferral(fails)
     ck(pu.containers[0] and pu.containers[-1], "...with its bags and bank intact")
     ck(pu.money == 39000, "...and its money")
     ck(data.migratedFrom1x == true, "a deferred run that converted an owner still latches the marker")
+    ck(data.meshImportDeferred == true,
+        "BAG-5: ...and RECORDS that the mesh half is still owed")
+    ck(r.meshDeferredRecorded == true, "BAG-5: the run reports having recorded the debt")
 
     -- 2) The NON-deferred run is unchanged (regression guard on the default path).
     local data2 = Store._defaultData()
@@ -684,6 +848,122 @@ local function testMeshDeferral(fails)
         "the same state without the deferral still heals")
 end
 
+----------------------------------------------------------------------
+-- BAG-5: the mesh debt is recorded, and settled when Nexus goes away.
+--
+-- The audit's real-world shape, which the in-file suite did NOT cover: 1.x data
+-- holding BOTH local characters and a cross-account mesh, with Nexus installed
+-- and populated at the first 2.0 login. The old marker latched on
+-- `counts.owners > 0`, but that count spans both passes while deferMesh
+-- suppresses the mesh one entirely — so the store latched with the mesh half
+-- never imported, and Migrate.SelfHeal could not recover it (it bails on a
+-- non-empty owners table). Disable Nexus six months later and every
+-- cross-account character and their gold is gone, permanently.
+----------------------------------------------------------------------
+
+local function testMeshDebtSettlement(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local defer  = { selfAccount = "acctSELF", deferMesh = true }
+    local normal = { selfAccount = "acctSELF" }
+    local quiet  = { quiet = true }
+
+    -- (a) THE MIXED SOURCE, deferred. This is the state the audit describes.
+    local data = Store._defaultData()
+    Migrate.Run(data, sampleAccount(), sampleMesh(), defer)
+    ck(data.migratedFrom1x == true, "(a) the marker latched")
+    ck(data.owners["Shalk-Whitemane"] == nil, "(a) the mesh half really did not import")
+    ck(data.meshImportDeferred == true, "(a) THE FIX: the unpaid half is written down")
+
+    -- (b) A later login with Nexus STILL active: the debt stands, untouched.
+    local held = Migrate.CompleteDeferredMesh(data, sampleMesh(), { deferMesh = true, quiet = true })
+    ck(held ~= nil and held.skipped == true and held.reason == "nexus-active",
+        "(b) settlement refuses while Nexus still owns those owners")
+    ck(data.meshImportDeferred == true, "(b) ...and does NOT clear the debt")
+    ck(data.owners["Shalk-Whitemane"] == nil, "(b) ...and imports nothing")
+
+    -- Six months of live 2.0 play on the local character.
+    local pu = data.owners["Puuchoco-Whitemane"]
+    pu.money = 987654
+    pu.containers[0].slots[1] = { id = 99999, count = 1 }
+
+    -- (c) THE LOGIN WHERE NEXUS GOES AWAY. The debt is paid.
+    local paid = Migrate.CompleteDeferredMesh(data, sampleMesh(), quiet)
+    ck(paid ~= nil and paid.skipped == false, "(c) settlement runs once Nexus is gone")
+    ck(paid.summary == 1 and paid.owners == 1,
+        "(c) the genuinely-missing summary imported (the local twin is correctly skipped)")
+    ck(data.owners["Shalk-Whitemane"] ~= nil, "(c) THE FIX: the cross-account character is back")
+    ck(data.owners["Shalk-Whitemane"].money == 1022693, "(c) ...with its gold")
+    ck(data.meshImportDeferred == nil, "(c) the debt is settled")
+    ck(data.meshImportCompletedAt ~= nil, "(c) ...and stamped")
+
+    -- (d) ADDITIVE-ONLY: six months of live data survived the settlement intact.
+    --     This is why settlement is its own pass and not a forced Migrate.Run.
+    --     Read back through data.owners, NOT the captured local: a settlement that
+    --     REPLACED the record would leave the local looking untouched.
+    local puNow = data.owners["Puuchoco-Whitemane"]
+    ck(puNow == pu, "(d) the live record is the same table, not a replacement")
+    ck(puNow.source == "full", "(d) ...still full, not downgraded to a 1.x summary")
+    ck(puNow.money == 987654, "(d) the live character's money was NOT overwritten by the 1.x copy")
+    ck(puNow.containers[0].slots[1].id == 99999, "(d) ...nor its live bag contents")
+
+    -- (e) RED CONTROL: the forced re-run the audit's fix shape could be read as
+    --     asking for really would clobber that live state. Kept so the choice of
+    --     a separate additive pass is demonstrated, not merely asserted.
+    Migrate.Run(data, sampleAccount(), sampleMesh(), { selfAccount = "acctSELF", force = true })
+    ck(data.owners["Puuchoco-Whitemane"].money == 39000,
+        "(e) RED CONTROL: a forced full re-run DOES overwrite live data with the 1.x snapshot")
+
+    -- (f) ONE-SHOT. Nothing is owed after settlement.
+    local again = Migrate.CompleteDeferredMesh(data, sampleMesh(), quiet)
+    ck(again == nil, "(f) a settled store owes nothing on the next login")
+
+    -- (g) A debt is only recorded when there IS one: deferring with no mesh source
+    --     owes nothing (proven-before-written, same rule as the marker itself).
+    local none = Store._defaultData()
+    Migrate.Run(none, sampleAccount(), nil, defer)
+    ck(none.migratedFrom1x == true, "(g) the run still latched")
+    ck(none.meshImportDeferred == nil, "(g) ...but recorded no debt, because there was none")
+
+    local emptyMesh = Store._defaultData()
+    Migrate.Run(emptyMesh, sampleAccount(), { ["Whitemane"] = {} }, defer)
+    ck(emptyMesh.meshImportDeferred == nil, "(g) an EMPTY mesh source records no debt either")
+
+    -- (h) A non-deferred run leaves no debt standing.
+    local plain = Store._defaultData()
+    plain.meshImportDeferred = true                    -- a stale flag from anywhere
+    Migrate.Run(plain, sampleAccount(), sampleMesh(), normal)
+    ck(plain.meshImportDeferred == nil, "(h) the mesh half ran, so no debt is left recorded")
+
+    -- (i) THE PRE-FIX INSTALL: latched before the deferral was ever written down,
+    --     so it carries no flag. Not decidable from the data (a missing character
+    --     is indistinguishable from one the owner removed by hand), so it is the
+    --     owner's explicit gesture that settles it -- and only additively.
+    local legacy = Store._defaultData()
+    Migrate.Run(legacy, sampleAccount(), sampleMesh(), defer)
+    legacy.meshImportDeferred = nil                    -- as an old build left it
+    ck(Migrate.CompleteDeferredMesh(legacy, sampleMesh(), quiet) == nil,
+        "(i) with no recorded debt the automatic settlement does nothing")
+    local forced = Migrate.CompleteDeferredMesh(legacy, sampleMesh(),
+                                                { force = true, quiet = true })
+    ck(forced ~= nil and forced.summary == 1,
+        "(i) the explicit /bags mesh import gesture settles it")
+    ck(legacy.owners["Shalk-Whitemane"] ~= nil, "(i) ...and the character is back")
+    ck(legacy.owners["Puuchoco-Whitemane"].source == "full",
+        "(i) ...while the local character is still FULL, not downgraded to a summary")
+
+    -- (j) The forced gesture still refuses while Nexus is active, and refuses on
+    --     an absent source rather than pretending the debt is discharged.
+    local g1 = Migrate.CompleteDeferredMesh(Store._defaultData(), sampleMesh(),
+                                            { force = true, deferMesh = true, quiet = true })
+    ck(g1 and g1.skipped and g1.reason == "nexus-active", "(j) forced import refuses under Nexus")
+    local owing = Store._defaultData()
+    owing.meshImportDeferred = true
+    local g2 = Migrate.CompleteDeferredMesh(owing, nil, quiet)
+    ck(g2 and g2.skipped and g2.reason == "no-source", "(j) an absent source is refused")
+    ck(owing.meshImportDeferred == true,
+        "(j) ...and the debt STANDS -- absence of the source is not proof there is no debt")
+end
+
 function Migrate.RunSelfTests(verbose)
     local suites = {
         { name = "parse item ref",   fn = testParse },
@@ -692,6 +972,7 @@ function Migrate.RunSelfTests(verbose)
         { name = "empty source leaves marker unset", fn = testEmptySourceLeavesMarkerUnset },
         { name = "sticky-marker self-heal", fn = testSelfHeal },
         { name = "nexus mesh-import deferral", fn = testMeshDeferral },
+        { name = "deferred mesh debt settlement (BAG-5)", fn = testMeshDebtSettlement },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

@@ -369,6 +369,17 @@ function Nexus.Debug()
     ns:Print(string.format("  local=%d nexus=%d | added=%d refreshed=%d kept-local=%d kept-full=%d",
         localN, n, stats.added, stats.refreshed, stats.keptLocal, stats.keptFull))
     ns:Print(string.format("  mesh import deferral: %s", Nexus.DeferMeshImport() and "ON (Nexus owns remote owners)" or "off"))
+    -- BAG-5: whether a deferred mesh half is still owed, and when one was settled.
+    -- The deferral itself is only half the story; the DEBT is what bites six months
+    -- later, so the diagnostic has to say whether one is outstanding.
+    if data then
+        if data.meshImportDeferred then
+            ns:Print("  1.x mesh half: DEFERRED and still owed — it settles automatically the " ..
+                     "first login without the Nexus inventory module (/bags mesh import forces it)")
+        elseif data.meshImportCompletedAt then
+            ns:Print("  1.x mesh half: settled")
+        end
+    end
 end
 
 ----------------------------------------------------------------------
