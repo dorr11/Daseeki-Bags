@@ -691,7 +691,14 @@ function Items.IsBelowLevel(equipLoc, minLevel, playerLevel)
     if not equipLoc or equipLoc == "" then return false end
     if Items.NONLEVEL_EQUIPLOC[equipLoc] then return false end
     if not minLevel or minLevel <= 1 then return false end
-    if not playerLevel then return false end
+    -- BAG-3 (data honesty, async class 5 — truthy zero). `not playerLevel` alone was
+    -- written to mean "unknown level -> never wash an item grey", and the suite pinned
+    -- exactly that with nil. But UnitLevel("player") answers 0 before the client has the
+    -- player's own unit data, and 0 is TRUTHY in Lua, so the guard fell straight through
+    -- to `0 < 40` and every equippable item with a required level took the red unusable
+    -- border. The nil branch was unreachable in practice; the zero branch was the one that
+    -- shipped. Both are "we have not been told", and neither may wash the grid.
+    if not playerLevel or playerLevel <= 0 then return false end
     return playerLevel < minLevel
 end
 
@@ -724,9 +731,25 @@ local function playerClassToken()
     end
     return Items._playerClass
 end
+-- Live player level for the required-level gate (BAG-3). Items._playerLevel used to be
+-- read here and ASSIGNED NOWHERE in the repo, so this function could only ever return
+-- UnitLevel's raw answer -- including the 0 it gives before the client has the player's
+-- unit data. It is a real seed now, set at login beside SetPlayerClass (core.lua) and
+-- re-learned from every good live read, so a zero answer degrades to the last level we
+-- were actually told rather than to a number that reads as "level zero".
+--
+-- Deliberately NOT cached-once like the class token: level changes during a session, so
+-- a live read that answers wins, every paint.
+function Items.SetPlayerLevel(level)
+    level = tonumber(level)
+    if level and level > 0 then Items._playerLevel = level end
+end
 local function playerLevelNow()
-    if _G.UnitLevel then return _G.UnitLevel("player") end
-    return Items._playerLevel
+    if _G.UnitLevel then
+        local lvl = tonumber(_G.UnitLevel("player"))
+        if lvl and lvl > 0 then Items._playerLevel = lvl; return lvl end
+    end
+    return Items._playerLevel     -- nil or a last-known-good level; never 0
 end
 
 function Items.IsLive(owner)
@@ -2888,6 +2911,29 @@ local function testBelowLevel(fails)
     ck(Items.IsBelowLevel("INVTYPE_CHEST", nil, 30) == false, "uncached minLevel never washes")
     ck(Items.IsBelowLevel("INVTYPE_CHEST", 1, 1) == false, "minLevel 1 never washes")
     ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, nil) == false, "unknown player level -> safe (no wash)")
+
+    -- BAG-3 (data honesty, class 5 — truthy zero). THE ROW THAT WAS MISSING beside the
+    -- nil one above, and the reason the nil one gave false confidence: UnitLevel answers
+    -- 0 before the client has the player's unit data, and 0 is truthy, so `not playerLevel`
+    -- fell through to `0 < 40` and washed every level-gated item in the grid red.
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, 0) == false,
+       "a ZERO player level is 'not told yet', not level zero -> no wash (BAG-3)")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 2, 0) == false,
+       "…at any required level, not just high ones")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, -1) == false, "a negative level never washes either")
+    ck(Items.IsBelowLevel("INVTYPE_CHEST", 40, 1) == true,
+       "…while a REAL level 1 still washes req-40 gear (the guard did not become a no-op)")
+
+    -- The seed that makes the guard reachable: Items._playerLevel was read at one site and
+    -- assigned at NONE, so the fallback was dead code. It is wired at login now, and it
+    -- refuses the same truthy zero on the way in.
+    local saved = Items._playerLevel
+    Items._playerLevel = nil
+    Items.SetPlayerLevel(0);   ck(Items._playerLevel == nil,  "SetPlayerLevel ignores a zero answer")
+    Items.SetPlayerLevel(nil); ck(Items._playerLevel == nil,  "…and a nil one")
+    Items.SetPlayerLevel(47);  ck(Items._playerLevel == 47,   "…and takes a real level")
+    Items.SetPlayerLevel(0);   ck(Items._playerLevel == 47,   "…and a later zero does not clobber it")
+    Items._playerLevel = saved
 end
 
 -- 1.0-LOOK PARITY (cell treatment on the Daseeki theme, ROUND 2): quality edges are now

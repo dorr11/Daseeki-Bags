@@ -1392,6 +1392,254 @@ ns:RegisterSelfTest("core-absent-login", function(verbose)
 end)
 
 ----------------------------------------------------------------------
+-- FRESH-LOGIN FIND SUITE  (added 2026-08-07, data-honesty BAG-1 / BAG-2)
+--
+-- ui_find.lua's own suite pins the PURE contract: Find.Search hands back the ids it could
+-- not judge, and Find.StatusText refuses to call an unanswered question a miss. What it
+-- cannot see is the LIVE CHAIN those pieces hang from, which is where the defect actually
+-- lived: the file registered no events at all, asked the client for nothing, and so never
+-- ran the search a second time. Pure functions returning the right values are worth
+-- nothing if nobody ever calls them again.
+--
+-- This suite is the fresh-login fixture end to end, against a client sim as unkind as the
+-- real one (simulator doctrine): GetItemInfoInstant answers from static data, GetItemInfo
+-- answers NOTHING until the sim is warmed id by id, and time only passes when the
+-- queue-and-pump clock is pumped. The four things it proves:
+--
+--   RED CONTROL   a cold first pass finds zero holders — that is real, and it is exactly
+--                 what the shipped window rendered as "No character has a matching item"
+--                 for an item three alts were holding. The new chain renders the SAME zero
+--                 rows as an in-progress instead, and asks the client for the ids.
+--   GREEN         warming the sim and firing GET_ITEM_INFO_RECEIVED re-runs the search
+--                 with no further input, and the matches appear.
+--   THE BOUND     ids that NEVER answer do not spin: the ladder runs its rungs, the queue
+--                 drains, the surfaces stop claiming to be loading. (A run that hangs here
+--                 IS the failure — an unbounded retry has no other symptom headless.)
+--   WARM CLIENT   nothing pending -> no event frame, no request, no timer, one pass. The
+--                 fix must not tax the healthy path.
+--
+-- The surface is a faithful stand-in for Find.Refresh's body minus the frame calls (the
+-- window itself needs Daseeki-Core), so it drives the real Find.Search / BuildItemRows /
+-- MergeIDs / NotePending / StatusText and the real shared watch.
+----------------------------------------------------------------------
+ns:RegisterSelfTest("cold-find-chain", function(verbose)
+    local fails = {}
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local Find = ns.Find
+    if not (Find and Find.NotePending) then
+        ns:Print("  FAIL cold-find-chain :: ns.Find has no cold-item watch (ui_find.lua changed)")
+        return false
+    end
+
+    -- ── saved state ───────────────────────────────────────────────────────────────
+    local savedCI, savedCF = _G.C_Item, _G.CreateFrame
+    local savedWatch, savedAsks, savedSurfaces = Find._watch, Find._asks, Find._surfaces
+    local savedEvt, savedRound = Find._evt, Find._watchRound
+    local savedExh, savedTimer, savedQueued =
+        Find._watchExhausted, Find._watchTimer, Find._repaintQueued
+
+    -- ── the client sim ────────────────────────────────────────────────────────────
+    -- Three ids on three characters: two in slots, one in a cross-account summary
+    -- aggregate — so both of Find.Search's branches are cold at once.
+    local CATALOG = {
+        [100] = { name = "Songflower Serenade Petal", quality = 1, itype = "Consumable" },
+        [101] = { name = "Songflower Petal Pouch",    quality = 2, itype = "Consumable" },
+        [102] = { name = "Songflower Essence",        quality = 3, itype = "Consumable" },
+    }
+    local owners = {
+        ["Poonyx-R"] = { name = "Poonyx", class = "MAGE", source = "full",
+            containers = { [0] = { slots = { [1] = { id = 100, count = 20 } } } } },
+        ["Zug-R"] = { name = "Zug", class = "WARRIOR", source = "full",
+            containers = { [5] = { slots = { [1] = { id = 101, count = 5 } } } } },
+        ["Rex-R"] = { name = "Rex", source = "summary", containers = {},
+            itemCounts = { [102] = 99 } },
+    }
+
+    local warm, asks, evtFrames
+    local function newSim()
+        warm, asks, evtFrames = {}, {}, {}
+        _G.C_Item = {
+            GetItemInfoInstant = function(id)
+                local e = CATALOG[id]; if not e then return nil end
+                return id, e.itype, e.itype, "", 5000 + id
+            end,
+            -- THE UNKIND BIT: nil until this id has been warmed, exactly as the client
+            -- answers for an itemID no tooltip has touched this session.
+            GetItemInfo = function(id)
+                local e = CATALOG[id]
+                if not (e and warm[id]) then return nil end
+                return e.name, "item:" .. id, e.quality
+            end,
+            RequestLoadItemDataByID = function(id) asks[id] = (asks[id] or 0) + 1 end,
+        }
+        _G.CreateFrame = function()
+            local f = { _events = {} }
+            function f:RegisterEvent(e) self._events[e] = true end
+            function f:UnregisterEvent(e) self._events[e] = nil end
+            function f:SetScript(which, fn) if which == "OnEvent" then self._onEvent = fn end end
+            evtFrames[#evtFrames + 1] = f
+            return f
+        end
+    end
+    local function fireInfoReceived(id, success)
+        for _, f in ipairs(evtFrames) do
+            if f._events["GET_ITEM_INFO_RECEIVED"] and f._onEvent then
+                f._onEvent(f, "GET_ITEM_INFO_RECEIVED", id, success ~= false)
+            end
+        end
+    end
+    local function askCount()
+        local n = 0
+        for _ in pairs(asks) do n = n + 1 end
+        return n
+    end
+
+    -- ── the surface (Find.Refresh's body, minus the frame calls) ──────────────────
+    local view
+    local function resolver()
+        return { instant = _G.C_Item.GetItemInfoInstant, info = _G.C_Item.GetItemInfo }
+    end
+    local function render(fromWatch)
+        view.renders = view.renders + 1
+        if not fromWatch then Find.ResetWatch() end
+        local q = ns.Search.Compile(view.query)
+        local R = resolver()
+        local results, searchPending = Find.Search(owners, q, R, {})
+        local rows, rowPending = Find.BuildItemRows(results, R)
+        local ids = Find.MergeIDs(searchPending, rowPending)
+        Find.NotePending(ids)
+        view.rows, view.pending = #rows, #ids
+        view.empty, view.status = Find.StatusText({
+            hasQuery = true, rows = #rows, pending = #ids,
+            exhausted = Find._watchExhausted })
+    end
+    local function freshWorld(query)
+        newSim()
+        Find._watch, Find._asks = {}, {}
+        Find._evt, Find._watchRound = nil, 0
+        Find._watchExhausted, Find._watchTimer, Find._repaintQueued = false, false, false
+        Find._surfaces = { function() render(true) end }
+        view = { query = query, renders = 0 }
+        HTIMER.flush(); HTIMER.reset()
+    end
+
+    -- ══ 1. RED CONTROL: the cold first pass ═══════════════════════════════════════
+    freshWorld("songflower")
+    render(false)
+
+    ck(view.rows == 0,
+       "PREMISE: on a cold client the matcher can judge nothing, so the first pass finds " ..
+       "ZERO rows (this part was always true and is not the bug)")
+    ck(view.empty ~= "No character has a matching item.",
+       "THE FIX: those zero rows are NOT rendered as a miss — the shipped window said " ..
+       "exactly that line about an item three alts were holding")
+    ck(type(view.empty) == "string" and view.empty:find("Still loading", 1, true) == 1,
+       "…it reads as an in-progress instead: " .. tostring(view.empty))
+    ck(view.pending == 3, "…all three ids are held pending (got " .. view.pending .. ")")
+
+    ck(askCount() == 3, "…the client was ASKED for each of them (got " .. askCount() .. " ids)")
+    ck(asks[100] == 1 and asks[101] == 1 and asks[102] == 1,
+       "…once each; NotePending does not re-ask what is already on the watch")
+    ck(#evtFrames == 1 and evtFrames[1]._events["GET_ITEM_INFO_RECEIVED"] == true,
+       "…and ONE event frame now listens for the answers (the file used to register none)")
+    ck(HTIMER.pending() == 1, "…with exactly one ladder rung armed (got " .. HTIMER.pending() .. ")")
+
+    -- ══ 2. GREEN: answers land, the search re-runs itself ═════════════════════════
+    -- One id warms. Nothing else happens — no keystroke, no re-open, no owner action.
+    warm[100] = true
+    fireInfoReceived(100)
+    ck(view.renders == 1, "the event alone does not re-run the search inline (it debounces)")
+    HTIMER.advance(0)
+    ck(view.renders == 2, "…the debounced repaint runs on the next tick")
+    ck(view.rows == 1,
+       "THE MATCH APPEARS with no further input from the owner (got " .. view.rows .. " row(s))")
+    ck(view.pending == 2, "…and the two still-unanswered ids stay held (got " .. view.pending .. ")")
+    ck(view.empty == nil, "…so there is no empty line at all now")
+    ck(view.status == "still loading 2 items\226\128\166",
+       "…and the short list TAGS its own incompleteness: " .. tostring(view.status))
+
+    -- The rest warm.
+    warm[101], warm[102] = true, true
+    fireInfoReceived(101); fireInfoReceived(102)
+    HTIMER.advance(0)
+    ck(view.rows == 3, "every holder lands once the client is warm (got " .. view.rows .. ")")
+    ck(view.pending == 0 and view.status == nil,
+       "…nothing outstanding, so the surface stops talking about loading")
+    ck(next(Find._watch) == nil, "…and the watch set is empty again")
+
+    -- The ladder was still armed underneath; draining it must be a no-op, not a re-ask.
+    local asksBefore = asks[100]
+    HTIMER.flush()
+    ck(asks[100] == asksBefore, "a rung firing after everything answered re-asks nothing")
+    ck(HTIMER.pending() == 0, "…and schedules nothing further")
+
+    -- ══ 3. THE BOUND: ids that never answer ═══════════════════════════════════════
+    -- Nothing is ever warmed. A run that HANGS here is the failure this asserts against:
+    -- an unbounded retry ladder has no other headless symptom.
+    freshWorld("songflower")
+    render(false)
+    ck(view.pending == 3, "premise: three ids the client will never answer for")
+    HTIMER.flush()                       -- drains rungs, repaints, and their nested timers
+    ck(HTIMER.pending() == 0, "THE BOUND: the queue drains to empty — the ladder is finite")
+    ck(Find._watchExhausted == true, "…and the cycle closes itself out as exhausted")
+    ck(Find._watchRound == #Find.WATCH_LADDER,
+       "…after exactly " .. #Find.WATCH_LADDER .. " rungs (got " .. Find._watchRound .. ")")
+    ck(view.rows == 0, "still no rows (nothing warmed) …")
+    ck(view.empty:find("No character has a matching item.", 1, true) == 1,
+       "…so the miss is now STATED rather than implied: " .. view.empty)
+    ck(view.empty:find("3 items never sent their data", 1, true) ~= nil,
+       "…together with what went unchecked, which is the honest half")
+    ck(view.empty:find("Still loading", 1, true) == nil,
+       "…and it has stopped claiming to be loading, because it is not")
+    for id in pairs(asks) do
+        ck(asks[id] <= Find.MAX_ASKS,
+           "id " .. id .. " was asked for " .. asks[id] .. " time(s), within the ceiling of " ..
+           Find.MAX_ASKS)
+    end
+
+    -- A late answer STILL heals, after the timers have stopped: the event subscription is
+    -- free, so only the ladder is bounded, not the listening.
+    local rendersAtRest = view.renders
+    warm[100] = true
+    fireInfoReceived(100)
+    HTIMER.advance(0)
+    ck(view.renders == rendersAtRest + 1, "a late GET_ITEM_INFO_RECEIVED still repaints")
+    ck(view.rows == 1, "…and the match appears even past the ladder's last rung")
+    HTIMER.flush()
+
+    -- ══ 4. WARM CLIENT: unchanged, single pass ════════════════════════════════════
+    freshWorld("songflower")
+    warm[100], warm[101], warm[102] = true, true, true
+    render(false)
+    ck(view.rows == 3, "a warm client finds all three holders on the first pass")
+    ck(view.pending == 0 and view.status == nil and view.empty == nil, "…with nothing to say")
+    ck(askCount() == 0, "…asks the client for NOTHING (got " .. askCount() .. ")")
+    ck(#evtFrames == 0, "…creates no event frame")
+    ck(Find._evt == nil, "…leaves the watch frame unbuilt")
+    ck(HTIMER.pending() == 0, "…and arms no timer: the healthy path is untaxed")
+    HTIMER.flush()
+    ck(view.renders == 1, "…and never re-runs itself (got " .. view.renders .. " render(s))")
+
+    -- ── restore ───────────────────────────────────────────────────────────────────
+    HTIMER.flush(); HTIMER.reset()
+    _G.C_Item, _G.CreateFrame = savedCI, savedCF
+    Find._watch, Find._asks, Find._surfaces = savedWatch, savedAsks, savedSurfaces
+    Find._evt, Find._watchRound = savedEvt, savedRound
+    Find._watchExhausted, Find._watchTimer, Find._repaintQueued =
+        savedExh, savedTimer, savedQueued
+
+    if verbose then
+        ns:Print(string.format("  cold-find: ladder=%d rung(s)/%.2fs ceiling, max %d ask(s) per id",
+            #Find.WATCH_LADDER, Find.LadderCeiling(), Find.MAX_ASKS))
+    end
+
+    for _, f in ipairs(fails) do ns:Print("  FAIL cold-find-chain :: " .. f) end
+    if #fails == 0 and verbose then ns:Print("  PASS cold-find-chain") end
+    return #fails == 0
+end)
+
+----------------------------------------------------------------------
 -- TIMER GATE — the rig proving itself
 --
 -- This gate exists because the thing it tests used to be a lie. A no-op C_Timer.After made

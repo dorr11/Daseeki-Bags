@@ -335,6 +335,14 @@ ns:RegisterEvent("PLAYER_LOGIN", function()
     if ns.Items and ns.Items.SetPlayerClass and UnitClass then
         ns:SafeCall(function() ns.Items.SetPlayerClass((select(2, UnitClass("player")))) end)
     end
+    -- Player LEVEL drives the required-level (red border) gate. Seeded here for the same
+    -- reason the class token is: the grid can paint before the client has answered for the
+    -- player's own unit, and UnitLevel returns 0 until it has. SetPlayerLevel ignores a
+    -- zero, so an early login seeds nothing and the gate stays "unknown" — which never
+    -- washes an item — rather than seeing a truthy zero (data-honesty BAG-3).
+    if ns.Items and ns.Items.SetPlayerLevel and UnitLevel then
+        ns:SafeCall(function() ns.Items.SetPlayerLevel(UnitLevel("player")) end)
+    end
     if ns.Capture and ns.Capture.OnLogin then ns:SafeCall(ns.Capture.OnLogin) end
     if ns.Frame   and ns.Frame.OnLogin   then ns:SafeCall(ns.Frame.OnLogin)   end
     ns:Fire("LOGIN")

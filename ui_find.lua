@@ -35,6 +35,14 @@
 --   summary hit has no slot location: it contributes to the TOTAL only, and the
 --   tooltip's Other Accounts section names who holds it.
 --
+-- ── DATA-HONESTY ROUND (2.0.5, audit BAG-1 / BAG-2) ──────────────────────────
+-- COLD ITEMS. This file used to discard the matcher's `pending` return and register no
+--   events at all, so on a fresh login — the one state the feature exists for — every
+--   unresolved id scored as a MISS and the window said "No character has a matching item"
+--   for an item three alts were holding, forever. It now runs the loop search.lua has
+--   always run: hold the pending ids, ask the client, re-run when the answers land, and
+--   say "still loading N items" meanwhile. See THE COLD-ITEM CONTRACT below.
+--
 -- Secure audit: zero protected ops — reads store records, sets view state + the
 -- inventory search box (both insecure), Show/Hides its own unprotected window.
 
@@ -58,6 +66,11 @@ local Store = ns.Store
 --     summaryHits  = { { id, count }, ... } }             -- aggregate hits (summary owners)
 -- Only owners with >=1 match are included.
 --
+-- SECOND RETURN: `pending` — the sorted itemIDs the matcher could NOT judge because
+-- C_Item.GetItemInfo has not answered for them yet (BAG-1). Not a miss: an unanswered
+-- question. Discarding it is what made a fresh login say "No character has a matching
+-- item" for an item three alts were holding; see THE COLD-ITEM CONTRACT below.
+--
 -- ITEM 4 (cross-account): a SUMMARY owner has no containers, only owner.itemCounts —
 -- the exact shape features.CountItemInOwner falls back to for its tooltip numbers. Its
 -- ids are matched with the same compiled query against a synthetic record, so the two
@@ -69,7 +82,9 @@ local Store = ns.Store
 function Find.Search(owners, query, resolver, opts)
     opts = opts or {}
     local results = {}
-    if type(owners) ~= "table" or not query or query.isEmpty then return results end
+    -- Ids the matcher reported PENDING. Held, never scored as a miss (BAG-1).
+    local pendingSet, pending = {}, {}
+    if type(owners) ~= "table" or not query or query.isEmpty then return results, pending end
 
     for key, owner in pairs(owners) do
         local containers = owner.containers
@@ -84,11 +99,13 @@ function Find.Search(owners, query, resolver, opts)
                 if type(slots) == "table" then
                     for slot, rec in pairs(slots) do
                         if rec and rec.id then
-                            local matched = query:Match(rec, resolver)
+                            local matched, isPending = query:Match(rec, resolver)
                             if matched then
                                 local n = rec.count or 1
                                 if isBank then bank = bank + n else bags = bags + n end
                                 matches[#matches + 1] = { cid = cid, slot = slot, data = rec }
+                            elseif isPending then
+                                pendingSet[rec.id] = true
                             end
                         end
                     end
@@ -100,9 +117,12 @@ function Find.Search(owners, query, resolver, opts)
                 id, n = tonumber(id), tonumber(n)
                 if id and n and n > 0 then
                     local rec = { id = id, count = n }
-                    if query:Match(rec, resolver) then
+                    local matched, isPending = query:Match(rec, resolver)
+                    if matched then
                         summary = summary + n
                         summaryHits[#summaryHits + 1] = { id = id, count = n }
+                    elseif isPending then
+                        pendingSet[id] = true
                     end
                 end
             end
@@ -127,7 +147,11 @@ function Find.Search(owners, query, resolver, opts)
         if a.total ~= b.total then return a.total > b.total end
         return tostring(a.name):lower() < tostring(b.name):lower()
     end)
-    return results
+    -- Sorted, because this list drives a RETRY loop and pairs() order differing per
+    -- attempt is how a bounded retry becomes a lottery (async class 8).
+    for id in pairs(pendingSet) do pending[#pending + 1] = id end
+    table.sort(pending)
+    return results, pending
 end
 
 -- Plain-copy result line: "Poonyx — Bank: 12 · Bags: 40" (only non-zero parts shown).
@@ -165,35 +189,55 @@ end
 -- Row ORDER is item name ASCENDING. Deliberately not total-desc: names resolve
 -- asynchronously through GetItemInfo while the player is still typing, and a count-
 -- ordered list re-shuffles under the cursor every time one lands.
+--
+-- SECOND RETURN: `pending` — the sorted itemIDs whose NAME did not answer, so the row is
+-- carrying an "item:<id>" placeholder. Those rows are flagged `row.pending` and sort
+-- AFTER every named row rather than wedging themselves into the alphabet under "i"
+-- (BAG-2), and the id list feeds the shared cold-item watch so they repaint when the
+-- names land. The comment above knew the names arrive late; this is the listening half.
+--
+-- A stored record may carry a captured `link`, which DOES contain a name — but wrapped in
+-- colour escapes, so `tostring(itemName):lower()` sorts it under "|" rather than under its
+-- first letter. Unsortable is unsortable: a row whose plain name has not answered goes to
+-- the bottom whichever placeholder it is wearing, and takes its proper place once the real
+-- name lands. (This does not touch the MATCHER, which reads the resolver and never the
+-- link — which is precisely why a cold search failed even for items with stored links.)
 ----------------------------------------------------------------------
 
 function Find.BuildItemRows(results, resolver)
     local agg, order = {}, {}
+    local pendingSet, pending = {}, {}
 
     local function identify(id, data)
         local name, quality, icon = nil, data and data.quality, nil
+        local isPending = false
         if resolver then
             if resolver.instant then local _, _, _, _, ic = resolver.instant(id); icon = ic end
             if resolver.info then
                 local nm, _, q = resolver.info(id)
                 name = nm
                 if quality == nil then quality = q end
+                -- We ASKED and got no answer: pending. With no resolver at all there is
+                -- nothing to wait for, so an absent resolver is never reported pending.
+                if nm == nil then isPending = true end
             end
         end
-        return name, quality, icon
+        return name, quality, icon, isPending
     end
 
     local function bucket(id, data)
         local row = agg[id]
         if not row then
-            local name, quality, icon = identify(id, data)
+            local name, quality, icon, isPending = identify(id, data)
             row = {
                 itemID = id, itemName = name or (data and data.link) or ("item:" .. id),
                 quality = quality, icon = icon,
                 total = 0, holders = 0, hasSummary = false,
+                pending = isPending or nil,
                 jumpKey = nil, jumpName = nil,
                 _seen = {},
             }
+            if isPending and not pendingSet[id] then pendingSet[id] = true end
             agg[id] = row
             order[#order + 1] = row
         end
@@ -234,11 +278,17 @@ function Find.BuildItemRows(results, resolver)
 
     for _, row in ipairs(order) do row._seen = nil end
     table.sort(order, function(a, b)
+        -- Unresolved names sort LAST (see the header): an "item:22785" placeholder must
+        -- not claim a place in the alphabet it will vacate two seconds later.
+        local ap, bp = a.pending and 1 or 0, b.pending and 1 or 0
+        if ap ~= bp then return ap < bp end
         local an, bn = tostring(a.itemName):lower(), tostring(b.itemName):lower()
         if an ~= bn then return an < bn end
         return (a.itemID or 0) < (b.itemID or 0)
     end)
-    return order
+    for id in pairs(pendingSet) do pending[#pending + 1] = id end
+    table.sort(pending)
+    return order, pending
 end
 
 -- The two row columns, as plain testable strings. `qualityHex` is injected so the
@@ -250,6 +300,121 @@ function Find.FormatItemRow(row, qualityHex)
     qualityHex = qualityHex or ""
     local nameStr = qualityHex .. (row.itemName or "?") .. (qualityHex ~= "" and "|r" or "")
     return nameStr, "x" .. tostring(row.total or 0)
+end
+
+----------------------------------------------------------------------
+-- PURE: THE COLD-ITEM CONTRACT  (data-honesty BAG-1 / BAG-2; async class 4 + 5)
+--
+-- `query:Match(record, resolver)` returns TWO values — matched, and PENDING, true exactly
+-- when a name/quality clause could not be evaluated because C_Item.GetItemInfo has not
+-- answered for that itemID yet. search.lua:288 and rules2.lua:423 have always consumed
+-- the second one. THIS FILE DISCARDED IT, and registered no events at all.
+--
+-- What that cost, in the one state the feature exists for: on a fresh login your alts'
+-- stored itemIDs are precisely the ids the client has never had in a tooltip this
+-- session, so GetItemInfo returns nil for most of them, every one of them scored as a
+-- MISS, every holder contributed zero matches and was dropped from `results` — and the
+-- window said "No character has a matching item" for an item three alts were holding,
+-- forever, because nothing ever ran the search again. The signature Daseeki feature
+-- failing in exactly the state it is most needed.
+--
+-- Absence of proof is not absence. A pending item is HELD — not counted as a match (we
+-- cannot claim what we cannot read) and not counted as a miss either — the client is
+-- asked for it, the search re-runs when the answer lands, and the surface SAYS SO
+-- meanwhile: an honest in-progress, never a false emptiness.
+--
+-- Catalog-verified against interface 11509 / build 1.15.9.68808:
+--   C_Item.GetItemInfo, C_Item.GetItemInfoInstant, C_Item.RequestLoadItemDataByID,
+--   Event.Item.GetItemInfoReceived  (== GET_ITEM_INFO_RECEIVED {itemID, success}).
+----------------------------------------------------------------------
+
+-- THE RE-RUN LADDER. GET_ITEM_INFO_RECEIVED is the primary signal and needs no timer:
+-- the ladder is the belt to its braces, for answers that arrive with no event of their
+-- own (a dropped request; data that warmed between our read and our ask) and for ids that
+-- never answer at all. It is BOUNDED — five rungs, 7.75s — and then the surfaces stop
+-- claiming "loading" and state what they actually have. A ladder with no last rung is the
+-- same lie in a slower voice.
+Find.WATCH_LADDER = { 0.25, 0.5, 1, 2, 4 }
+
+-- Per-id ask ceiling. GET_ITEM_INFO_RECEIVED also fires with success=false for an id the
+-- server has no data for; that id stays pending forever, so an unbounded ask/repaint pair
+-- would trade a stuck window for an event storm. Three asks per id per query, then we
+-- stop asking and let the count say so.
+Find.MAX_ASKS = 3
+
+-- PURE: the delay for ladder rung `round` (1-based), or nil past the last rung — which is
+-- the ladder's terminal condition and therefore the thing a test can pin.
+function Find.LadderDelay(round)
+    local n = tonumber(round)
+    if not n then return nil end
+    return Find.WATCH_LADDER[n]
+end
+
+-- PURE: the total time the ladder spans, i.e. how long a surface may say "still loading".
+function Find.LadderCeiling()
+    local t = 0
+    for i = 1, #Find.WATCH_LADDER do t = t + Find.WATCH_LADDER[i] end
+    return t
+end
+
+-- PURE: the sorted, de-duplicated union of two itemID lists. Sorted for the same class-8
+-- reason Find.Search sorts its own: this list drives a retry loop.
+function Find.MergeIDs(a, b)
+    local seen, out = {}, {}
+    local lists = { a, b }
+    for li = 1, 2 do
+        local list = lists[li]
+        if type(list) == "table" then
+            for i = 1, #list do
+                local id = tonumber(list[i])
+                if id and not seen[id] then seen[id] = true; out[#out + 1] = id end
+            end
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+-- PURE: the two lines a cold-item surface is allowed to show about its own certainty.
+--   state = { hasQuery = <bool>, rows = <n>, pending = <n>, exhausted = <bool> }
+-- Returns emptyText (the no-rows line; nil when rows exist) and statusText (the small
+-- "still loading" tag; nil when there is nothing to say).
+--
+-- THE LOAD-BEARING ROW: rows == 0 with pending > 0 is NOT "no matches". It is "we have
+-- not been told yet", and it must read as that. The exhausted form is the honest end of
+-- the ladder — it states the miss AND names what went unchecked, rather than quietly
+-- folding unknowns into the answer.
+function Find.StatusText(state)
+    state = state or {}
+    local rows      = tonumber(state.rows) or 0
+    local pending   = tonumber(state.pending) or 0
+    local exhausted = state.exhausted and true or false
+
+    if not state.hasQuery then
+        return "Type an item name to search every character.", nil
+    end
+
+    local phrase = (pending == 1) and "1 item" or (tostring(pending) .. " items")
+
+    if rows == 0 then
+        if pending > 0 and not exhausted then
+            return "Still loading item data for " .. phrase ..
+                   " \194\183 matches will appear as they arrive.", nil
+        end
+        if pending > 0 then
+            return "No character has a matching item. " .. phrase ..
+                   " never sent their data, so they could not be checked.", nil
+        end
+        return "No character has a matching item.", nil
+    end
+
+    if pending > 0 and not exhausted then
+        return nil, "still loading " .. phrase .. "\226\128\166"
+    end
+    if pending > 0 then
+        return nil, phrase .. " unchecked"
+    end
+    return nil, nil
 end
 
 ----------------------------------------------------------------------
@@ -310,6 +475,128 @@ local function classRGB(class)
     return 0.925, 0.890, 0.816
 end
 
+-- =====================================================================
+-- THE SHARED COLD-ITEM WATCH  (BAG-1 + BAG-2)
+--
+-- ONE watch set, ONE event frame, ONE ladder — serving the Find window AND every summary
+-- panel, exactly as the audit's fix note asks. They are the same defect on two surfaces
+-- reading the same resolver, so giving them two independent loops would be two chances to
+-- fix only one of them next time.
+--
+-- Surfaces register a repaint closure (Find.AddSurface) and report the ids they could not
+-- judge (Find.NotePending). When an answer lands — by event, or by a ladder rung for the
+-- answers that arrive without one — every registered surface re-derives from the resolver
+-- and repaints itself. Each surface owns its own shownness check, so a closed window
+-- costs nothing.
+-- =====================================================================
+
+Find._watch     = Find._watch or {}    -- [itemID] = true — asked for, not yet answered
+Find._asks      = Find._asks  or {}    -- [itemID] = how many times we have asked (<= MAX_ASKS)
+Find._surfaces  = Find._surfaces or {} -- ordered repaint closures (ipairs: class 8)
+Find._watchRound     = 0               -- ladder rungs fired this cycle
+Find._watchExhausted = false           -- the ladder ran out; stop claiming "loading"
+Find._watchTimer     = false           -- a rung is armed
+
+-- Register a surface's repaint. Called once per surface at construction.
+function Find.AddSurface(fn)
+    if type(fn) ~= "function" then return end
+    Find._surfaces[#Find._surfaces + 1] = fn
+end
+
+-- New INPUT (a new query, a different owner) restarts the ladder — never the watch set
+-- itself: an id already asked for keeps its event subscription, so a late answer still
+-- repaints even after the timers have stopped. Events are free; timers are the thing that
+-- has to be bounded.
+function Find.ResetWatch()
+    Find._watchRound, Find._watchExhausted = 0, false
+    Find._asks = {}
+end
+
+local function askFor(id)
+    local n = Find._asks[id] or 0
+    if n >= Find.MAX_ASKS then return false end
+    Find._asks[id] = n + 1
+    local CI = _G.C_Item
+    if CI and CI.RequestLoadItemDataByID then CI.RequestLoadItemDataByID(id) end
+    return true
+end
+
+function Find.EnsureWatchFrame()
+    if Find._evt or not _G.CreateFrame then return end
+    local f = _G.CreateFrame("Frame")
+    f:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    f:SetScript("OnEvent", function(_, _, itemID)
+        if Find._watch[itemID] == nil then return end
+        Find._watch[itemID] = nil
+        Find.RequestRepaint()
+    end)
+    Find._evt = f
+end
+
+-- Debounced repaint of every registered surface: an info-received burst on login is
+-- hundreds of events in a handful of frames, and each one must not re-run the search.
+Find._repaintQueued = false
+function Find.RequestRepaint()
+    if Find._repaintQueued then return end
+    Find._repaintQueued = true
+    local fire = function()
+        Find._repaintQueued = false
+        if ns.SafeCall then ns:SafeCall(Find.Repaint) else Find.Repaint() end
+    end
+    if _G.C_Timer and _G.C_Timer.After then _G.C_Timer.After(0, fire) else fire() end
+end
+
+function Find.Repaint()
+    for i = 1, #Find._surfaces do
+        local fn = Find._surfaces[i]
+        if ns.SafeCall then ns:SafeCall(fn) else fn() end
+    end
+end
+
+-- Arm the next ladder rung, or close the cycle out honestly when there is no next rung.
+function Find.ArmLadder()
+    if Find._watchTimer or Find._watchExhausted then return end
+    local delay = Find.LadderDelay(Find._watchRound + 1)
+    if not delay then
+        -- The bound. One last repaint so every surface swaps its "still loading" line for
+        -- the honest "could not be checked" one, and no further timer is scheduled.
+        Find._watchExhausted = true
+        Find.RequestRepaint()
+        return
+    end
+    Find._watchTimer = true
+    local fire = function()
+        Find._watchTimer = false
+        Find._watchRound = Find._watchRound + 1
+        if next(Find._watch) == nil then return end   -- everything answered; the event path did it
+        -- Re-ask (within the per-id ceiling) in a DETERMINISTIC order, then repaint: an id
+        -- that warmed without firing an event lands here rather than never.
+        local ids = {}
+        for id in pairs(Find._watch) do ids[#ids + 1] = id end
+        table.sort(ids)
+        for i = 1, #ids do askFor(ids[i]) end
+        Find.RequestRepaint()
+        Find.ArmLadder()
+    end
+    if _G.C_Timer and _G.C_Timer.After then _G.C_Timer.After(delay, fire) else fire() end
+end
+
+-- A surface reports the ids it could not judge. Idempotent: an id already on the watch is
+-- not re-asked here (the ladder owns re-asking), so a warm client that reports nothing
+-- pending never creates a frame, never arms a timer, and stays a single pass.
+function Find.NotePending(ids)
+    if type(ids) ~= "table" or #ids == 0 then return end
+    for i = 1, #ids do
+        local id = ids[i]
+        if id and Find._watch[id] == nil then
+            Find._watch[id] = true
+            askFor(id)
+        end
+    end
+    Find.EnsureWatchFrame()
+    Find.ArmLadder()
+end
+
 function Find.Ensure()
     if Find.window then return Find.window end
     if not _G.CreateFrame then return nil end
@@ -356,6 +643,17 @@ function Find.Ensure()
     closeBtn:SetScript("OnEnter", function() cx:SetFontObject(UI.fonts.danger) end)
     closeBtn:SetScript("OnLeave", function() cx:SetFontObject(UI.fonts.body) end)
     closeBtn:SetScript("OnClick", function() Find.Close() end)
+
+    -- Cold-item status tag (BAG-1): "still loading 37 items…" while the client is still
+    -- answering, so a SHORT list is never mistaken for a COMPLETE one. Lives in the title
+    -- bar, so it costs the result list no geometry at all.
+    local status = titleBar:CreateFontString(nil, "OVERLAY")
+    status:SetFontObject(UI.fonts.microLabel or UI.fonts.small)
+    status:SetPoint("RIGHT", closeBtn, "LEFT", -6, 0)
+    status:SetJustifyH("RIGHT")
+    UI.Skin(status, function(self) self:SetTextColor(UI.Color("faint")) end)
+    status:Hide()
+    win.status = status
 
     -- Search box
     local wrap = UI.FlatFrame(win, "inset", "controlBorder")
@@ -410,6 +708,15 @@ function Find.Ensure()
 
     win:SetPoint("CENTER", _G.UIParent, "CENTER", 0, 120)
     Find.window = win
+
+    -- Register the window with the shared cold-item watch. Ensure is one-shot (it returns
+    -- early once Find.window exists), so this is exactly one surface. A closed window
+    -- re-runs nothing.
+    Find.AddSurface(function()
+        local w = Find.window
+        if w and w.IsShown and w:IsShown() then Find.Refresh(nil, true) end
+    end)
+
     return win
 end
 
@@ -578,12 +885,20 @@ function Find.CreateSummaryPanel(parent)
     empty:Hide()
     panel._empty = empty
 
-    function panel:SetSummary(owner, opts)
+    -- BAG-2: `fromWatch` marks a repaint driven by the shared cold-item watch. A
+    -- DIFFERENT owner is new input and restarts the ladder; the same owner re-rendered is
+    -- not, or the watch would re-arm itself forever.
+    function panel:SetSummary(owner, opts, fromWatch)
         opts = opts or {}
         local O = ns.Owner
         if not (O and O.SummaryRows) then return end
-        self._caption:SetText(O.SummaryCaption(owner, nil, { bank = opts.bank }))
-        local rows = O.SummaryRows(owner, liveResolver(), { sortBy = opts.sortBy })
+        if not fromWatch and self._owner ~= owner then Find.ResetWatch() end
+        -- Remembered so the watch can re-render this exact panel when a name lands.
+        self._owner, self._opts = owner, opts
+        local rows, pending = O.SummaryRows(owner, liveResolver(), { sortBy = opts.sortBy })
+        Find.NotePending(pending)
+        self._caption:SetText(O.SummaryCaption(owner, nil, {
+            bank = opts.bank, pending = #pending, exhausted = Find._watchExhausted }))
         for _, r in ipairs(self._rows) do r:Hide() end
         if #rows == 0 then
             self._empty:SetText(O.SummaryEmptyText(owner))
@@ -615,15 +930,38 @@ function Find.CreateSummaryPanel(parent)
         return #rows
     end
 
+    -- Same shared watch as the Find window (BAG-2's fix note: ONE watch, ONE frame, both
+    -- surfaces). The panel repaints itself only while it is shown and holding an owner.
+    Find.AddSurface(function()
+        if panel._owner and panel.IsShown and panel:IsShown() then
+            panel:SetSummary(panel._owner, panel._opts, true)
+        end
+    end)
+
     return panel
 end
 
+-- Show or hide the title-bar cold-item tag.
+local function setStatus(win, text)
+    if not (win and win.status) then return end
+    if text and text ~= "" then
+        win.status:SetText(text); win.status:Show()
+    else
+        win.status:SetText(""); win.status:Hide()
+    end
+end
+
 -- Run the search and repaint the result rows.
-function Find.Refresh(text)
+--
+-- `fromWatch` marks a re-run driven by the shared cold-item watch rather than by the
+-- owner. Only owner-driven input restarts the ladder; a watch repaint that reset it would
+-- be a loop with no bound at all.
+function Find.Refresh(text, fromWatch)
     local win = Find.window
     if not win then return end
     text = text or (win.box and win.box:GetText()) or ""
     if win.hint then win.hint:SetShown(text == "") end
+    if not fromWatch then Find.ResetWatch() end
 
     for _, r in ipairs(win._rows) do r:Hide() end
 
@@ -644,7 +982,8 @@ function Find.Refresh(text)
     local query = ns.Search and ns.Search.Compile and ns.Search.Compile(text)
     if not query or query.isEmpty then
         fit(0)
-        win.emptyFS:SetText("Type an item name to search every character.")
+        setStatus(win, nil)
+        win.emptyFS:SetText((Find.StatusText({ hasQuery = false })))
         win.emptyFS:Show()
         return
     end
@@ -660,18 +999,37 @@ function Find.Refresh(text)
         local view = ns.Nexus.Owners()
         if type(view) == "table" then owners = view end
     end
-    local results = Find.Search(owners, query, liveResolver(), { selfKey = selfKey })
+    local resolver = liveResolver()
+    local results, searchPending = Find.Search(owners, query, resolver, { selfKey = selfKey })
 
-    if #results == 0 then
+    -- ITEM 2: ONE aggregate row per distinct item — icon, quality-colored name, TOTAL.
+    local itemRows, rowPending = Find.BuildItemRows(results, resolver)
+
+    -- BAG-1: consume the matcher's `pending`. Ids we could not judge (no name yet) and
+    -- ids we could not NAME (matched on t:/slot:/q: but the label is a placeholder) go to
+    -- the one shared watch, which asks the client and repaints every surface when the
+    -- answers land.
+    local watchIDs = Find.MergeIDs(searchPending, rowPending)
+    Find.NotePending(watchIDs)
+
+    local emptyText, statusText = Find.StatusText({
+        hasQuery  = true,
+        rows      = #itemRows,
+        pending   = #watchIDs,
+        exhausted = Find._watchExhausted,
+    })
+    setStatus(win, statusText)
+
+    if #itemRows == 0 then
+        -- NOT "no matches" while ids are still unanswered: an absence of proof rendered as
+        -- an honest in-progress. StatusText owns which of the three lines this is.
         fit(0)
-        win.emptyFS:SetText("No character has a matching item.")
+        win.emptyFS:SetText(emptyText)
         win.emptyFS:Show()
         return
     end
     win.emptyFS:Hide()
 
-    -- ITEM 2: ONE aggregate row per distinct item — icon, quality-colored name, TOTAL.
-    local itemRows = Find.BuildItemRows(results, liveResolver())
     fit(#itemRows)
     local y = 0
     for i, r in ipairs(itemRows) do
@@ -994,6 +1352,144 @@ local function testSummaryPanelGeometry(fails)
     ck(Find.SUMMARY_CAP_H >= 2 * Find.ROW_H - 12, "the caption band fits a wrapped line")
 end
 
+-- BAG-1 (data honesty, async class 4): the COLD-ITEM CONTRACT, pure half.
+--
+-- The premise is the fresh login: a resolver whose `info` answers nil for every id,
+-- because that is literally the client's state — your alts' stored itemIDs are the ones
+-- no tooltip has warmed this session. The RED CONTROL is the old chain: it scored every
+-- pending item as a miss, so `#results == 0` and the window said "No character has a
+-- matching item" about an item three alts were holding. The GREEN is that the same call
+-- now HANDS BACK the ids it could not judge, and that the line the window shows for a
+-- zero-row result is an in-progress rather than an emptiness.
+local function testColdItems(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- The cold client: type/subtype/icon answer (static data, synchronous); name and
+    -- quality do not (server-cached, async). This is exactly search.lua's `cached = false`.
+    local cold = {
+        instant = function(id) return id, "Consumable", "Consumable", "", 5000 + id end,
+        info    = function() return nil end,
+    }
+    local warm = {
+        instant = cold.instant,
+        info    = function(id) return "Songflower Serenade Petal", "item:" .. id, 1 end,
+    }
+    local owners = {
+        ["Poonyx-R"] = { name = "Poonyx", class = "MAGE", source = "full", containers = {
+            [0] = { slots = { [1] = { id = 100, count = 20 } } } } },
+        ["Zug-R"] = { name = "Zug", class = "WARRIOR", source = "full", containers = {
+            [5] = { slots = { [1] = { id = 101, count = 5 } } } } },
+        ["Rex-R"] = { name = "Rex", source = "summary", containers = {}, itemCounts = { [102] = 99 } },
+    }
+    local q = ns.Search.Compile("songflower")
+
+    ------------------------------------------------------------------ the red control
+    local coldRes, coldPending = Find.Search(owners, q, cold, { selfKey = "Poonyx-R" })
+    ck(#coldRes == 0,
+       "PREMISE (the red control): on a cold client the matcher can judge nothing, so the " ..
+       "old chain's result list is EMPTY and the window said 'No character has a matching item'")
+    ck(#coldPending == 3,
+       "THE FIX: those three ids come back as PENDING rather than vanishing (got " ..
+       #coldPending .. ")")
+    ck(coldPending[1] == 100 and coldPending[2] == 101 and coldPending[3] == 102,
+       "…sorted, and covering BOTH branches — slot owners and the summary owner's aggregate")
+
+    -- And the line the window actually shows for that state is not a denial.
+    local emptyCold = Find.StatusText({ hasQuery = true, rows = 0, pending = #coldPending })
+    ck(emptyCold:find("Still loading", 1, true) == 1,
+       "…and the empty line reads as in-progress, not as emptiness: " .. emptyCold)
+    ck(emptyCold:find("No character", 1, true) == nil, "…it does not claim a miss it cannot prove")
+
+    ------------------------------------------------------------------ the green
+    local warmRes, warmPending = Find.Search(owners, q, warm, { selfKey = "Poonyx-R" })
+    ck(#warmRes == 3, "once the client warms, all three holders appear (got " .. #warmRes .. ")")
+    ck(#warmPending == 0, "…with nothing left pending")
+    local _, warmStatus = Find.StatusText({ hasQuery = true, rows = 3, pending = 0 })
+    ck(warmStatus == nil, "…and a fully-resolved result says nothing about loading")
+    -- A warm single pass reports no pending at all, which is what makes NotePending a
+    -- no-op and keeps the warm client on ONE pass with no frame and no timer.
+    ck(#(select(2, Find.Search(owners, q, warm, {}))) == 0, "a warm search is pending-free, every time")
+
+    ------------------------------------------------------------------ a REAL miss
+    -- The honest miss must survive the fix: warm data that simply does not match is still
+    -- "No character has a matching item", with no loading language anywhere.
+    local missRes, missPending = Find.Search(owners, ns.Search.Compile("thunderfury"), warm, {})
+    ck(#missRes == 0 and #missPending == 0, "a warm non-match is a real miss, not a pending one")
+    local missText = Find.StatusText({ hasQuery = true, rows = 0, pending = 0 })
+    ck(missText == "No character has a matching item.", "…and reads as one: " .. missText)
+
+    ------------------------------------------------------------------ a t: query, cold name
+    -- t:/slot: resolve from static data, so a cold item can MATCH while its name is still
+    -- a placeholder. The row is held, flagged, sorted last, and its id watched.
+    local tRes, tPending = Find.Search(owners, ns.Search.Compile("t:consumable"), cold, {})
+    ck(#tRes == 3 and #tPending == 0, "t: matches on synchronous static data, nothing pending")
+    local tRows, tRowPending = Find.BuildItemRows(tRes, cold)
+    ck(#tRows == 3, "…three rows render")
+    ck(#tRowPending == 3, "…but their NAMES are pending, and BuildItemRows says so")
+    ck(tRows[1].pending == true and tRows[1].itemName == "item:100",
+       "…each unnamed row is flagged, not silently placeholdered")
+    ck(tRows[1].icon == 5100, "…while the icon, which is synchronous, is real")
+
+    -- Half warm: named rows keep the alphabet, the placeholder sorts LAST (BAG-2's rule,
+    -- shared with Owner.SummaryRows so the two lists cannot drift).
+    local half = {
+        instant = cold.instant,
+        info = function(id)
+            if id == 101 then return nil end
+            return (id == 100) and "Alpha Elixir" or "Zeta Elixir", "item:" .. id, 1
+        end,
+    }
+    local halfRows, halfPending = Find.BuildItemRows(tRes, half)
+    ck(#halfPending == 1 and halfPending[1] == 101, "only the unresolved id is pending")
+    ck(halfRows[1].itemName == "Alpha Elixir" and halfRows[2].itemName == "Zeta Elixir",
+       "the named rows hold their alphabetical order")
+    ck(halfRows[3].itemID == 101 and halfRows[3].pending == true,
+       "…and the placeholder sorts last, not under 'i'")
+    -- With rows on screen AND ids outstanding, the window tags the shortfall rather than
+    -- letting a partial list read as a complete one.
+    local pEmpty, pStatus = Find.StatusText({ hasQuery = true, rows = 3, pending = 1 })
+    ck(pEmpty == nil, "rows exist, so there is no empty line")
+    ck(pStatus == "still loading 1 item\226\128\166", "…and the tag names the shortfall: " .. tostring(pStatus))
+
+    ------------------------------------------------------------------ the bound
+    -- The ladder is finite by construction: LadderDelay runs out, and that is the ONLY
+    -- terminal condition ArmLadder has. A ladder with no last rung is the same lie slower.
+    ck(#Find.WATCH_LADDER >= 3, "the ladder has real rungs (" .. #Find.WATCH_LADDER .. ")")
+    for i = 2, #Find.WATCH_LADDER do
+        ck(Find.WATCH_LADDER[i] >= Find.WATCH_LADDER[i - 1], "…backing off, not hammering (rung " .. i .. ")")
+    end
+    ck(Find.LadderDelay(#Find.WATCH_LADDER) ~= nil, "the last rung has a delay")
+    ck(Find.LadderDelay(#Find.WATCH_LADDER + 1) == nil, "THE BOUND: there is no rung past the last one")
+    ck(Find.LadderDelay(0) == nil and Find.LadderDelay(nil) == nil and Find.LadderDelay("x") == nil,
+       "…and junk rounds do not conjure one")
+    local ceil = Find.LadderCeiling()
+    ck(ceil > 0 and ceil < 60, "the whole ladder spans a sane window (" .. ceil .. "s)")
+    ck(Find.MAX_ASKS >= 1 and Find.MAX_ASKS <= 5,
+       "…and the per-id ask ceiling is bounded too (an id the server has no data for fires " ..
+       "GET_ITEM_INFO_RECEIVED with success=false forever)")
+
+    ------------------------------------------------------------------ the id union
+    local u = Find.MergeIDs({ 3, 1, 3 }, { 2, 1 })
+    ck(#u == 3, "MergeIDs de-duplicates within and across both lists (got " .. #u .. ")")
+    ck(u[1] == 1 and u[2] == 2 and u[3] == 3, "…and returns them SORTED (class 8)")
+    ck(#Find.MergeIDs(nil, nil) == 0, "…and tolerates two absent lists")
+    ck(#Find.MergeIDs({ 7 }, nil) == 1, "…or one")
+
+    ------------------------------------------------------------------ the three empty lines
+    ck((Find.StatusText({ hasQuery = false })):find("Type an item name", 1, true) == 1,
+       "no query -> the prompt")
+    local exhausted = Find.StatusText({ hasQuery = true, rows = 0, pending = 4, exhausted = true })
+    ck(exhausted:find("No character has a matching item.", 1, true) == 1,
+       "ladder spent -> the miss is stated…")
+    ck(exhausted:find("4 items never sent their data", 1, true) ~= nil,
+       "…AND what went unchecked is named, rather than folded into the answer: " .. exhausted)
+    ck(exhausted:find("Still loading", 1, true) == nil, "…and it stops claiming to be loading")
+    ck((Find.StatusText({ hasQuery = true, rows = 0, pending = 1 })):find("1 item ", 1, true) ~= nil,
+       "singular reads '1 item'")
+    ck(select(2, Find.StatusText({ hasQuery = true, rows = 2, pending = 2, exhausted = true }))
+       == "2 items unchecked", "a partial list past the ladder tags itself as partial")
+end
+
 function Find.RunSelfTests(verbose)
     local suites = {
         { name = "find across owners",  fn = testFindAcrossOwners },
@@ -1001,6 +1497,7 @@ function Find.RunSelfTests(verbose)
         { name = "summary owners",      fn = testFindSummaryOwners },
         { name = "window geometry",     fn = testFindWindowGeometry },
         { name = "summary panel geometry", fn = testSummaryPanelGeometry },
+        { name = "cold items",          fn = testColdItems },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
