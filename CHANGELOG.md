@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased — rides 2.0.6
+
+### The top rows of your bank had no item tooltips
+
+Open the bank, hover anything in the first few rows, and nothing came up — or worse, just
+a price line from another addon hanging in the air with no item above it. Hover something
+further down and the tooltip was perfect. It was not the items and it was not the other
+addon.
+
+Those top rows are the bank's own 28 slots, and the game treats them as a different kind
+of storage from every other container you own — including the bank bags directly below
+them, which is why the same hover worked two rows down. Bags drew all of them with one
+kind of cell and let the game's own bag tooltip answer for it. For the bank's own slots,
+the game's bag tooltip has nothing to say; Blizzard's bank asks a different question
+there, and now so does Bags. Every bank slot shows its item, on the same side of the
+window and with the same comparisons as every other cell.
+
+Nothing else moved: dragging, clicking, splitting and depositing in the bank are the
+game's own handlers exactly as before, an alt's bank (or your own, viewed away from the
+bank) still shows its cached tooltip with the "cached Xd ago" line, and the keyring was
+checked and left alone — the game draws the keyring the same way it draws a bag, so its
+tooltips were never affected.
+
 ## 2.0.5 — 2026-08-08
 
 **Equip something from your bags in the middle of a fight and the bag cell updates. It
