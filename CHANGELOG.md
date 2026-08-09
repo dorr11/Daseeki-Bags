@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — 2.0.5
+## 2.0.5 — 2026-08-08
 
 **Equip something from your bags in the middle of a fight and the bag cell updates. It
 used to keep showing the item you just put on. Your last deposit before closing the bank
