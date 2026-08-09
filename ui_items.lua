@@ -32,7 +32,9 @@
 -- secure/combat-correct handlers (pickup / place / split / use / real-slot tooltip)
 -- operate on the right (bag, slot) with zero behavior re-implemented — the public
 -- Blizzard template contract, not transcribed addon code. Structural (re)builds are
--- deferred out of combat (secure frames are protected).
+-- deferred out of combat (secure frames are protected). The ONE routed handler is
+-- OnEnter, and only for the BANK MAIN CONTAINER (-1), which the container template
+-- cannot draw a tooltip for at all — see the BAG-6 banner above Items._liveOnEnter.
 -- OFFLINE / REMOTE owners: render-only ItemButtonTemplate buttons — icon/count/quality
 -- from cached data, hyperlink tooltip + "cached Xd ago", clicks inert (shift-link only).
 --
@@ -1935,6 +1937,138 @@ local function showCachedTooltip(button)
 end
 
 ----------------------------------------------------------------------
+-- BAG-6 — LIVE TOOLTIP ROUTING (THE BANK MAIN CONTAINER)
+--
+-- The defect, from the owner's own bank: hovering anything in the first ~3 rows of the
+-- bank view showed NO item tooltip — just the third-party price addon's lines appended to
+-- an empty GameTooltip. Rows below (the bank BAGS, container ids 5..11) were fine.
+--
+-- Those first rows are the BANK MAIN CONTAINER, container id -1. Our live cells inherit
+-- ContainerFrameItemButtonTemplate and deliberately keep its own OnEnter (a real-slot
+-- tooltip with zero behavior re-implemented), and that handler resolves the tooltip as
+-- GameTooltip:SetBagItem(parent:GetID(), self:GetID()) — SetBagItem(-1, slot), which
+-- renders NOTHING on this client. Blizzard's own bank does not use this template for the
+-- 28 generic bank slots at all: BankFrame's buttons resolve
+-- GameTooltip:SetInventoryItem("player", BankButtonIDToInvSlotID(slot)) instead. Bank BAGS
+-- are real container ids, so the template's bag path works for them — hence "the first
+-- three rows only".
+--
+-- The fix routes ONE live OnEnter through a dispatcher that reads the cell's CURRENT
+-- container id:
+--     cid == BANK_CONTAINER (-1) -> inventory-slot tooltip (the bank's own path)
+--     everything else            -> the template's own handler, untouched
+--
+-- WHY A DISPATCHER AND NOT A SECOND TEMPLATE AT CONSTRUCTION: the grid's button pool is
+-- POSITIONAL. layoutGroup keeps G._buttons[i] for cell index i and only rebuilds a button
+-- when its LIVENESS changes (live vs cached); a cell that showed bank slot 3 is reparented
+-- to another bag's holder and reused for (bag 1, slot 3) on the next layout, and
+-- repaintGroup rewrites _cid in place without going near the button's scripts. Any routing
+-- baked in at construction would therefore be carried into the wrong container by the very
+-- next relayout. Reading _cid at HOVER time is recycle-proof by construction, and the
+-- pool-recycling test below is the assertion that keeps it that way.
+--
+-- Catalog-verified against wow-api-catalog/1.15.9.68808 (interface 11509):
+--   BankButtonIDToInvSlotID, KeyRingButtonIDToInvSlotID, GetScreenWidth, CursorUpdate
+--   (globals.txt). GameTooltip:SetInventoryItem / :SetBagItem are widget methods (not in
+--   the globals dump) and are already the shipping tooltip calls for the bank-bag and
+--   carried-bag strips (ui_bank.lua bankCellTooltip, ui_frame.lua strip tooltip).
+--
+-- KEYRING (-2) IS DELIBERATELY NOT ROUTED. Blizzard's keyring IS a ContainerFrame with
+-- bagID -2 whose cells ARE ContainerFrameItemButtons, so SetBagItem(-2, slot) is the
+-- client's OWN keyring tooltip path and renders normally. The bank main container is the
+-- only container id in this addon's scope that the default UI refuses to draw with the
+-- container template. The route table below states that verdict in code.
+----------------------------------------------------------------------
+
+-- PURE: which tooltip path a LIVE cell in this container must take.
+-- "inventory" = GameTooltip:SetInventoryItem("player", <mapped inventory slot>)
+-- "bag"       = the template's own SetBagItem(cid, slot) handler (left alone)
+function Items.LiveTooltipRoute(cid)
+    if cid == Store.BANK_CONTAINER then return "inventory" end
+    return "bag"
+end
+
+-- The inventory (equip) slot a BANK MAIN slot maps to. Never guessed: nil when the
+-- client API is absent, and nil sends the cell back to the template's own handler.
+function Items.BankMainInvSlot(slot)
+    if type(slot) ~= "number" then return nil end
+    if _G.BankButtonIDToInvSlotID then return _G.BankButtonIDToInvSlotID(slot) end
+    return nil
+end
+
+-- PURE: the anchor side ContainerFrameItemButton uses — a cell on the right half of the
+-- screen anchors its tooltip LEFT. Replicated so a bank-main cell and the carried-bag cell
+-- two rows under it put their tooltips on the SAME side of the grid.
+function Items.TooltipAnchorSide(right, screenWidth)
+    if type(right) == "number" and type(screenWidth) == "number" and screenWidth > 0
+       and right >= (screenWidth / 2) then
+        return "ANCHOR_LEFT"
+    end
+    return "ANCHOR_RIGHT"
+end
+
+local function tooltipAnchorFor(button)
+    local right = button.GetRight and button:GetRight() or nil
+    local width = _G.GetScreenWidth and _G.GetScreenWidth() or nil
+    return Items.TooltipAnchorSide(right, width)
+end
+
+-- The template's own OnEnter, however this client binds it. A mixin template binds the
+-- SCRIPT to a thin wrapper that calls the METHOD, so the method is preferred: calling the
+-- wrapper after we have replaced the method would re-enter us forever.
+local function nativeEnter(button)
+    local m = button._dsNativeEnterMethod
+    if m then return m(button) end
+    local s = button._dsNativeEnterScript
+    if s then return s(button) end
+end
+
+-- The bank main container's own tooltip path. Returns true when it rendered an item.
+function Items.ShowBankMainTooltip(button)
+    local GT = _G.GameTooltip
+    if not GT or not GT.SetInventoryItem then return false end
+    local invSlot = Items.BankMainInvSlot(button._slot)
+    if not invSlot then return false end          -- no mapping -> caller falls back
+    GT:SetOwner(button, tooltipAnchorFor(button))
+    local hasItem = GT:SetInventoryItem("player", invSlot)
+    if not hasItem then
+        -- An empty bank slot draws no tooltip, exactly as an empty carried slot does.
+        if GT.Hide then GT:Hide() end
+        return false
+    end
+    if GT.Show then GT:Show() end
+    -- The template's OnUpdate re-enters OnEnter every TOOLTIP_UPDATE_TIME while
+    -- self.updateTooltip is set, and on a non-mixin client that re-entry goes to the
+    -- GLOBAL container handler — SetBagItem(-1, slot) — which would blank the tooltip we
+    -- just drew, a fifth of a second after the cursor lands. Clearing the timer costs
+    -- nothing that the native path ever gave a bank-main cell (it gave it no tooltip at
+    -- all); GameTooltip's own MODIFIER_STATE_CHANGED handling still drives comparison
+    -- tooltips, and leaving the cell re-enters this function on the next hover anyway.
+    button.updateTooltip = nil
+    if _G.CursorUpdate then _G.CursorUpdate(button) end   -- the default bank's cursor pass
+    return true
+end
+
+-- Can this cell actually BE routed? (client mapping present + a tooltip that answers the
+-- inventory question). Answered before the route is taken, so "no client API" degrades to
+-- the template's own handler — today's behaviour — instead of to a dead hover.
+function Items.BankMainCanRoute(button)
+    local GT = _G.GameTooltip
+    if not GT or not GT.SetInventoryItem then return false end
+    return Items.BankMainInvSlot(button._slot) ~= nil
+end
+
+-- The single live OnEnter. Reads the CURRENT (cid, slot) — the pool recycles buttons
+-- across containers, so the route can never be decided any earlier than this.
+function Items._liveOnEnter(button)
+    if Items.LiveTooltipRoute(button._cid) == "inventory" and Items.BankMainCanRoute(button) then
+        Items.ShowBankMainTooltip(button)
+        return
+    end
+    return nativeEnter(button)
+end
+
+----------------------------------------------------------------------
 -- Button factory + methods
 ----------------------------------------------------------------------
 
@@ -1974,10 +2108,27 @@ function Items.CreateButton(parent, opts)
             end
         end)
     else
-        -- LIVE keeps the template's own OnClick/OnDragStart/OnReceiveDrag/OnEnter handlers
-        -- (secure, combat-correct pickup/place/split/use + real-slot tooltip) untouched.
+        -- LIVE keeps the template's own OnClick/OnDragStart/OnReceiveDrag handlers
+        -- (secure, combat-correct pickup/place/split/use) untouched — none of them is
+        -- touched here.
+        --
+        -- OnEnter is the ONE exception, and only as a ROUTER (BAG-6): the template's own
+        -- handler stays the tooltip for every real container id, and the bank main
+        -- container (-1) — which that handler cannot draw at all — takes the inventory-slot
+        -- path instead. Both bindings are captured first: a mixin template binds the script
+        -- to a wrapper that calls the method, so replacing only one of them either misses
+        -- the client's own re-entry or loops back into us.
+        button._dsNativeEnterScript = button.GetScript and button:GetScript("OnEnter") or nil
+        button._dsNativeEnterMethod = button.OnEnter
+        if button.SetScript then
+            button:SetScript("OnEnter", function(self) Items._liveOnEnter(self) end)
+        end
+        if button._dsNativeEnterMethod then
+            button.OnEnter = function(self) Items._liveOnEnter(self) end
+        end
         -- An INSECURE OnEnter post-hook clears the new-item mark on hover (1.x MarkSeen
-        -- fact) — a non-secure hook that never touches the secure click path.
+        -- fact) — a non-secure hook that never touches the secure click path. It is hooked
+        -- AFTER the router so it still runs on every hover, on either route.
         if button.HookScript then
             button:HookScript("OnEnter", function(self) Items.MarkSeen(self) end)
         end
@@ -3640,6 +3791,312 @@ local function testCooldownRefresh(fails)
     Items._buttons, _G.C_Container, _G.CooldownFrame_Set = savedButtons, savedCC, savedSet
 end
 
+-- BAG-6 — THE BANK MAIN CONTAINER TOOLTIP.
+--
+-- The owner's screenshot: every cell in the first ~3 rows of his bank showed no item
+-- tooltip at all — only a price addon's lines hanging off an empty GameTooltip. Those rows
+-- are container -1, and the container template's own OnEnter resolves them as
+-- SetBagItem(-1, slot), which this client draws NOTHING for.
+--
+-- The simulator below is the client, unkindly: SetBagItem(-1, ...) returns "no item" no
+-- matter what is in the slot (the RED CONTROL row drives the captured native handler
+-- through it and asserts the blank), while the inventory-slot path and the ordinary bag
+-- path both render. Every row after that is driven through the REAL wiring — a button
+-- built by Items.CreateButton, hovered through the script the client would fire.
+--
+-- The pooling rows are the point of the suite: G._buttons[i] is a POSITIONAL pool, so the
+-- same button serves bank slot 3 on one layout and (bag 1, slot 3) on the next, by
+-- SetParent + _setSlot (or by repaintGroup rewriting _cid in place during combat). A cell
+-- must take the right path in BOTH directions, every time it is recycled.
+local function testBankMainTooltip(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    ---------------------------------------------------------------- the route (pure)
+    ck(Items.LiveTooltipRoute(Store.BANK_CONTAINER) == "inventory",
+       "a LIVE bank-main cell (-1) takes the inventory-slot tooltip path")
+    ck(Items.LiveTooltipRoute(Store.BACKPACK_CONTAINER) == "bag",
+       "the backpack keeps the template's own handler")
+    for cid = 1, 11 do
+        ck(Items.LiveTooltipRoute(cid) == "bag",
+           "carried bag / bank bag " .. cid .. " keeps the template's own handler")
+    end
+    -- KEYRING VERDICT (-2): Blizzard's keyring IS a ContainerFrame whose cells ARE
+    -- ContainerFrameItemButtons, so SetBagItem(-2, slot) is the client's OWN keyring
+    -- tooltip path and renders normally — unlike the bank main container, which the
+    -- default UI never draws with this template. The keyring is deliberately NOT routed.
+    ck(Items.LiveTooltipRoute(Store.KEYRING_CONTAINER) == "bag",
+       "KEYRING (-2) keeps the native path — it is the client's own keyring tooltip")
+    ck(Items.LiveTooltipRoute(nil) == "bag",
+       "no container known -> the template's own handler (fail safe, never our path)")
+
+    ---------------------------------------------------------------- anchor side (pure)
+    ck(Items.TooltipAnchorSide(1500, 1920) == "ANCHOR_LEFT",
+       "a cell on the right half of the screen anchors its tooltip LEFT (container rule)")
+    ck(Items.TooltipAnchorSide(200, 1920) == "ANCHOR_RIGHT", "…and on the left half, RIGHT")
+    ck(Items.TooltipAnchorSide(nil, nil) == "ANCHOR_RIGHT",
+       "no geometry -> ANCHOR_RIGHT, the same default the cached path uses")
+
+    ---------------------------------------------------------------- the mapping
+    local savedBBID = _G.BankButtonIDToInvSlotID
+    _G.BankButtonIDToInvSlotID = function(id) return id + 39 end   -- the client's own map
+    ck(Items.BankMainInvSlot(3) == 42,
+       "bank slot -> inventory slot goes through BankButtonIDToInvSlotID (11509 globals.txt)")
+    _G.BankButtonIDToInvSlotID = nil
+    ck(Items.BankMainInvSlot(3) == nil, "…and is NEVER guessed when the client API is absent")
+    _G.BankButtonIDToInvSlotID = function(id) return id + 39 end
+
+    ---------------------------------------------------------------- THE CLIENT SIM
+    local BANKLINK, BAGLINK = "item:bank3", "item:bag1slot3"
+    local inv  = { [42] = BANKLINK }                 -- bank slot 3 == inventory slot 42
+    local bags = { ["1:3"] = BAGLINK }               -- carried bag 1, slot 3
+    local T = { calls = {} }
+    function T:reset() self.calls, self.rendered, self.shown, self.owner, self.anchor = {}, nil, nil, nil, nil end
+    function T:log(s) self.calls[#self.calls + 1] = s end
+    function T:has(s) for _, c in ipairs(self.calls) do if c == s then return true end end return false end
+    function T:SetOwner(o, a) self.owner, self.anchor, self.rendered = o, a, nil end
+    function T:ClearLines() self.rendered = nil end
+    function T:AddLine() end
+    function T:Show() self.shown = true end
+    function T:Hide() self.shown = false; self.rendered = nil end
+    function T:IsOwned(f) return self.owner == f end
+    function T:SetHyperlink(link) self:log("SetHyperlink(" .. tostring(link) .. ")"); self.rendered = link; return true end
+    -- THE DEFECT, reproduced: bag -1 draws nothing, whatever is in the slot.
+    function T:SetBagItem(bag, slot)
+        self:log(("SetBagItem(%s,%s)"):format(tostring(bag), tostring(slot)))
+        if bag == Store.BANK_CONTAINER then return nil end
+        local link = bags[tostring(bag) .. ":" .. tostring(slot)]
+        self.rendered = link
+        return link ~= nil
+    end
+    function T:SetInventoryItem(unit, invSlot)
+        self:log(("SetInventoryItem(%s,%s)"):format(tostring(unit), tostring(invSlot)))
+        local link = inv[invSlot]
+        self.rendered = link
+        return link ~= nil
+    end
+
+    -- The template's own OnEnter, as the client binds it on ContainerFrameItemButtonTemplate.
+    local nativeEnters = 0
+    local function nativeOnEnter(self)
+        nativeEnters = nativeEnters + 1
+        T:SetOwner(self, "ANCHOR_RIGHT")
+        if not T:SetBagItem(self:GetParent():GetID(), self:GetID()) then T:Hide() else T:Show() end
+        self.updateTooltip = 0.25          -- the template arms its own OnUpdate re-entry
+    end
+
+    local function newTexture()
+        local t = {}
+        function t:SetTexture() end
+        function t:SetAtlas() end
+        function t:SetAlpha() end
+        function t:SetDesaturated() end
+        function t:SetVertexColor() end
+        function t:SetPoint() end
+        function t:SetAllPoints() end
+        function t:SetShown() end
+        function t:Show() end
+        function t:Hide() end
+        function t:SetTexCoord() end
+        return t
+    end
+    local function newFrame(_, _, parent, template)
+        local f = { parent = parent, scripts = {}, template = template, icon = newTexture() }
+        function f:SetSize() end
+        function f:GetWidth() return Items.DEFAULT_SIZE end
+        function f:GetRight() return self._right end
+        function f:SetParent(p) self.parent = p end
+        function f:GetParent() return self.parent end
+        function f:SetID(id) self._id = id end
+        function f:GetID() return self._id end
+        function f:Show() self.shown = true end
+        function f:Hide() self.shown = false end
+        function f:SetNormalTexture() end
+        function f:RegisterForDrag() end
+        function f:CreateTexture() return newTexture() end
+        function f:SetScript(k, fn) self.scripts[k] = fn end
+        function f:GetScript(k) return self.scripts[k] end
+        function f:HookScript(k, fn)          -- real semantics: post-hook, both run
+            local prev = self.scripts[k]
+            self.scripts[k] = function(...) if prev then prev(...) end return fn(...) end
+        end
+        if template == "ContainerFrameItemButtonTemplate" then
+            f.scripts.OnEnter = nativeOnEnter
+            f.scripts.OnLeave = function() T:Hide() end
+        end
+        return f
+    end
+
+    local savedCF, savedBorders, savedGT, savedEvt, savedGSW, savedCU, savedCN =
+        _G.CreateFrame, ns.Borders, _G.GameTooltip, Items._evt,
+        _G.GetScreenWidth, _G.CursorUpdate, _G.C_NewItems
+    _G.CreateFrame, ns.Borders, _G.GameTooltip = newFrame, nil, T
+    Items._evt = Items._evt or {}                 -- ensureEventFrame is not under test here
+    _G.GetScreenWidth = function() return 1920 end
+    local cursorPasses = 0
+    _G.CursorUpdate = function() cursorPasses = cursorPasses + 1 end
+    local seen = {}
+    _G.C_NewItems = { RemoveNewItem = function(cid, slot) seen[#seen + 1] = tostring(cid) .. ":" .. tostring(slot) end }
+
+    local ok, err = pcall(function()
+        local owner = newOwnerWith({ [Store.BANK_CONTAINER] = {}, [1] = {} })
+        owner.source, owner.nameRealm = "full", "Senche-Whitemane"
+        local savedSelf = Items._self
+        Items.SetSelf("Senche-Whitemane")
+
+        local bankHolder = { GetID = function() return Store.BANK_CONTAINER end }
+        local bagHolder  = { GetID = function() return 1 end }
+
+        -- The cell, built exactly as layoutGroup builds it for a LIVE bank slot.
+        local cell = Items.CreateButton(bankHolder, { live = true, size = 37 })
+        ck(cell ~= nil and cell.scripts.OnEnter ~= nil, "a live cell has an OnEnter to fire")
+        ck(cell._dsNativeEnterScript == nativeOnEnter,
+           "the template's own handler is CAPTURED, not discarded (the bag path still uses it)")
+
+        -------------------------------------------------- 1) bank main: our path renders
+        Items._setSlot(cell, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
+        T:reset()
+        cell.scripts.OnEnter(cell)
+        ck(T:has("SetInventoryItem(player,42)"),
+           "hovering a bank-main cell resolves the INVENTORY slot (BankButtonIDToInvSlotID(3)=42)")
+        ck(not T:has("SetBagItem(-1,3)"),
+           "…and never asks the client for bag -1, which is what drew nothing")
+        ck(T.rendered == BANKLINK, "…so the tooltip actually renders the item (THE DEFECT, fixed)")
+        ck(T.shown == true and T.owner == cell, "…owned by the cell and shown")
+        ck(T.anchor == "ANCHOR_RIGHT", "…anchored right for a cell on the left half of the screen")
+        ck(cell.updateTooltip == nil,
+           "…with the template's OnUpdate re-entry disarmed (it would blank us via SetBagItem(-1))")
+        ck(seen[#seen] == "-1:3", "the insecure MarkSeen post-hook still runs on the new path")
+        ck(cursorPasses == 1, "…and the default bank's cursor pass runs with it")
+
+        -- ...and the anchor really does follow the cell's position, as the container rule does.
+        cell._right = 1500
+        T:reset(); cell.scripts.OnEnter(cell)
+        ck(T.anchor == "ANCHOR_LEFT", "a bank-main cell on the right half anchors LEFT (native rule)")
+        cell._right = nil
+
+        -------------------------------------------------- 2) RED CONTROL: the native path
+        T:reset()
+        local nBefore = nativeEnters
+        cell._dsNativeEnterScript(cell)
+        ck(nativeEnters == nBefore + 1, "the red control really drove the template's own handler")
+        ck(T:has("SetBagItem(-1,3)") and T.rendered == nil,
+           "RED CONTROL: the template's own handler asks for bag -1 and renders NOTHING — " ..
+           "this is 2.0.5 in the owner's bank, and the whole reason for the route")
+
+        -------------------------------------------------- 3) POOL RECYCLE: bank -> carried bag
+        cell:SetParent(bagHolder)                       -- exactly what layoutGroup does
+        Items._setSlot(cell, owner, 1, 3, { id = 2, quality = 1, link = BAGLINK })
+        T:reset()
+        local nBefore2 = nativeEnters
+        cell.scripts.OnEnter(cell)
+        ck(nativeEnters == nBefore2 + 1,
+           "a cell RECYCLED from bank-main to a carried bag goes back to the template's handler")
+        ck(T:has("SetBagItem(1,3)") and not T:has("SetInventoryItem(player,42)"),
+           "…and asks for (bag 1, slot 3) — the recycled cell carries no bank routing with it")
+        ck(T.rendered == BAGLINK, "…and that tooltip renders")
+        ck(seen[#seen] == "1:3", "…MarkSeen followed the recycled (cid, slot) too")
+
+        -------------------------------------------------- 4) …and back again
+        cell:SetParent(bankHolder)
+        Items._setSlot(cell, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
+        T:reset()
+        local nBefore3 = nativeEnters
+        cell.scripts.OnEnter(cell)
+        ck(nativeEnters == nBefore3,
+           "recycled BACK to bank-main, the same cell leaves the native handler alone again")
+        ck(T:has("SetInventoryItem(player,42)") and T.rendered == BANKLINK,
+           "…and renders through the inventory slot (both directions, same button)")
+
+        -------------------------------------------------- 5) the COMBAT repaint recycle
+        -- repaintGroup rewrites _cid/_slot in place, touching no script and no parent. The
+        -- route has to follow that too, or an in-combat relayout strands the old path.
+        local G = { _buttons = { cell } }
+        Items._repaintGroup(G, { { owner = owner, cid = Store.BANK_CONTAINER, slot = 5,
+                                   data = { id = 3, quality = 1 } } })
+        T:reset()
+        cell.scripts.OnEnter(cell)
+        ck(T:has("SetInventoryItem(player,44)"),
+           "an in-combat data-only repaint (repaintGroup) re-routes with the new slot (5 -> 44)")
+
+        -------------------------------------------------- 6) an EMPTY bank slot
+        Items._setSlot(cell, owner, Store.BANK_CONTAINER, 9, nil)
+        T:reset()
+        cell.scripts.OnEnter(cell)
+        ck(T:has("SetInventoryItem(player,48)") and T.rendered == nil and T.shown == false,
+           "an EMPTY bank slot draws no tooltip (and leaves no stale one up)")
+
+        -------------------------------------------------- 7) no client mapping -> degrade
+        _G.BankButtonIDToInvSlotID = nil
+        Items._setSlot(cell, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
+        T:reset()
+        local nBefore4 = nativeEnters
+        cell.scripts.OnEnter(cell)
+        ck(nativeEnters == nBefore4 + 1,
+           "with no BankButtonIDToInvSlotID the cell falls back to the template's handler " ..
+           "(degrades to today's behaviour, never to a dead hover)")
+        _G.BankButtonIDToInvSlotID = function(id) return id + 39 end
+
+        -------------------------------------------------- 8) the CACHED view is untouched
+        local cached = Items.CreateButton(bankHolder, { live = false, size = 37 })
+        Items._setSlot(cached, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
+        T:reset()
+        cached.scripts.OnEnter(cached)
+        ck(T:has("SetHyperlink(" .. BANKLINK .. ")"),
+           "a CACHED bank cell still uses the hyperlink tooltip (alt/away-from-bank path untouched)")
+        ck(not T:has("SetInventoryItem(player,42)"),
+           "…and never reads the LIVE inventory slot for somebody else's bank")
+
+        -------------------------------------------------- 9) the MIXIN-SHAPED client
+        -- A mixin template binds the SCRIPT to a wrapper that calls the METHOD, and its own
+        -- OnUpdate re-enters through the method. Both bindings therefore have to be routed,
+        -- and the bag path must call the METHOD (calling the wrapper back would recurse
+        -- forever through our own override — a hang, in the client, on every bag hover).
+        local mixinEnters = 0
+        local function mixinOnEnter(self)
+            mixinEnters = mixinEnters + 1
+            T:SetOwner(self, "ANCHOR_RIGHT")
+            if not T:SetBagItem(self:GetParent():GetID(), self:GetID()) then T:Hide() else T:Show() end
+        end
+        local savedNew = _G.CreateFrame
+        _G.CreateFrame = function(kind, name, parent, template)
+            local f = newFrame(kind, name, parent, template)
+            if template == "ContainerFrameItemButtonTemplate" then
+                f.OnEnter = mixinOnEnter
+                f.scripts.OnEnter = function(self) return self:OnEnter() end   -- the wrapper
+            end
+            return f
+        end
+        local mx = Items.CreateButton(bankHolder, { live = true, size = 37 })
+        _G.CreateFrame = savedNew
+        ck(mx._dsNativeEnterMethod == mixinOnEnter, "the mixin METHOD is captured too")
+        ck(mx.OnEnter ~= mixinOnEnter, "…and the method itself is routed, not only the script")
+
+        Items._setSlot(mx, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
+        T:reset(); local mBefore = mixinEnters
+        mx.scripts.OnEnter(mx)
+        ck(mixinEnters == mBefore and T.rendered == BANKLINK,
+           "on a mixin client the bank-main cell still renders through the inventory slot")
+        T:reset()
+        mx:OnEnter()          -- the client's OWN re-entry (its OnUpdate calls the method)
+        ck(T.rendered == BANKLINK,
+           "…and the client's own method re-entry lands on our route, not on SetBagItem(-1)")
+
+        mx:SetParent(bagHolder)
+        Items._setSlot(mx, owner, 1, 3, { id = 2, quality = 1, link = BAGLINK })
+        T:reset(); mBefore = mixinEnters
+        mx.scripts.OnEnter(mx)
+        ck(mixinEnters == mBefore + 1 and T.rendered == BAGLINK,
+           "a bag cell on a mixin client reaches the mixin EXACTLY ONCE (no wrapper recursion)")
+
+        Items._self = savedSelf
+    end)
+    if not ok then fails[#fails + 1] = "error: " .. tostring(err) end
+
+    _G.CreateFrame, ns.Borders, _G.GameTooltip, Items._evt = savedCF, savedBorders, savedGT, savedEvt
+    _G.GetScreenWidth, _G.CursorUpdate, _G.C_NewItems = savedGSW, savedCU, savedCN
+    _G.BankButtonIDToInvSlotID = savedBBID
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -3664,6 +4121,7 @@ function Items.RunSelfTests(verbose)
         { name = "sort-lock cell layer", fn = testLockLayer },
         { name = "cell click action (use path)", fn = testCellClickAction },
         { name = "cooldown swipe (BAG_UPDATE_COOLDOWN)", fn = testCooldownRefresh },
+        { name = "bank-main tooltip route (BAG-6)", fn = testBankMainTooltip },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
