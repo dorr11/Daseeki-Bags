@@ -183,85 +183,86 @@ function Borders.SetRGB()
     return 0.2, 1, 0.8
 end
 
--- NEW-ITEM crimson — brand `brand` (Field Ledger wax), the colour 2.0's retired corner pip
--- already used for "recently acquired", carried over so the meaning is continuous for the
--- owner. See the NEW-ITEM ARCHAEOLOGY block below for why this branch is new design rather
--- than transcription, and why crimson can never be confused with the unusable red.
-local NEW_RGB = { 0.7529, 0.2824, 0.2353 }
-Borders.NEW_RGB = NEW_RGB
-function Borders.NewRGB()
-    return NEW_RGB[1], NEW_RGB[2], NEW_RGB[3]
-end
-
 ----------------------------------------------------------------------
--- NEW-ITEM ARCHAEOLOGY — the verdict, recorded so it is not re-litigated.
+-- NEW-ITEM ARCHAEOLOGY — SUPERSEDED. The previous verdict recorded here ("1.x had no
+-- new-item treatment at all, so 2.0's cue is new design") WAS WRONG, and this block is
+-- the correction, kept in full so the mistake is not repeated a third time.
 --
--- The owner's recollection was that "original bags/bagnon highlight+flash the border" for
--- a newly-acquired item. Our own 1.x tree does NOT. Two facts settle it:
+-- The earlier reading looked at exactly one file, core/classes/item.lua, found
+--     Daseeki-Bags/core/classes/item.lua:49   b.NewItemTexture:Hide()
+-- in Construct, saw no `new` branch in UpdateBorder's four-branch chain, and concluded the
+-- cue did not exist. That :49 line is an INITIAL hide on the shared base class. The BAG
+-- SUBCLASS drives the region every update:
 --
---   Daseeki-Bags/core/classes/item.lua:49   b.NewItemTexture:Hide()
---       — the template's own new-loot flash sheet is killed at CONSTRUCT, for every cell,
---         unconditionally. Nothing ever un-hides it.
---   Daseeki-Bags/core/classes/item.lua:196-205  UpdateBorder's glow chain has exactly FOUR
---       branches — glowQuest, glowUnusable, glowSets, glowQuality. There is no `glowNew`
---       setting anywhere in the 1.x tree (core/api/settings.lua has no such key).
+--   Daseeki-Bags/frames/inventory/item.lua:97-107   Item:UpdateGlow()
+--       local new = Addon.sets.glowNew and self.info.isNew
+--       self.BattlepayItemTexture:SetShown(new and self.info.isPaid)
+--       self.NewItemTexture:SetShown(new)
+--       if new then
+--           self.NewItemTexture:SetAtlas(self.info.quality
+--               and NEW_ITEM_ATLAS_BY_QUALITY[self.info.quality] or 'bags-glow-white')
+--           self.newitemglowAnim:Play()
+--           self.flashAnim:Play()
+--       end
+--   Daseeki-Bags/core/api/settings.lua:35        glowNew = true      -- shipped default ON
+--   Daseeki-Bags/config/panels/slotOptions.lua:67  self:AddCheck('glowNew')  -- and a checkbox
+--   Daseeki-Bags/frames/inventory/item.lua:56/112-117  OnEnter -> MarkSeen -> RemoveNewItem
 --
--- 1.x's only flash machinery is `FlashFind` (item.lua:73-85), a 3-cycle alpha pulse on the
--- template's `flash` region, and it is driven by the ALT-CLICK "find this item" signal
--- (item.lua:114 FLASH_ITEM), not by newness. So: 1.x had NO new-item treatment at all.
+-- So 1.x's new-item indicator is BLIZZARD'S OWN: the template's NewItemTexture sheet set to
+-- the per-quality `bags-glow-*` atlas, with the template's looping newitemglowAnim pulse and
+-- its one-shot flashAnim burst. The owner's recollection was right and the archaeology was
+-- wrong.
 --
--- What ships here is therefore NEW DESIGN, written in 1.x's idiom rather than copied from
--- it — which is what the owner asked for once the archaeology came back empty:
---   * it is a BRANCH OF THE ONE GLOW CHAIN, not a second mark on the cell. That is 1.x's
---     whole model (one cue per cell), and it is why the crimson corner pip 2.0 shipped is
---     retired rather than kept alongside.
---   * it sits directly ABOVE rarity and BELOW quest / unusable / set. 1.x orders its chain
---     by how much the cue is an INSTRUCTION about the item — "this is for a quest", "you
---     cannot use this", "this belongs to a set you wear" — and lets rarity be the default
---     decoration underneath. "New" is a fact about your SESSION, not about the item, so it
---     must not mask any of the three item-facts; but it has to outrank plain rarity or it
---     would be invisible on exactly the items you just looted.
---   * because unusable outranks it, a crimson halo only ever appears on an item you CAN
---     use, so it can never be mistaken for the unusable red (which is a pure bright red,
---     1/.1/.1, against this brick 0.75/.28/.24).
---   * the FLASH is a slow pulse on the halo (Borders.PULSE_*), not the template's burst.
+-- THE STRUCTURAL CONSEQUENCE, and why this file loses code rather than gaining it:
+-- in 1.x the new-item cue is NOT part of the glow chain. UpdateBorder (item.lua:196-205)
+-- has four branches and none of them is `new`; UpdateGlow is a SEPARATE pass on a SEPARATE
+-- region. A newly-looted epic therefore glows PURPLE and carries the new-item sheet on top
+-- of it — it does not lose its rarity colour. 2.0's crimson branch made "new" outrank
+-- rarity and repaint the halo, which is the thing the owner was looking at when he said the
+-- 2.0 indicator was not what Bags 1 shipped.
 --
--- The cue clears exactly when the game's own new-item set clears it — C_NewItems, which
--- ui_items already drives (RemoveNewItem on interaction).
+-- So the crimson branch (Borders.NewRGB) and its slow halo pulse (Borders.PULSE_*) are
+-- RETIRED, not re-tuned: the chain goes back to 1.x's four branches, and the new-item cue
+-- moves to the template region 1.x actually drives (ui_items.Items._applyNewCue). Only the
+-- TOGGLE stays here, because db.newItemMarkers is a settings row and options.lua already
+-- writes it — it now gates 1.x's sheet instead of 2.0's crimson.
+--
+-- The cue still clears exactly when the game's own new-item set clears it — C_NewItems,
+-- which ui_items already drives (RemoveNewItem on interaction), i.e. 1.x's MarkSeen.
 ----------------------------------------------------------------------
 
 -- PURE: the WHOLE precedence chain in one place — 1.x's UpdateBorder branch order, top
--- down (item.lua:197-205), with the new-item branch inserted above rarity:
---     quest gold > unusable red > equipment-set teal > NEW crimson > rarity (above floor)
+-- down (item.lua:197-205), and nothing else:
+--     quest gold > unusable red > equipment-set teal > rarity (above floor)
 -- Returns r,g,b for the tint the cell should glow, or nil when it should not glow at all.
 -- `provider` is injected exactly as for QualityRGB (live: the game's quality-color function).
 --
+-- NEWNESS IS DELIBERATELY ABSENT. It is not a branch of this chain in 1.x and it is no
+-- longer one here (see the archaeology block above); the new-item cue is its own region.
+--
 -- This is the SINGLE glow decision. Apply() paints the halo AND the template's IconBorder
 -- from it, so "is this cell glowing?" has exactly one answer and the two can never disagree.
-function Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider, isNew)
+function Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider)
     if not enabled then return nil end
     if quest    then return Borders.QuestRGB() end           -- 1.x's FIRST branch
     if unusable then return Borders.UnusableRGB() end        -- "can't use", over rarity
     if set      then return Borders.SetRGB() end             -- 1.x glowSets, over rarity
-    if isNew and Borders.NewCueEnabled() then
-        return Borders.NewRGB()                              -- 2.0: new, over rarity
-    end
     if not Borders.ShouldShow(quality, enabled, minQuality) then return nil end
     return Borders.QualityRGB(quality, provider)             -- may still be nil (unknown quality)
 end
 
 -- PURE: the boolean form of ResolveTint — "does this cell's halo show?".
-function Borders.GlowShown(quality, unusable, quest, set, enabled, minQuality, provider, isNew)
-    return Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider, isNew) ~= nil
+function Borders.GlowShown(quality, unusable, quest, set, enabled, minQuality, provider)
+    return Borders.ResolveTint(quality, unusable, quest, set, enabled, minQuality, provider) ~= nil
 end
 
--- The new-item cue's own toggle, read live. DEFAULT ON — unlike the equipment-set teal,
--- which is default-off because 1.x cannot draw it at all on this client. This cue is
--- transient (it clears as soon as the game's own C_NewItems set clears the slot), so it
--- cannot permanently repaint a large part of the bag the way the set teal can.
+-- The new-item cue's own toggle, read live. DEFAULT ON, which is 1.x's own shipped value
+-- (core/api/settings.lua:35 `glowNew = true`) — unlike the equipment-set teal, which is
+-- default-off because 1.x cannot draw it at all on this client.
 --
--- `db.newItemMarkers` is a NEW key — the retired wax dot had no toggle of its own, it was
--- unconditional. Absent => ON, so an existing profile needs no migration.
+-- `db.newItemMarkers` is the 2.0 name for 1.x's `glowNew`. Absent => ON, so an existing
+-- profile needs no migration. It lives in this file because options.lua already writes it
+-- here; the cue it gates is drawn by ui_items (Items._applyNewCue).
 function Borders.NewCueEnabled()
     local db = Store and Store.db
     if type(db) ~= "table" then return true end
@@ -517,56 +518,17 @@ function Borders.Attach(button)
 end
 
 ----------------------------------------------------------------------
--- THE NEW-ITEM PULSE (the "flash" half of the owner's ask).
+-- THE NEW-ITEM PULSE IS RETIRED (it was the crimson branch's other half).
 --
--- A slow breathe on the halo TEXTURE's own alpha — deliberately not on the container's,
--- which already carries the search-dim cascade (Borders.SetAlpha); the two multiply, so a
--- dimmed new item recedes exactly like every other dimmed cell while still breathing.
+-- 2.0 breathed the quality halo's own alpha to say "new". 1.x does not: its flash is
+-- Blizzard's `newitemglowAnim` / `flashAnim` on the template's NewItemTexture, a REGION
+-- of its own that leaves the rarity halo alone (see the archaeology block above). The
+-- halo therefore has exactly ONE alpha again — Borders.GLOW_ALPHA — and no animation.
 --
--- Written in 1.x's idiom: 1.x's only pulse (FlashFind, item.lua:73-85) is a chain of Alpha
--- animations on an AnimationGroup, so this is one too. It is slower and shallower than
--- FlashFind's 3-cycle 0.1->1 strobe, because that fires once on demand whereas this runs
--- for as long as an item is unseen — a strobe on half a freshly-looted bag is not "subtle".
-Borders.PULSE_MIN      = 0.45   -- texture alpha floor (multiplies GLOW_ALPHA)
-Borders.PULSE_MAX      = 1.00
-Borders.PULSE_DURATION = 0.90   -- seconds per half-cycle (1.8s round trip)
-
-local function ensurePulse(b)
-    if b._pulse then return b._pulse end
-    local glow = b._glow
-    if not (glow and glow.CreateAnimationGroup) then return nil end
-    local ag = glow:CreateAnimationGroup()
-    if not ag then return nil end
-    if ag.SetLooping then ag:SetLooping("REPEAT") end
-    local down = ag:CreateAnimation("Alpha")
-    down:SetOrder(1)
-    down:SetDuration(Borders.PULSE_DURATION)
-    down:SetFromAlpha(Borders.PULSE_MAX)
-    down:SetToAlpha(Borders.PULSE_MIN)
-    local up = ag:CreateAnimation("Alpha")
-    up:SetOrder(2)
-    up:SetDuration(Borders.PULSE_DURATION)
-    up:SetFromAlpha(Borders.PULSE_MIN)
-    up:SetToAlpha(Borders.PULSE_MAX)
-    b._pulse = ag
-    return ag
-end
-
--- Start / stop the breathe. Idempotent in both directions: a repaint on an already-pulsing
--- cell must not restart the animation (that would make every grid refresh visibly hitch).
-local function setPulse(b, on)
-    if on then
-        local ag = ensurePulse(b)
-        if not ag then return end
-        if not (ag.IsPlaying and ag:IsPlaying()) then ag:Play() end
-    else
-        local ag = b._pulse
-        if ag and ag.IsPlaying and ag:IsPlaying() then ag:Stop() end
-        -- Stop() leaves whatever alpha the animation last wrote; restore full so a cell
-        -- that stops being new is never left dimmed at the pulse floor.
-        if b._glow and b._glow.SetAlpha then b._glow:SetAlpha(1) end
-    end
-end
+-- 1.x's only addon-owned pulse is FlashFind (item.lua:73-85), a 3-cycle strobe on the
+-- template's `flash` region driven by the ALT-CLICK "find this item" signal. It is not a
+-- newness cue and 2.0 has never drawn it here.
+----------------------------------------------------------------------
 
 -- Paint the halo one color and show it. Alpha is the spec's single uniform intensity
 -- for every branch — quest, unusable and rarity all glow at the same strength, and the
@@ -642,8 +604,10 @@ function Borders.SetIconBorder(button, r, g, bl)
 end
 
 -- Color (or hide) a button's quality glow AND the template IconBorder under it.
--- Precedence is 1.x's UpdateBorder chain, top down:
+-- Precedence is 1.x's UpdateBorder chain, top down, and ONLY that chain:
 --   quest (gold)  >  unusable (red)  >  equipment set (teal)  >  quality (rarity)
+-- NEWNESS never enters here — 1.x draws it on the template's NewItemTexture instead, so a
+-- freshly-looted epic keeps its purple halo and wears the new-item sheet over it.
 -- `quest` (1.x glowQuest) draws the GOLD tint every quest item carries — the glow half of
 -- 1.x's quest treatment, the bang glyph being reserved for quest STARTERS (ui_items draws
 -- that). `unusable` (1.x glowUnusable) draws a RED glow. `set` (1.x glowSets) draws the
@@ -654,21 +618,17 @@ end
 -- The tint is resolved ONCE (Borders.ResolveTint) and both consumers read that one verdict:
 -- the halo and the IconBorder. The IconBorder op runs BEFORE the Attach guard on purpose —
 -- it must hold on any item button, including a headless/harness one with no glow container.
-function Borders.Apply(button, quality, unusable, quest, set, isNew)
+function Borders.Apply(button, quality, unusable, quest, set)
     local r, g, bl = Borders.ResolveTint(
-        quality, unusable, quest, set, Borders.Enabled(), Borders.MinQuality(), liveProvider, isNew)
+        quality, unusable, quest, set, Borders.Enabled(), Borders.MinQuality(), liveProvider)
 
     -- 1.x item.lua:210/220 — the crisp ring that anchors the wash to this cell.
     Borders.SetIconBorder(button, r, g, bl)
 
     local b = Borders.Attach(button)
     if not b then return end
-    if not r then setPulse(b, false); b:Hide(); return end
+    if not r then b:Hide(); return end
     showGlow(b, r, g, bl)
-    -- The breathe runs only on the cell whose tint the NEW branch actually won — a new
-    -- quest item shows steady gold, because the quest fact outranks the session fact.
-    setPulse(b, isNew and Borders.NewCueEnabled()
-                 and not (quest or unusable or set) and true or false)
 end
 
 -- Dim-cascade support (search-dim): scale the whole container's alpha so a dimmed slot's

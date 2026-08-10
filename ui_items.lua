@@ -258,16 +258,41 @@ function Items.MarkerArt(kind)
         return { texture = Items.QuestBangTexture(), mask = nil, token = nil,
                  sizeRatio = 1, anchor = "CELL", glyph = true }
     end
-    -- CELL PARITY: the "set" AND "new" pip specs are both RETIRED, for the same reason.
-    -- 1.x draws exactly ONE cue per cell — the halo — and expresses every per-item fact as
-    -- a BRANCH of that one chain (item.lua:196-205). Equipment-set membership is its teal
-    -- branch (Borders.SetRGB); the new-item cue is now a crimson branch plus a slow pulse
-    -- (Borders.NewRGB / Borders.PULSE_*, and see borders.lua's NEW-ITEM ARCHAEOLOGY block
-    -- for why that branch is new design rather than transcription). Neither has corner art
-    -- any more, so there is nothing to declare here. art/dot-mask.tga stays on disk — the
-    -- shipped stencil is still referenced by Items.TEX_DOT_MASK for any future pip — but no
-    -- caller asks MarkerArt for one.
+    -- CELL PARITY: the "set" AND "new" pip specs are both RETIRED, and neither comes back.
+    -- Equipment-set membership is 1.x's teal branch of the ONE glow chain (Borders.SetRGB).
+    -- The NEW-ITEM cue is 1.x's own: the TEMPLATE's NewItemTexture sheet, per-quality atlas,
+    -- driven by Items._applyNewCue below (1.x frames/inventory/item.lua:97-107) — a native
+    -- region, not addon art, so there is nothing to declare here either. art/dot-mask.tga
+    -- stays on disk (Items.TEX_DOT_MASK) for any future pip, but no caller asks for one.
     return nil
+end
+
+----------------------------------------------------------------------
+-- NEW-ITEM ATLAS — 1.x frames/inventory/item.lua:103, verbatim:
+--     self.NewItemTexture:SetAtlas(self.info.quality
+--         and NEW_ITEM_ATLAS_BY_QUALITY[self.info.quality] or 'bags-glow-white')
+-- so the LIVE FrameXML table is authoritative and 'bags-glow-white' is the fallback for
+-- every quality it does not name (Poor and Common included). The static table below is
+-- reached ONLY when the global is absent — i.e. headless — so the pure layer is
+-- deterministic under test without ever overruling the client. Same discipline as
+-- Borders.QualityRGB's injected provider + FALLBACK pair.
+----------------------------------------------------------------------
+Items.NEW_ITEM_ATLAS_DEFAULT = "bags-glow-white"
+Items.NEW_ITEM_ATLAS = {          -- Blizzard's NEW_ITEM_ATLAS_BY_QUALITY, headless mirror
+    [2] = "bags-glow-green",      -- Uncommon
+    [3] = "bags-glow-blue",       -- Rare
+    [4] = "bags-glow-purple",     -- Epic
+    [5] = "bags-glow-orange",     -- Legendary
+    [6] = "bags-glow-artifact",   -- Artifact
+    [7] = "bags-glow-artifact",   -- Heirloom
+}
+
+-- PURE: the atlas name for a quality. `atlasTable` is injected (live: the FrameXML global).
+function Items.NewItemAtlas(quality, atlasTable)
+    local t = atlasTable
+    if t == nil then t = _G.NEW_ITEM_ATLAS_BY_QUALITY end
+    if type(t) ~= "table" then t = Items.NEW_ITEM_ATLAS end
+    return (quality ~= nil and t[quality]) or Items.NEW_ITEM_ATLAS_DEFAULT
 end
 
 -- Human labels per container class for the split-view bag header (fallback when the
@@ -561,10 +586,11 @@ end
 -- edge; redBorder is therefore suppressed on a quest cell so the two never fight.
 --   ctx = { quality=<n|nil>, dimmed=<bool>, isNew=<bool>, isQuest=<bool>,
 --           isQuestStarter=<bool>, isUnusable=<bool>, isSet=<bool> }
--- returns { icon, iconDesat, redBorder, questBorder, setBorder, newBorder, junkCoin,
---           unusableTint, showNewDot, showQuestTab, showSetMark, dressAlpha }.
--- `showSetMark` and `showNewDot` are retained at `false` for back-compat readers; those two
--- cues are now `setBorder` and `newBorder` — branches of the ONE glow chain, per 1.x.
+-- returns { icon, iconDesat, redBorder, questBorder, setBorder, junkCoin, unusableTint,
+--           showNewGlow, showQuestTab, dressAlpha, … }.
+-- `showSetMark`, `showNewDot` and `newBorder` are retained at `false` for back-compat
+-- readers: the set cue is `setBorder` (a branch of the ONE glow chain, per 1.x) and the
+-- new-item cue is `showNewGlow` (the template's own sheet, per 1.x — NOT a glow branch).
 function Items.ResolveState(ctx)
     ctx = ctx or {}
     local dimmed = ctx.dimmed and true or false
@@ -598,12 +624,15 @@ function Items.ResolveState(ctx)
         -- 1.x's nil-valued cached info does.
         junkCoin     = (ctx.quality == 0 and not ctx.hasNoValue and not dimmed) and true or false,
         unusableTint = false,                    -- retired (1.x kept the icon full-color)
-        -- 2.0 new-item cue: a CRIMSON BRANCH of the glow chain plus a slow pulse, below
-        -- the three item-facts above and above rarity. Replaces the corner wax dot for the
-        -- same reason the set pip went: 1.x draws one cue per cell, and it is a branch.
-        newBorder    = (ctx.isNew and not dimmed and not questBorder and not redBorder
-                        and not (set and not dimmed)) and true or false,
-        showNewDot   = false,                    -- retired: the new cue is newBorder
+        -- NEW-ITEM (1.x frames/inventory/item.lua:97-107): the TEMPLATE's NewItemTexture
+        -- sheet, per-quality atlas, with the template's own newitemglowAnim + flashAnim.
+        -- It is INDEPENDENT of the glow chain — 1.x's UpdateBorder has no `new` branch —
+        -- so a freshly-looted epic keeps its purple halo AND wears the sheet. Withheld on
+        -- a search-dimmed cell for the same reason the quest bang is: 2.0 recedes a
+        -- non-match by hiding its markers rather than fighting an animation's alpha.
+        showNewGlow  = (ctx.isNew and not dimmed) and true or false,
+        newBorder    = false,                    -- retired: newness is not a glow branch
+        showNewDot   = false,                    -- retired: the wax dot is gone for good
         -- 1.x reserves the bang glyph for quest STARTERS; ordinary quest items get the tint.
         showQuestTab = (starter and not dimmed) and true or false,
         showSetMark  = false,                    -- retired: the set cue is setBorder (1.x)
@@ -899,13 +928,23 @@ end
 -- have no live new/quest/usable state) — junk calm still applies via captured quality.
 ----------------------------------------------------------------------
 
--- NEW-ITEM: C_NewItems is the game's own new-item set (1.x drove glowNew from it). The
--- wax dot shows while a slot is new; MarkSeen clears it on interaction (below).
+-- NEW-ITEM: C_NewItems is the game's own new-item set (1.x drove glowNew from it, via
+-- info.isNew). The template's glow sheet shows while a slot is new; MarkSeen clears it on
+-- interaction (below).
+--
+-- The TOGGLE is applied here rather than in ResolveState, exactly as the equipment-set cue
+-- applies Items.SetCueEnabled inside slotIsSet: 1.x's own gate is `Addon.sets.glowNew and
+-- self.info.isNew` (frames/inventory/item.lua:98), one conjunction at the fact site, so
+-- switching the cue off makes every downstream reader see a slot that simply is not new.
 local function slotIsNew(button)
+    if ns.Borders and ns.Borders.NewCueEnabled and not ns.Borders.NewCueEnabled() then
+        return false
+    end
     local CN = _G.C_NewItems
     if not (CN and CN.IsNewItem and button._cid and button._slot) then return false end
     return CN.IsNewItem(button._cid, button._slot) and true or false
 end
+Items._slotIsNew = slotIsNew
 
 -- QUEST: container quest info, split into the two 1.x cues. Returns `isQuest, isStarter`
 -- (see Items.QuestFlags for the exact 1.x rule): every quest item takes the gold border,
@@ -1040,16 +1079,118 @@ local function slotIsSet(button)
     return (ok and named) and true or false
 end
 
--- Clear the new-item mark on interaction (1.x MarkSeen fact: RemoveNewItem on seen).
--- Wired as an insecure OnEnter post-hook on live buttons (hover-to-clear) so the secure
--- click path is never touched. RemoveNewItem is not a protected op.
+----------------------------------------------------------------------
+-- THE NEW-ITEM CUE — 1.x's own, restored (frames/inventory/item.lua:97-107)
+--
+-- WHAT 1.x DRAWS. Blizzard's template ships a `NewItemTexture` sheet plus two animation
+-- groups (`newitemglowAnim`, a looping alpha pulse on that sheet, and `flashAnim`, a
+-- one-shot burst on the template's `flash` region). 1.x sets the sheet's ATLAS from the
+-- item's quality (bags-glow-green/blue/purple/orange/artifact, white for everything else)
+-- and plays both. That is the "new item" look the owner is comparing against; 2.0's
+-- crimson halo + slow breathe is what he was looking at when he said it was not.
+--
+-- WHY IT IS A REGION AND NOT A GLOW BRANCH. 1.x's UpdateBorder chain (item.lua:196-205)
+-- has four branches and none is `new`; UpdateGlow is a separate pass on a separate region.
+-- A newly-looted epic therefore glows PURPLE and carries the sheet on top. Restoring the
+-- region is what gives every rarity its colour back on exactly the items you just looted.
+--
+-- 2.0 LAYERING DISCIPLINE, three deliberate departures from 1.x's literal code:
+--   1. NewItemTexture LEAVES THE KILL LIST and becomes an OWNED region, like IconBorder
+--      and JunkIcon before it: the kill sweep no longer hides it, and every path that can
+--      resurrect template art re-asserts OUR verdict (_reassertOwnedArt). It cannot fight
+--      the quality halo — the halo is OVERLAY sublevel -1 on the button's own frame level
+--      (1.x item.lua:54) and the template's sheet is plain OVERLAY, so the sheet sorts
+--      ABOVE the halo, which is 1.x's ordering exactly.
+--   2. THE ANIMS ARE TRANSITION-DRIVEN, not replayed on every paint. 1.x calls Play() on
+--      both inside UpdateGlow, which runs on every update; ours plays the looping glow only
+--      when it is not already playing and fires the one-shot flash only on the false->true
+--      edge. A repaint (and 2.0 repaints far more often than 1.x — the live-sort sweep
+--      below runs at ~8 Hz) must never re-strobe a cell that was already new.
+--   3. A SEARCH-DIMMED cell hides the sheet instead of receding it. Our dim cascade scales
+--      per-region alpha, and newitemglowAnim OWNS this region's alpha; the two would fight
+--      every frame. ResolveState.showNewGlow already withholds the cue when dimmed, which
+--      is the same rule the quest bang has always followed.
+--
+-- BATTLEPAY IS DELIBERATELY STILL KILLED. 1.x drives BattlepayItemTexture from
+-- `info.isPaid` (item.lua:99), a retail cash-shop field: Classic Era has no such items and
+-- our capture has no such field, so the branch is provably dead here. Leaving the region in
+-- the kill list keeps the "no stray template art" posture with zero behavioural difference.
+--
+-- SECURE / TAINT: SetAtlas / SetAlpha / Show / Hide on a CHILD region, and Play/Stop on
+-- animation groups that belong to it. No protected op on the secure button — safe on every
+-- repaint, in combat, and inside the SetItemButton* post-hooks.
+----------------------------------------------------------------------
+
+local function newItemRegion(button)
+    if not button then return nil end
+    if button.NewItemTexture ~= nil then return button.NewItemTexture end
+    local name = button.GetName and button:GetName()
+    if name and _G then return _G[name .. "NewItemTexture"] end
+    return nil
+end
+Items._newItemRegion = newItemRegion
+
+-- Show/hide the cue on one button. `quality` picks the atlas (1.x item.lua:103).
+-- Idempotent; safe on a button whose template has neither the region nor the anims.
+--
+-- THE OFF PATH IS STATE-DRIVEN, NOT FLAG-DRIVEN, and deliberately so. An "already off?"
+-- shortcut on `_dsNewCue` would be wrong on exactly the path that matters: the template can
+-- re-show this region behind our back (SetItemButtonQuality / the template's own OnShow),
+-- and _reassertOwnedArt's whole job is to undo that. So OFF asks the WIDGET whether there
+-- is anything to undo — IsPlaying / IsShown / GetAlpha, all cheap — and only then writes.
+-- On a settled grid that is a few reads per cell, which is what lets the live-sort sweep
+-- repaint the whole visible grid several times a second.
+function Items._applyNewCue(button, show, quality)
+    if not button then return false end
+    local tex   = newItemRegion(button)
+    local glow  = button.newitemglowAnim
+    local flash = button.flashAnim
+    if show then
+        local first = not button._dsNewCue
+        button._dsNewCue = true
+        if tex then
+            if tex.SetAtlas then tex:SetAtlas(Items.NewItemAtlas(quality)) end
+            if tex.SetAlpha then tex:SetAlpha(1) end
+            if tex.Show then tex:Show() end
+        end
+        -- looping pulse: start it only if it is not already running (no per-paint hitch)
+        if glow and glow.Play and not (glow.IsPlaying and glow:IsPlaying()) then
+            pcall(glow.Play, glow)
+        end
+        -- one-shot burst: only on the edge into "new"
+        if first and flash and flash.Play then pcall(flash.Play, flash) end
+        return true
+    end
+    button._dsNewCue = false
+    if glow  and glow.Stop  and (glow.IsPlaying  == nil or glow:IsPlaying())  then glow:Stop()  end
+    if flash and flash.Stop and (flash.IsPlaying == nil or flash:IsPlaying()) then flash:Stop() end
+    if tex then
+        -- Stop() leaves whatever alpha the animation last wrote, so park it explicitly —
+        -- but only when it is not already parked (this is the per-paint hot path).
+        local live = (tex.IsShown == nil) or tex:IsShown()
+            or (tex.GetAlpha and (tex:GetAlpha() or 0) ~= 0)
+        if live then
+            if tex.SetAlpha then tex:SetAlpha(0) end
+            if tex.Hide then tex:Hide() end
+        end
+    end
+    return false
+end
+
+-- Clear the new-item mark on interaction (1.x MarkSeen: RemoveNewItem, then re-run the
+-- glow pass — frames/inventory/item.lua:112-117). Wired as an insecure OnEnter post-hook
+-- on live buttons (hover-to-clear) so the secure click path is never touched.
+-- RemoveNewItem is not a protected op.
 function Items.MarkSeen(button)
     if not button._live then return end
     local CN = _G.C_NewItems
     if CN and CN.RemoveNewItem and button._cid and button._slot then
         CN.RemoveNewItem(button._cid, button._slot)
     end
-    if button._dsNewDot then button._dsNewDot:Hide() end
+    -- 1.x sets info.isNew = false and calls UpdateGlow; ours does the same two things, so
+    -- the cue goes off on hover without waiting for a repaint to re-ask C_NewItems.
+    button._isNew = false
+    Items._applyNewCue(button, false, button._quality)
 end
 
 -- Apply a resolved STATE spec to a button's dress. Operates ONLY on child textures/
@@ -1093,9 +1234,10 @@ function Items._applyDress(button, spec)
     -- an addon-owned region the kill sweep can't reach)
     if button._dsNativeQuest then button._dsNativeQuest:Hide() end
 
-    -- NEW-ITEM: no corner element any more. The cue is the crimson glow branch + pulse that
-    -- Borders.Apply already painted from the same `isNew` fact, and it recedes with the dim
-    -- through the Borders.SetAlpha cascade above like every other part of the halo.
+    -- NEW-ITEM: the template's own glow sheet, per 1.x (see THE NEW-ITEM CUE banner). The
+    -- quality drives the atlas; `showNewGlow` is already false on a dimmed cell, so the
+    -- animation and the dim cascade never fight over this region's alpha.
+    Items._applyNewCue(button, spec.showNewGlow, button._quality)
 
     -- QUEST bang glyph
     local tab = button._dsQuestTab
@@ -1125,7 +1267,12 @@ local function applyDressState(button)
     local hasItem = button._data and button._data.id ~= nil
     local isNew, isQuest, isStarter, isUnusable, isSet = false, false, false, false, false
     if hasItem and live then
-        isNew      = slotIsNew(button)
+        -- Same reuse rule as the three verdicts below: paintButton has already asked
+        -- C_NewItems for this cell, and MarkSeen writes `false` through on hover, so a
+        -- second query per dress would be both redundant and (on the live-sort sweep) 88
+        -- extra API calls a pass. Only a standalone dress (SetDimmed on a never-painted
+        -- button) falls through to the live read.
+        if button._isNew ~= nil then isNew = button._isNew else isNew = slotIsNew(button) end
         if button._isSet ~= nil then isSet = button._isSet else isSet = slotIsSet(button) end
         -- reuse the verdicts paintButton already computed (avoids a second proficiency/level
         -- scan and a second quest query); recompute only if this path ran standalone.
@@ -1421,6 +1568,103 @@ function Items.RefreshCooldowns()
     return n
 end
 
+-- =====================================================================
+-- BAG-7 — THE LIVE-SLOT REPAINT SWEEP  ("sorting doesn't update until it finishes")
+--
+-- OWNER REPORT: "when sorting bags the icon locations dont update until the sort is
+-- concluded, but with bags 1 you could see the sort happening live. is there a bag render
+-- delay?"
+--
+-- THERE IS NO RENDER DELAY. The window freezes because the sort DELIBERATELY MUTES CAPTURE:
+-- sort.lua's beginQuiet swaps Capture.RequestCapture for a dirty-flag stub for the duration
+-- of a run (a sort fires dozens of lock events per wave, and a full container re-scan per
+-- burst was measurably slowing the sort down). Every repaint in 2.0 rides a capture —
+-- BAG_UPDATE -> RequestCapture -> BAGS_CAPTURED -> Frame.RequestRefresh -> Rebuild — and
+-- Rebuild paints from the STORE. With capture muted the store is frozen, so the ~5 Hz
+-- heartbeat sort.lua already ran was faithfully repainting the same frozen picture for the
+-- whole sort. 1.x had no capture layer at all: its item groups repainted straight off the
+-- raw bag events, which is why its sort was visible.
+--
+-- THE FIX IS A SECOND, MUCH CHEAPER PATH that does not go through capture at all. For every
+-- LIVE, SHOWN cell, read that cell's OWN (cid, slot) from the live container API and repaint
+-- the button in place. Data only — no CreateFrame, no SetParent, no SetPoint, no SetSize, no
+-- Show/Hide, no relayout — the same discipline as the in-combat repaintGroup path.
+--
+-- THE INVARIANT THAT MAKES THIS SAFE (state it, then gate it):
+--   THE CAPTURED SNAPSHOT IS NEVER TOUCHED HERE. This sweep writes only to a scratch table
+--   the BUTTON owns (button._dsLiveData). It never mutates a store slot record, never calls
+--   Capture.*, and never writes Store. Mesh consumers, the Find window, alt summaries and
+--   Nexus therefore cannot see mid-sort churn: they still read the snapshot as it was before
+--   the sort started, and the sort's own endQuiet does the one full capture + rebuild at the
+--   end exactly as it does today. The only thing that changes mid-sort is PIXELS.
+--
+-- AND THE OTHER HALF: it must not perturb the sort. It is strictly READ-ONLY against the
+-- client — GetContainerItemInfo and the paint path — so it issues no container operation, no
+-- capture request and no lock write, and the executor's settle timing is unaffected. The
+-- sort suite pins that with the simulator's own mutation counters.
+--
+-- Skips mirror RefreshCooldowns': CACHED cells (an offline owner's slot is not this
+-- character's (cid, slot)) and HIDDEN cells (nothing to show; the next paint re-reads).
+-- =====================================================================
+
+-- PURE: has this cell's visible content changed? `cur` is the button's current slot record
+-- (may be nil = empty), `id/count/quality` the live read. Count and quality both matter —
+-- a merge changes only the count, and a swap can change only the quality.
+function Items.LiveSlotChanged(cur, id, count, quality)
+    local curId = cur and cur.id or nil
+    if curId ~= id then return true end
+    if id == nil then return false end
+    if (cur.count or 1) ~= (count or 1) then return true end
+    if cur.quality ~= quality then return true end
+    return false
+end
+
+-- Apply one live container read to one button. Returns true when it repainted.
+-- `info` is a ContainerItemInfo-shaped table (or nil for an empty slot).
+function Items.ApplyLiveSlot(button, info)
+    if not button then return false end
+    local id      = (type(info) == "table") and info.itemID or nil
+    local count   = id and (info.stackCount or 1) or nil
+    local quality = id and info.quality or nil
+    local link    = id and info.hyperlink or nil
+    if not Items.LiveSlotChanged(button._data, id, count, quality) then return false end
+    if id == nil then
+        button._data = nil
+    else
+        -- NEVER write through button._data: at layout time that field holds a STORE slot
+        -- record by reference, and mutating it would edit the captured snapshot. The button
+        -- gets its own scratch record instead, allocated once and reused.
+        local rec = button._dsLiveData
+        if type(rec) ~= "table" then rec = {}; button._dsLiveData = rec end
+        rec.id, rec.count, rec.quality, rec.link = id, count, quality, link
+        button._data = rec
+    end
+    if button._dsRepaint then button:_dsRepaint() end
+    return true
+end
+
+-- The sweep. Returns `touched, changed`; both are recorded for the self-test and the
+-- sort log's readout. Costs one GetContainerItemInfo per visible live cell and a paint
+-- only for the cells that actually moved.
+function Items.LiveSlotRepaint()
+    local CC = _G.C_Container
+    if not (CC and CC.GetContainerItemInfo) then
+        Items._lastLiveSweep = { touched = 0, changed = 0 }
+        return 0, 0
+    end
+    local touched, changed = 0, 0
+    for b in pairs(Items._buttons) do
+        if b._live and b._cid and b._slot and (not b.IsShown or b:IsShown()) then
+            touched = touched + 1
+            if Items.ApplyLiveSlot(b, CC.GetContainerItemInfo(b._cid, b._slot)) then
+                changed = changed + 1
+            end
+        end
+    end
+    Items._lastLiveSweep = { touched = touched, changed = changed }
+    return touched, changed
+end
+
 -- CELL PARITY: the stack-count numeral is the TEMPLATE's, untouched — 1.x never restyles
 -- it (core/classes/item.lua:168 is a bare `SetItemButtonCount(self, stackCount)` and there
 -- is no font/colour/anchor call anywhere in the file). The previous round re-fonted it to
@@ -1462,10 +1706,6 @@ end
 --   NormalTexture      UI-Quickslot2 bluish-lavender ring — empty-cell blue glow (defect #1)
 --                      + filled-cell blue-purple rim (defect #2). Killed + SetNormalTexture(nil).
 --                      This is the one region 1.x also kills (item.lua:51-52).
---   NewItemTexture     the "new loot" flash sheet (blue/gold burst) — our crimson wax dot replaces it.
---                      1.x kills this one too (item.lua:49).
---   flashAnim /        AnimationGroups that PULSE NewItemTexture's alpha back up — stopped, or
---   newitemglowAnim    the sheet we just hid re-animates itself bright next frame.
 --   BattlepayItemTexture  cash-shop swirl — irrelevant in Classic bags, hidden for safety.
 --                      1.x kills this one too (item.lua:48).
 --   UpgradeIcon        green upgrade arrow (may be absent in Classic) — off; we don't upsell.
@@ -1478,8 +1718,8 @@ end
 --   Cooldown edge/bling  the cooldown swipe's bright edge ring + finish flash — quieted
 --                      (SetDrawEdge/SetDrawBling false); the dark swipe itself stays (ours).
 --
--- CELL PARITY — TWO REGIONS LEFT THE KILL LIST, because 1.x DRIVES them rather than killing
--- them, and both are load-bearing for the look the owner is comparing against:
+-- CELL PARITY — THREE REGIONS LEFT THE KILL LIST, because 1.x DRIVES them rather than
+-- killing them, and all three are load-bearing for the look the owner is comparing against:
 --   IconBorder   1.x re-tints it to the glow colour and shows it on exactly the glowing
 --                cells (item.lua:194/210/220). It is the crisp ring that anchors the soft
 --                67px wash to its own cell; without it the halo reads as an unanchored
@@ -1490,9 +1730,15 @@ end
 --                keeps the icon in FULL COLOUR. 2.0 used to kill the coin and greyscale the
 --                icon instead — a third of a Classic bag rendered in greyscale, which is the
 --                "hard to view" half of the owner's report. Owned by Items._applyDress.
--- Both are still SWEPT on the paths that can resurrect them out of band (the OnShow hook
--- and the SetItemButton* post-hooks run the sweep, then our paint re-asserts the state), so
--- the defensive posture is unchanged for every region that is genuinely not ours.
+--   NewItemTexture  and its two AnimationGroups (newitemglowAnim / flashAnim). The kill
+--                list used to cite "1.x kills this one too (item.lua:49)" — that citation
+--                was WRONG: :49 is the base class's initial hide, and the BAG SUBCLASS
+--                re-shows the sheet with a per-quality atlas and plays both anims on every
+--                update (frames/inventory/item.lua:97-107). It is 1.x's whole new-item
+--                indicator. Owned by Items._applyNewCue; see THE NEW-ITEM CUE banner.
+-- All three are still SWEPT on the paths that can resurrect them out of band (the OnShow
+-- hook and the SetItemButton* post-hooks run the sweep, then our paint re-asserts the
+-- state), so the defensive posture is unchanged for every region that is genuinely not ours.
 --
 -- SECURE / TAINT: every op here is a texture/animation op on a CHILD region of the button
 -- (SetTexture / SetAlpha / Hide / anim:Stop / Cooldown:SetDrawEdge). NONE is a protected op
@@ -1521,12 +1767,8 @@ local function hideRegion(button, tex, key)
     button._dsArt[key] = tex
 end
 
--- Stop a pulsing AnimationGroup (the glow motors) so a hidden sheet cannot re-animate bright.
-local function stopAnim(ag)
-    if not ag then return end
-    if ag.Stop   then ag:Stop()   end
-    if ag.Finish then pcall(ag.Finish, ag) end
-end
+-- (The AnimationGroup stopper that used to live here is gone with the NewItemTexture kill:
+-- the two new-item motors are OWNED now and Items._applyNewCue stops them.)
 
 -- THE exhaustive kill sweep. Idempotent; safe on any button shape (accessor OR $parent OR
 -- neither). Returns the NormalTexture (back-compat with callers/tests).
@@ -1543,11 +1785,12 @@ function Items._killTemplateArt(button)
     if button.SetNormalTexture then pcall(button.SetNormalTexture, button, nil) end
     button._dsSlotArtHidden = nt   -- back-compat marker
 
-    -- CELL PARITY: IconBorder and JunkIcon are NOT killed any more — 1.x drives both (see
-    -- the block above). They are owned by borders.SetIconBorder / Items._applyDress, which
-    -- re-assert their state on every paint and on every resurrection path.
+    -- CELL PARITY: IconBorder, JunkIcon and NewItemTexture are NOT killed any more — 1.x
+    -- drives all three (see the block above). They are owned by borders.SetIconBorder /
+    -- Items._applyDress / Items._applyNewCue, which re-assert their state on every paint
+    -- and on every resurrection path. The two new-item AnimationGroups are owned with the
+    -- sheet, so the sweep no longer stops them either.
 
-    hideRegion(button, region(button, "NewItemTexture",        "NewItemTexture"),        "newItem")
     hideRegion(button, region(button, "BattlepayItemTexture",  "BattlepayItemTexture"),  "battlepay")
     hideRegion(button, region(button, "UpgradeIcon",           "UpgradeIcon"),           "upgrade")
     hideRegion(button, region(button, "IconOverlay",           "IconOverlay"),           "iconOverlay")
@@ -1556,10 +1799,6 @@ function Items._killTemplateArt(button)
     hideRegion(button, region(button, "IconQuestTexture",      "IconQuestTexture"),      "quest")
     hideRegion(button, region(button, "Stock",                 "Stock"),                 "stock")
     button._dsNativeQuest = button._dsArt and button._dsArt.quest   -- back-compat marker
-
-    -- Stop the new-item glow motors (they pulse NewItemTexture's alpha).
-    stopAnim(button.flashAnim)
-    stopAnim(button.newitemglowAnim)
 
     -- Quiet the cooldown swipe's bright edge ring + finish flash; keep the dark swipe (ours).
     local cd = button.Cooldown or button.cooldown
@@ -1584,8 +1823,11 @@ function Items._reassertOwnedArt(button)
     if not (button and button._dsDressed) then return end
     if ns.Borders and ns.Borders.Apply then
         ns.Borders.Apply(button, button._quality, button._unusable,
-            button._questItem, button._isSet, button._isNew)
+            button._questItem, button._isSet)
     end
+    -- The new-item sheet is owned too, and follows the same cached verdict the dress does.
+    Items._applyNewCue(button,
+        (button._isNew and not button._dimmed) and true or false, button._quality)
     local junk = button.JunkIcon
         or (button.GetName and _G and _G[(button:GetName() or "") .. "JunkIcon"])
     if junk then
@@ -1807,10 +2049,12 @@ local function ensureDress(button)
 
     local sz = button:GetWidth() or Items.DEFAULT_SIZE
 
-    -- CELL PARITY: NO new-item corner pip. The crimson wax dot that used to be created here
-    -- is retired; the cue is now a branch of the ONE glow chain plus a slow pulse
-    -- (Borders.NewRGB / Borders.PULSE_*), which is 1.x's model — one cue per cell — applied
-    -- to a fact 1.x itself had no cue for at all. See borders.lua's NEW-ITEM ARCHAEOLOGY.
+    -- CELL PARITY: NO new-item corner pip and no addon-owned new-item art at all. The cue
+    -- is the TEMPLATE's own NewItemTexture sheet + its two animation groups, which is what
+    -- 1.x draws (frames/inventory/item.lua:97-107). Nothing to CREATE here — the region
+    -- already exists on the button — but it is parked once here so its state is ours from
+    -- the first frame, exactly as 1.x parks it at Construct (item.lua:48-49).
+    Items._applyNewCue(button, false, nil)
 
     -- QUEST bang glyph, over the cell — the real 1.x marker (item.lua:47 paints the
     -- template's IconQuestTexture with TEXTURE_ITEM_QUEST_BANG). Ours is an addon-owned
@@ -1855,8 +2099,10 @@ local function paintButton(button)
         button._hasNoValue = nil
         button._unusable, button._isSet = false, false
         -- Clear the cached quest verdicts with the slot, so a recycled button can never
-        -- carry a stale bang/gold tint from the item that used to sit here.
+        -- carry a stale bang/gold tint from the item that used to sit here — and the same
+        -- for newness, or an emptied slot would keep glowing "new" from its last occupant.
         button._questItem, button._questStarter = false, false
+        button._isNew = false
         applyDressState(button)   -- icon alpha/desat, hides markers + junk coin, cascades alpha
         -- An EMPTY cell still carries its lock: the lock belongs to the SLOT, and an
         -- empty locked slot is exactly the case the sort planner must refuse to fill.
@@ -1879,14 +2125,15 @@ local function paintButton(button)
         pcall(_G.SetItemButtonQuality, button, quality, data.link or data.id, false, false)
     end
 
-    -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > SET teal > NEW crimson
-    -- > quality edge. A quest item (starter or objective) draws the gold tint — 1.x's first
-    -- branch. An UNUSABLE (class-can't-equip / below-level) item draws the red. A saved-set
-    -- member draws the teal. A recently-acquired item draws the crimson AND breathes (2.0's
-    -- new-item cue, which replaced the corner wax dot — see borders.lua's NEW-ITEM
-    -- ARCHAEOLOGY block: 1.x had no new-item treatment at all). All are computed once here
-    -- (live only) and cached on the button so applyDressState and the re-assert path reuse
-    -- them without a second scan; the bang glyph is decided from _questStarter in ResolveState.
+    -- 1.0-PARITY border chain, top down: QUEST gold > UNUSABLE red > SET teal > quality
+    -- edge. A quest item (starter or objective) draws the gold tint — 1.x's first branch.
+    -- An UNUSABLE (class-can't-equip / below-level) item draws the red. A saved-set member
+    -- draws the teal. NEWNESS IS NOT IN THIS CHAIN (1.x item.lua:196-205 has no `new`
+    -- branch): it is the template's own glow sheet, applied by _applyDress -> _applyNewCue,
+    -- so a freshly-looted epic keeps its purple halo and wears the sheet over it. All the
+    -- facts are computed once here (live only) and cached on the button so applyDressState
+    -- and the re-assert path reuse them without a second scan; the bang glyph is decided
+    -- from _questStarter in ResolveState.
     local isQuest, isStarter = false, false
     if button._live then isQuest, isStarter = slotQuestFlags(button) end
     button._questItem, button._questStarter = isQuest, isStarter
@@ -1897,7 +2144,7 @@ local function paintButton(button)
     local isNew = (button._live and slotIsNew(button)) or false
     button._isNew = isNew
     button._hasNoValue = slotHasNoValue(button)
-    if ns.Borders then ns.Borders.Apply(button, quality, unusable, isQuest, isSet, isNew) end
+    if ns.Borders then ns.Borders.Apply(button, quality, unusable, isQuest, isSet) end
     button._quality = quality
 
     -- FILLED: the icon IS the cell (1.x). No card, no ring by default; the ONLY thing that
@@ -2139,8 +2386,10 @@ function Items.CreateButton(parent, opts)
 
     -- DEFENSIVE re-kill (layer 2b): the template's OWN OnShow re-applies art every time the
     -- button is shown (relayout / pool reuse). A non-secure OnShow post-hook re-sweeps AFTER
-    -- it, so no resurrected NormalTexture/NewItemTexture ever survives a Show. Never touches
-    -- the secure click path (HookScript adds an insecure post-hook; body is texture-only).
+    -- it, so no resurrected NormalTexture ever survives a Show, and _reassertOwnedArt puts
+    -- our verdict back on the three regions we own (IconBorder / JunkIcon / NewItemTexture).
+    -- Never touches the secure click path (HookScript adds an insecure post-hook; the body
+    -- is texture-only).
     if button.HookScript then
         button:HookScript("OnShow", function(self)
             Items._killTemplateArt(self); Items._reassertOwnedArt(self)
@@ -2155,8 +2404,9 @@ function Items.CreateButton(parent, opts)
         if _G.SetItemButtonTexture then _G.SetItemButtonTexture(self, nil) end
         if _G.SetItemButtonCount then _G.SetItemButtonCount(self, 0) end
         self._unusable, self._isSet, self._hasNoValue = false, false, nil
+        self._isNew = false
         if ns.Borders then ns.Borders.Apply(self, nil) end
-        if self._dsNewDot then self._dsNewDot:Hide() end
+        Items._applyNewCue(self, false, nil)
         if self._dsQuestTab then self._dsQuestTab:Hide() end
         -- A cleared button no longer stands for any slot, so its lock affordance must
         -- go with it (the catcher especially: it must never outlive its (cid, slot)).
@@ -2662,26 +2912,53 @@ local function testStatePrecedence(fails)
     local nq = Items.ResolveState({ quality = 1 })
     ck(nq.questBorder == false and nq.showQuestTab == false, "non-quest item -> no gold, no bang")
 
-    -- new-only, quest-starter-only, set-only. NEW is a BORDER branch now, never a pip.
+    -- new-only, quest-starter-only, set-only. NEW is the TEMPLATE'S OWN GLOW SHEET now
+    -- (1.x frames/inventory/item.lua:97-107) — neither a pip nor a border branch.
     local n = Items.ResolveState({ quality = 2, isNew = true })
-    ck(n.newBorder == true and n.showNewDot == false and n.showQuestTab == false
-        and n.icon == "normal", "new-only -> the crimson border, no pip, clean icon")
+    ck(n.showNewGlow == true and n.newBorder == false and n.showNewDot == false
+        and n.showQuestTab == false and n.icon == "normal",
+        "new-only -> the template glow sheet, no pip, no border branch, clean icon")
     local q = Items.ResolveState({ quality = 2, isQuestStarter = true })
-    ck(q.showQuestTab == true and q.showNewDot == false, "quest-starter-only marker")
+    ck(q.showQuestTab == true and q.showNewGlow == false, "quest-starter-only marker")
     local st = Items.ResolveState({ quality = 2, isSet = true })
-    ck(st.setBorder == true and st.showNewDot == false and st.showQuestTab == false
+    ck(st.setBorder == true and st.showNewGlow == false and st.showQuestTab == false
         and st.icon == "normal", "set-only -> the teal border, no pip, clean icon")
 
-    -- NEW-ITEM BRANCH PRECEDENCE inside ResolveState: new yields to all three item-facts,
-    -- so a cell never claims two border branches at once.
+    -- BAG-7 / 1.x PARITY: newness is INDEPENDENT of the glow chain. 1.x's UpdateBorder has
+    -- four branches and none of them is `new`, so a new item keeps whichever border its own
+    -- facts earned AND wears the sheet — it never displaces the quest gold, the unusable
+    -- red, the set teal or its own rarity colour. This is the row the crimson branch broke.
     local nq = Items.ResolveState({ quality = 2, isNew = true, isQuest = true })
-    ck(nq.questBorder == true and nq.newBorder == false, "new yields to the quest gold")
+    ck(nq.questBorder == true and nq.showNewGlow == true,
+        "a NEW quest item keeps the quest gold AND shows the sheet")
     local nu = Items.ResolveState({ quality = 2, isNew = true, isUnusable = true })
-    ck(nu.redBorder == true and nu.newBorder == false, "new yields to the unusable red")
+    ck(nu.redBorder == true and nu.showNewGlow == true,
+        "a NEW unusable item keeps the unusable red AND shows the sheet")
     local nset = Items.ResolveState({ quality = 2, isNew = true, isSet = true })
-    ck(nset.setBorder == true and nset.newBorder == false, "new yields to the set teal")
+    ck(nset.setBorder == true and nset.showNewGlow == true,
+        "a NEW set member keeps the set teal AND shows the sheet")
+    for _, qy in ipairs({ 0, 1, 2, 3, 4, 5 }) do
+        ck(Items.ResolveState({ quality = qy, isNew = true }).newBorder == false,
+            "no quality can turn newness back into a border branch (q=" .. qy .. ")")
+    end
     local nd = Items.ResolveState({ quality = 2, isNew = true, dimmed = true })
-    ck(nd.newBorder == false, "a search-dimmed cell drops the new cue with everything else")
+    ck(nd.showNewGlow == false and nd.newBorder == false,
+        "a search-dimmed cell drops the new cue with every other marker")
+
+    -- THE ATLAS (1.x item.lua:103). The LIVE FrameXML table wins; 'bags-glow-white' is the
+    -- fallback for every quality it does not name, and our static mirror is reached only
+    -- when the global is absent.
+    ck(Items.NewItemAtlas(4) == "bags-glow-purple", "epic -> bags-glow-purple")
+    ck(Items.NewItemAtlas(2) == "bags-glow-green",  "uncommon -> bags-glow-green")
+    ck(Items.NewItemAtlas(3) == "bags-glow-blue",   "rare -> bags-glow-blue")
+    ck(Items.NewItemAtlas(5) == "bags-glow-orange", "legendary -> bags-glow-orange")
+    ck(Items.NewItemAtlas(1) == "bags-glow-white",  "common -> the white default (1.x `or`)")
+    ck(Items.NewItemAtlas(0) == "bags-glow-white",  "poor -> the white default")
+    ck(Items.NewItemAtlas(nil) == "bags-glow-white", "unknown quality -> the white default")
+    ck(Items.NewItemAtlas(3, { [3] = "client-blue" }) == "client-blue",
+        "an injected (live) atlas table overrules our static mirror")
+    ck(Items.NewItemAtlas(6, { [3] = "client-blue" }) == "bags-glow-white",
+        "…and a quality the live table omits falls back to white, never to the mirror")
 end
 
 -- 1.x QUEST RULE (Items.QuestFlags): the exact field mechanism that separates a quest
@@ -2723,9 +3000,9 @@ end
 -- count numeral + quest tab together (the C condition-4 bug fix). Uses a fake button (no
 -- CreateFrame needed) so the wiring itself is asserted headless.
 --
--- The NEW-ITEM cue is deliberately absent from this list now: it is a branch of the glow
--- chain, so it recedes through the `_dsBagsBorder` container alpha asserted below rather
--- than through an element of its own. A stale `_dsNewDot` is still fed in to prove the
+-- The NEW-ITEM cue joins this list as the template's own NewItemTexture sheet: a dimmed
+-- cell HIDES it (rather than receding it) because newitemglowAnim owns that region's alpha
+-- and the two would fight every frame. A stale `_dsNewDot` is still fed in to prove the
 -- retired pip is never resurrected by a dress.
 local function testDimCascade(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -2735,10 +3012,18 @@ local function testDimCascade(fails)
         function r:SetAlpha(a) self.alpha = a end
         function r:SetDesaturated(d) self.desat = d end
         function r:SetVertexColor() end
+        function r:SetAtlas(a) self.atlas = a end
         function r:IsShown() return self.shown end
         function r:Show() self.shown = true end
         function r:Hide() self.shown = false end
         return r
+    end
+    local function animRecorder()
+        local a = { playing = false, plays = 0, stops = 0 }
+        function a:Play() self.playing = true; self.plays = self.plays + 1 end
+        function a:Stop() self.playing = false; self.stops = self.stops + 1 end
+        function a:IsPlaying() return self.playing end
+        return a
     end
 
     -- a fake button carrying every dress layer
@@ -2747,22 +3032,50 @@ local function testDimCascade(fails)
     local count  = recorder()
     local dot    = recorder(); dot.shown = true   -- currently shown (new)
     local tab    = recorder(); tab.shown = true
+    local sheet  = recorder(); sheet.shown = true
+    local glowAn, flashAn = animRecorder(), animRecorder()
     local btn = {
         icon = icon, _dsBagsBorder = border, _dsCount = count,
         _dsNewDot = dot, _dsQuestTab = tab,
+        NewItemTexture = sheet, newitemglowAnim = glowAn, flashAnim = flashAn,
+        _quality = 4,
     }
 
-    -- DIMMED spec: everything must land at 0.25 and markers hide
+    -- DIMMED spec: everything must land at 0.3 and markers hide
     Items._applyDress(btn, Items.ResolveState({ quality = 4, isNew = true, isQuest = true, dimmed = true }))
     ck(icon.alpha == 0.3,   "cascade: icon dimmed to 0.3")
     ck(border.alpha == 0.3, "cascade: quality edge dimmed to 0.3")
     ck(count.alpha == 0.3,  "cascade: count numeral dimmed to 0.3")
     ck(icon.desat == true,   "cascade: icon desaturated while dimmed")
     ck(tab.shown == false,   "cascade: quest tab hidden while dimmed")
-    -- The retired wax dot is never touched by a dress any more; the halo carries the cue
-    -- and it is already receding via `border.alpha` above.
-    ck(Items.ResolveState({ quality = 4, isNew = true, dimmed = true }).newBorder == false,
-        "cascade: the new-item glow branch is dropped while dimmed")
+    ck(sheet.shown == false and sheet.alpha == 0,
+        "cascade: the new-item sheet is HIDDEN while dimmed (never alpha-fought)")
+    ck(glowAn.playing == false and flashAn.playing == false,
+        "cascade: …and both new-item motors are stopped with it")
+    ck(Items.ResolveState({ quality = 4, isNew = true, dimmed = true }).showNewGlow == false,
+        "cascade: the new-item cue is dropped while dimmed")
+
+    -- UNDIMMED + new: the sheet takes the quality atlas, the loop starts, the burst fires
+    -- ONCE, and a second dress on an already-new cell must not re-strobe it.
+    Items._applyDress(btn, Items.ResolveState({ quality = 4, isNew = true }))
+    ck(sheet.shown == true and sheet.alpha == 1, "new + undimmed -> the sheet is shown")
+    ck(sheet.atlas == "bags-glow-purple", "…at the EPIC atlas (1.x item.lua:103)")
+    ck(glowAn.playing == true and glowAn.plays == 1, "…the looping glow started")
+    ck(flashAn.plays == 1, "…and the one-shot burst fired once")
+    Items._applyDress(btn, Items.ResolveState({ quality = 4, isNew = true }))
+    ck(glowAn.plays == 1 and flashAn.plays == 1,
+        "a repaint on an already-new cell re-plays NEITHER motor (no per-paint strobe)")
+    -- and it goes away cleanly when the slot stops being new
+    Items._applyDress(btn, Items.ResolveState({ quality = 4 }))
+    ck(sheet.shown == false and sheet.alpha == 0 and glowAn.playing == false,
+        "no longer new -> sheet hidden, motors stopped")
+
+    -- MarkSeen (1.x's hover clear) takes the cue off without waiting for a repaint.
+    btn._live, btn._isNew = true, true
+    Items._applyNewCue(btn, true, 4)
+    Items.MarkSeen(btn)
+    ck(sheet.shown == false and btn._isNew == false,
+        "MarkSeen clears the new-item sheet on hover (1.x item.lua:112-117)")
 
     -- UNDIMMED normal: dress alpha restored to 1.0, no desat
     local icon2, border2, count2 = recorder(), recorder(), recorder()
@@ -2847,6 +3160,11 @@ end
 -- would run, and asserts the art registry reports EVERYTHING hidden again. This is the gate
 -- the institutional lesson demands: the render is defensive by construction, not verified
 -- only at the moment of creation.
+--
+-- BAG-7 amendment: NewItemTexture and its two motors are OWNED now (1.x drives them), so
+-- they leave the kill registry and the re-assert path is what states their verdict. The
+-- rows below assert BOTH halves — the registry no longer claims the sheet, and a
+-- resurrection followed by the sweep+re-assert lands on OUR answer rather than a bare hide.
 local function testKillListResurrection(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
     local function tex()
@@ -2859,9 +3177,15 @@ local function testKillListResurrection(fails)
         function t:IsShown() return self.shown end
         return t
     end
-    local anim = { running = true }
-    function anim:Stop() self.running = false end
-    function anim:Finish() end
+    local function newAnim()
+        local a = { running = true, plays = 0 }
+        function a:Stop() self.running = false end
+        function a:Play() self.running = true; self.plays = self.plays + 1 end
+        function a:IsPlaying() return self.running end
+        function a:Finish() end
+        return a
+    end
+    local glowAnim, flashAnim = newAnim(), newAnim()
     local cd = { edge = true, bling = true }
     function cd:SetDrawEdge(v) self.edge = v end
     function cd:SetDrawBling(v) self.bling = v end
@@ -2875,44 +3199,66 @@ local function testKillListResurrection(fails)
         IconBorder = iconBorder, NewItemTexture = newItem,
         BattlepayItemTexture = battlepay, JunkIcon = junk,
         IconQuestTexture = quest, searchOverlay = search,
-        flashAnim = anim, newitemglowAnim = anim, Cooldown = cd,
+        flashAnim = flashAnim, newitemglowAnim = glowAnim, Cooldown = cd,
     }
+    btn.NewItemTexture.SetAtlas = function(self, a) self.atlas = a end
 
     Items._killTemplateArt(btn)
     ck(Items.ArtRegistryHidden(btn) == true, "after first kill: all art hidden")
-    ck(anim.running == false, "new-item glow anim stopped")
     ck(cd.edge == false and cd.bling == false, "cooldown edge + bling quieted")
-    for _, k in ipairs({ "normal", "newItem", "battlepay", "quest", "searchOverlay" }) do
+    for _, k in ipairs({ "normal", "battlepay", "quest", "searchOverlay" }) do
         ck(btn._dsArt[k] ~= nil, "kill registry enumerates " .. k)
     end
-    -- CELL PARITY: the two regions 1.x DRIVES are deliberately NOT in the registry.
-    ck(btn._dsArt.iconBorder == nil, "IconBorder is not killed (borders.lua drives it â€” 1.x)")
-    ck(btn._dsArt.junk == nil, "JunkIcon is not killed (the dress drives it â€” 1.x glowPoor)")
+    -- CELL PARITY: the three regions 1.x DRIVES are deliberately NOT in the registry.
+    ck(btn._dsArt.iconBorder == nil, "IconBorder is not killed (borders.lua drives it - 1.x)")
+    ck(btn._dsArt.junk == nil, "JunkIcon is not killed (the dress drives it - 1.x glowPoor)")
+    ck(btn._dsArt.newItem == nil,
+        "NewItemTexture is not killed either (1.x frames/inventory/item.lua:97-107 drives it)")
+    ck(glowAnim.running == true and flashAnim.running == true,
+        "…and the sweep no longer stops the two new-item motors it does not own")
 
     -- RESURRECTION: the template re-shows its art (exactly what SetItemButtonQuality / the
     -- template OnShow do after our creation-time kill).
     normal:Show(); normal.alpha = 1; normal.tex = "UI-Quickslot2"
     newItem:Show(); newItem.alpha = 1
-    anim.running = true
     ck(Items.ArtRegistryHidden(btn) == false, "resurrection is detectable (registry not all-hidden)")
 
     -- The re-kill the global hooks + paint sweep run:
     Items._killTemplateArt(btn)
     ck(Items.ArtRegistryHidden(btn) == true, "re-kill hides ALL resurrected art (defensive)")
-    ck(anim.running == false, "re-kill re-stops the glow anim")
-    ck(normal.alpha == 0 and newItem.alpha == 0,
-        "re-kill parks NormalTexture/NewItemTexture at alpha 0")
+    ck(normal.alpha == 0, "re-kill parks NormalTexture at alpha 0")
 
-    -- ...and the RE-ASSERT path puts OUR verdict back on the two owned regions. The button is
-    -- a common (quality 1) with no flags, so both must end hidden; then a rare must ring.
+    -- ...and the RE-ASSERT path puts OUR verdict back on the three owned regions. The button
+    -- is a common (quality 1) with no flags, so all three must end hidden; then a rare rings.
     btn._quality, btn._unusable, btn._questItem, btn._isSet = 1, false, false, false
+    btn._isNew, btn._dimmed = false, false
     iconBorder:Show(); iconBorder.alpha = 1; junk:Show(); junk.alpha = 1
+    newItem:Show(); newItem.alpha = 1
     Items._reassertOwnedArt(btn)
     ck(iconBorder.shown == false and junk.shown == false,
         "re-assert drops the ring + coin a common must not carry")
+    ck(newItem.shown == false and newItem.alpha == 0,
+        "re-assert drops a resurrected new-item sheet on a cell that is not new")
+    -- ...and it must do so REPEATEDLY. The cue's OFF path is state-driven precisely so a
+    -- second resurrection on an already-settled cell is still undone; a flag-based "already
+    -- off, nothing to do" shortcut would leave the sheet up here, which is the one way this
+    -- region could go rogue now that the kill sweep no longer owns it.
+    newItem:Show(); newItem.alpha = 1
+    glowAnim:Play()
+    Items._reassertOwnedArt(btn)
+    ck(newItem.shown == false and newItem.alpha == 0 and glowAnim.running == false,
+        "…and again on the NEXT resurrection of the same settled cell")
     btn._quality = 4
     Items._reassertOwnedArt(btn)
     ck(iconBorder.shown == true, "re-assert restores the ring an epic must carry")
+    -- a NEW epic: the sheet comes back with the epic atlas, and the ring/halo are untouched
+    btn._isNew = true
+    Items._reassertOwnedArt(btn)
+    ck(newItem.shown == true and newItem.atlas == "bags-glow-purple",
+        "re-assert restores the new-item sheet at the item's own quality atlas")
+    ck(iconBorder.shown == true,
+        "…and the epic keeps its rarity ring (newness is not a glow branch — 1.x)")
+    btn._isNew = false
     btn._quality, btn._hasNoValue = 0, false
     Items._reassertOwnedArt(btn)
     ck(junk.shown == true, "re-assert restores the coin a valued poor item must carry")
@@ -3297,7 +3643,7 @@ local function testMarkerArt(fails)
     -- 1.x actually draws (item.lua:39-47, TEXTURE_ITEM_QUEST_BANG on IconQuestTexture).
     ck(Items.MarkerArt("set") == nil, "set pip retired (1.x expresses sets as a teal glow)")
     ck(Items.MarkerArt("new") == nil,
-       "new-item wax dot retired (2.0 makes it a crimson glow branch + pulse)")
+       "new-item wax dot retired (1.x's cue is the template's own NewItemTexture sheet)")
     ck(Items.MarkerArt("nope") == nil, "unknown marker kind -> nil")
     -- the mask is OUR shipped stencil, addressed through the live addon folder
     ck(Items.TEX_DOT_MASK:find("art\\dot%-mask") ~= nil, "mask path points at the shipped art/dot-mask")
@@ -4097,6 +4443,233 @@ local function testBankMainTooltip(fails)
     _G.BankButtonIDToInvSlotID = savedBBID
 end
 
+----------------------------------------------------------------------
+-- NEW-ITEM LAYERING GATE (BAG-7, item 1)
+--
+-- The 1.x cue is a TEMPLATE region on the same button that already carries the quality
+-- halo, the template IconBorder, the per-cell slot border, the quest bang, the junk coin,
+-- the lock mark and the lock click-catcher. "Does not fight" is made a MECHANICAL fact
+-- here: each layer's writer must touch ONLY its own regions. A fake button carrying every
+-- layer is driven through each writer, and the regions each one wrote are compared against
+-- the set it is allowed to own.
+--
+-- The ORDERING half is a constants row: 1.x draws its halo at OVERLAY sublevel -1 on the
+-- button (item.lua:54) and the template's NewItemTexture is plain OVERLAY, so the sheet
+-- sorts above the halo — 1.x's own stacking, reproduced because we kept both in place
+-- rather than re-parenting either. The lock catcher is a FRAME ten levels above the button
+-- (ensureLockLayer), so its wash covers everything on the cell including the sheet, which
+-- is what "the grid is suspended" has to look like.
+--
+-- The BANK ACCEPT HIGHLIGHT is a non-collision by construction and is asserted as one: it
+-- is a texture on ui_bank's BAG-STRIP cells (`cell._accept`), which are not item-grid
+-- buttons at all, so no cell can ever carry both.
+----------------------------------------------------------------------
+local function testNewItemLayering(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    -- A region recorder that logs every write, so "who touched what" is observable.
+    local touched
+    local function reg(name)
+        local r = { name = name, shown = false, alpha = nil, atlas = nil }
+        local function note() touched[name] = (touched[name] or 0) + 1 end
+        function r:SetAlpha(a) self.alpha = a; note() end
+        function r:SetAtlas(a) self.atlas = a; note() end
+        function r:SetTexture(t) self.tex = t; note() end
+        function r:SetVertexColor() note() end
+        function r:SetShown(v) self.shown = v and true or false; note() end
+        function r:Show() self.shown = true; note() end
+        function r:Hide() self.shown = false; note() end
+        function r:IsShown() return self.shown end
+        function r:GetAlpha() return self.alpha end
+        return r
+    end
+    local function anim(name)
+        local a = { playing = false, plays = 0 }
+        function a:Play() self.playing = true; self.plays = self.plays + 1
+                          touched[name] = (touched[name] or 0) + 1 end
+        function a:Stop() self.playing = false; touched[name] = (touched[name] or 0) + 1 end
+        function a:IsPlaying() return self.playing end
+        return a
+    end
+
+    local sheet   = reg("newItem")
+    local glowAn  = anim("newItemGlowAnim")
+    local flashAn = anim("newItemFlashAnim")
+    local iconBd  = reg("iconBorder")
+    local junk    = reg("junk")
+    local questTb = reg("questTab")
+    local lockMk  = reg("lockMark")
+    local haloBox = reg("haloContainer")
+    local icon    = reg("icon")
+    local count   = reg("count")
+
+    local btn = {
+        _dsDressed = true, _live = true, _cid = 1, _slot = 1,
+        _quality = 4, _isNew = true, _dimmed = false,
+        _unusable = false, _questItem = false, _isSet = false, _hasNoValue = nil,
+        icon = icon, _dsCount = count,
+        NewItemTexture = sheet, newitemglowAnim = glowAn, flashAnim = flashAn,
+        IconBorder = iconBd, JunkIcon = junk,
+        _dsQuestTab = questTb, _dsLockMark = lockMk, _dsBagsBorder = haloBox,
+    }
+
+    -- WRITER 1: the new-item cue. It may touch the sheet + its two motors, nothing else.
+    touched = {}
+    Items._applyNewCue(btn, true, 4)
+    ck(sheet.shown == true and sheet.atlas == "bags-glow-purple",
+        "layering: _applyNewCue paints the sheet at the epic atlas")
+    ck((touched.newItemGlowAnim or 0) > 0 and (touched.newItemFlashAnim or 0) > 0,
+        "layering: …and drives both template motors")
+    for _, k in ipairs({ "iconBorder", "junk", "questTab", "lockMark", "haloContainer",
+                         "icon", "count" }) do
+        ck((touched[k] or 0) == 0, "layering: _applyNewCue never touches " .. k)
+    end
+
+    -- WRITER 2: the quality chain. It may touch the IconBorder + its own halo container.
+    -- Critically it must leave the SHEET alone — that is the crimson-branch regression.
+    touched = {}
+    ns.Borders.Apply(btn, 4, false, false, false)
+    ck((touched.newItem or 0) == 0 and (touched.newItemGlowAnim or 0) == 0,
+        "layering: Borders.Apply never touches the new-item sheet or its motors")
+    ck(sheet.shown == true, "layering: …so a quality repaint leaves a new cell's sheet up")
+    ck(iconBd.shown == true, "layering: …while the epic still gets its own rarity ring")
+
+    -- WRITER 3: the lock layer. Cells stay editable-free here (no Locks module in the
+    -- harness), which is exactly the "mode closed" path — and it must still not touch us.
+    touched = {}
+    Items._applyLockLayer(btn)
+    ck((touched.newItem or 0) == 0, "layering: the lock layer never touches the sheet")
+
+    -- WRITER 4: the per-cell slot border. Same rule.
+    touched = {}
+    Items._applySlotBorder(btn)
+    ck((touched.newItem or 0) == 0, "layering: the slot border never touches the sheet")
+
+    -- ORDERING constants (1.x item.lua:54 / ensureLockLayer).
+    ck(ns.Borders.GLOW_LAYER == "OVERLAY" and ns.Borders.GLOW_SUBLEVEL == -1,
+        "layering: the halo is OVERLAY(-1), so the template's OVERLAY sheet draws above it")
+    ck(Items.LOCK_WASH_ALPHA and Items.LOCK_WASH_ALPHA > 0,
+        "layering: the lock wash is a frame-level cover, above every cell region incl. the sheet")
+
+    -- The bank accept highlight cannot collide: it lives on ui_bank's strip cells.
+    ck(btn._accept == nil and (ns.Bank == nil or ns.Bank.ACCEPT_GLOW_ALPHA ~= nil),
+        "layering: the bank accept cue is a BAG-STRIP cue — no item cell carries both")
+end
+
+----------------------------------------------------------------------
+-- LIVE-SLOT REPAINT GATE (BAG-7, item 2) — the ui_items half.
+--
+-- Three things have to be true, and all three are asserted against a counting
+-- C_Container double rather than against the sort simulator (which pins the sort-side
+-- half in sort.lua):
+--   1. it REPAINTS the cells whose contents moved, and only those;
+--   2. it issues ZERO container-mutating calls, ZERO capture requests and ZERO lock writes;
+--   3. it never writes the CAPTURED SNAPSHOT. The store's slot record the cell was handed
+--      at layout time must come back byte-identical, and the button must be pointing at a
+--      scratch table of its own instead.
+----------------------------------------------------------------------
+local function testLiveSlotRepaint(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedButtons, savedCC = Items._buttons, _G.C_Container
+    Items._buttons = setmetatable({}, { __mode = "k" })
+
+    -- The world the double answers from, and a tally of every call made against it.
+    local world = {
+        ["1:1"] = { itemID = 111, stackCount = 5, quality = 2, hyperlink = "item:111" },
+        ["1:2"] = nil,
+        ["1:3"] = { itemID = 333, stackCount = 1, quality = 4, hyperlink = "item:333" },
+    }
+    local calls = { info = 0, mutate = 0 }
+    local function mut() calls.mutate = calls.mutate + 1 end
+    _G.C_Container = {
+        GetContainerItemInfo = function(cid, slot)
+            calls.info = calls.info + 1
+            return world[cid .. ":" .. slot]
+        end,
+        -- every mutating entry point the sort executor uses; touching ANY of these from a
+        -- repaint is the failure this gate exists to catch
+        PickupContainerItem = mut, SplitContainerItem = mut, UseContainerItem = mut,
+        SortBags = mut, SortBankBags = mut, SetInsertItemsLeftToRight = mut,
+    }
+
+    local painted = {}
+    local function cell(cid, slot, data)
+        local b = { _live = true, _cid = cid, _slot = slot, _data = data }
+        b.IsShown = function() return true end
+        b._dsRepaint = function(self) painted[#painted + 1] = self._cid .. ":" .. self._slot end
+        Items._buttons[b] = true
+        return b
+    end
+
+    -- The STORE record the layout handed cell (1,1). It must survive untouched.
+    local storeRec = Store.NewSlot(999, 1, 3, "item:999")
+    local snapshot = { id = storeRec.id, count = storeRec.count,
+                       quality = storeRec.quality, link = storeRec.link }
+
+    local c1 = cell(1, 1, storeRec)          -- store says 999; the client says 111 -> repaint
+    local c2 = cell(1, 2, nil)               -- empty and still empty -> no repaint
+    local c3 = cell(1, 3, { id = 333, count = 1, quality = 4, link = "item:333" })
+    local cached = { _live = false, _cid = 1, _slot = 1,
+                     IsShown = function() return true end,
+                     _dsRepaint = function() painted[#painted + 1] = "CACHED" end }
+    Items._buttons[cached] = true
+    local hidden = { _live = true, _cid = 1, _slot = 1,
+                     IsShown = function() return false end,
+                     _dsRepaint = function() painted[#painted + 1] = "HIDDEN" end }
+    Items._buttons[hidden] = true
+
+    local touchedN, changedN = Items.LiveSlotRepaint()
+    ck(touchedN == 3, "sweep touches only the LIVE, SHOWN cells (got " .. touchedN .. " of 5)")
+    ck(changedN == 1, "…and repaints only the cell whose contents actually moved")
+    ck(#painted == 1 and painted[1] == "1:1", "…which is (1,1)")
+    ck(calls.mutate == 0, "ZERO container-mutating calls from the repaint path")
+    ck(calls.info == 3, "one read per swept cell, no more")
+
+    -- THE SNAPSHOT INVARIANT.
+    ck(storeRec.id == snapshot.id and storeRec.count == snapshot.count
+        and storeRec.quality == snapshot.quality and storeRec.link == snapshot.link,
+        "the captured store record is BYTE-STABLE (the sweep never writes the snapshot)")
+    ck(c1._data ~= storeRec, "…because the cell now points at its own scratch record")
+    ck(c1._data == c1._dsLiveData and c1._data.id == 111 and c1._data.count == 5
+        and c1._data.quality == 2, "…carrying the LIVE (cid, slot) contents")
+
+    -- IDEMPOTENCE: nothing moved, so nothing repaints (this is what keeps an 8 Hz sweep
+    -- cheap during a sort — most cells are unchanged on any given bag event).
+    painted = {}
+    local _, again = Items.LiveSlotRepaint()
+    ck(again == 0 and #painted == 0, "a second sweep with no change repaints nothing")
+
+    -- ...and each individual change kind is detected: count (a merge), quality (a swap),
+    -- id (a move), and emptying.
+    ck(Items.LiveSlotChanged({ id = 1, count = 5, quality = 2 }, 1, 5, 2) == false, "no change")
+    ck(Items.LiveSlotChanged({ id = 1, count = 5, quality = 2 }, 1, 20, 2) == true, "count change (merge)")
+    ck(Items.LiveSlotChanged({ id = 1, count = 5, quality = 2 }, 1, 5, 4) == true, "quality change (swap)")
+    ck(Items.LiveSlotChanged({ id = 1, count = 5, quality = 2 }, 2, 5, 2) == true, "id change (move)")
+    ck(Items.LiveSlotChanged({ id = 1, count = 5, quality = 2 }, nil) == true, "emptied")
+    ck(Items.LiveSlotChanged(nil, nil) == false, "empty stays empty")
+    ck(Items.LiveSlotChanged(nil, 7, 1, 1) == true, "filled from empty")
+
+    -- an emptied slot drops its record entirely rather than keeping a stale scratch
+    world["1:1"] = nil
+    Items.LiveSlotRepaint()
+    ck(c1._data == nil, "an emptied slot clears the cell's record")
+
+    -- reused scratch: refilling must not allocate a second table per cell per event
+    world["1:1"] = { itemID = 55, stackCount = 2, quality = 1 }
+    Items.LiveSlotRepaint()
+    ck(c1._data == c1._dsLiveData and c1._data.id == 55,
+        "the per-cell scratch record is reused, never reallocated per event")
+
+    -- no client API at all -> a silent no-op, never an error into the sort's event handler
+    _G.C_Container = nil
+    local t0, c0 = Items.LiveSlotRepaint()
+    ck(t0 == 0 and c0 == 0, "no C_Container -> a silent no-op")
+
+    ck(c2 ~= nil and c3 ~= nil, "fixture cells retained")   -- keep the weak registry honest
+    Items._buttons, _G.C_Container = savedButtons, savedCC
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -4122,6 +4695,8 @@ function Items.RunSelfTests(verbose)
         { name = "cell click action (use path)", fn = testCellClickAction },
         { name = "cooldown swipe (BAG_UPDATE_COOLDOWN)", fn = testCooldownRefresh },
         { name = "bank-main tooltip route (BAG-6)", fn = testBankMainTooltip },
+        { name = "new-item layering (BAG-7)", fn = testNewItemLayering },
+        { name = "live-slot repaint (BAG-7)", fn = testLiveSlotRepaint },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

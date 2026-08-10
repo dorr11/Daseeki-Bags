@@ -76,6 +76,8 @@ function MigrateSettings.Defaults()
         -- Equipment-set teal: OFF by default (1.x's own set branch is inert on Era —
         -- ItemSearch-1.3/API.lua:145-146). See ui_items.lua's slotIsSet note.
         setMarkers          = false,
+        -- New-item glow sheet: ON by default, which is 1.x's own shipped glowNew.
+        newItemMarkers      = true,
         -- Slot appearance defaults are the OWNER'S live 1.x profile values, owned by
         -- ui_items so this file can never drift from them.
         slotBackground      = (I and I.DEFAULT_SLOT_BACKGROUND) or 6,
@@ -223,11 +225,20 @@ function MigrateSettings.MapSettings(db, sets, opts)
     put(db, "showItemCounts", asBool(sets.countItems), DEF.showItemCounts)
 
     -- Quality colouring of item slots (1.x drew it as a glow, 2.0 as a border; the
-    -- toggle means the same thing to the owner). 1.x's per-quality glow switches
-    -- (glowNew / glowQuest / glowUnusable / glowPoor) and its glowAlpha have no 2.0
-    -- equivalent: 2.0 has a minimum-quality floor instead, which is a different
-    -- control, so it is deliberately left at its own default.
+    -- toggle means the same thing to the owner). 1.x's remaining per-cue switches
+    -- (glowQuest / glowUnusable / glowPoor) and its glowAlpha have no 2.0 equivalent:
+    -- 2.0 has a minimum-quality floor instead, which is a different control, so it is
+    -- deliberately left at its own default.
     put(db, "qualityBorders", asBool(sets.glowQuality), DEF.qualityBorders)
+
+    -- BAG-7: glowNew DOES have a 2.0 equivalent, and this row is new because the earlier
+    -- reading of the 1.x tree concluded (wrongly) that there was no new-item cue to map.
+    -- 1.x core/api/settings.lua:35 ships `glowNew = true` with a checkbox at
+    -- config/panels/slotOptions.lua:67, and it gates the same thing 2.0's newItemMarkers
+    -- gates: the new-item glow sheet. Unlike glowSets below, this branch is fully live on
+    -- Classic Era (it reads C_NewItems, not ItemSearch), so a stored value is a real
+    -- preference and carries.
+    put(db, "newItemMarkers", asBool(sets.glowNew), DEF.newItemMarkers)
 
     -- 1.x glowSets is DELIBERATELY NOT MIGRATED onto 2.0's setMarkers. On Classic Era
     -- 1.x's set branch is inert unless ItemRack is loaded (ItemSearch-1.3/API.lua:145-146
@@ -720,6 +731,7 @@ local function testFullMapping(fails)
     inv.money     = false
     sets.countItems          = false
     sets.glowQuality         = false
+    sets.glowNew             = false
     sets.moneyTooltipFaction = true
     sets.moneyTooltipMinGold = 50
     sets.display.merchant    = false
@@ -733,6 +745,7 @@ local function testFullMapping(fails)
     ck(db.showMoney == false, "money bar off carried")
     ck(db.showItemCounts == false, "countItems -> showItemCounts")
     ck(db.qualityBorders == false, "glowQuality -> qualityBorders")
+    ck(db.newItemMarkers == false, "glowNew -> newItemMarkers (BAG-7: 1.x DOES have this cue)")
     ck(db.moneyTooltipFaction == true, "moneyTooltipFaction carried 1:1")
     ck(db.moneyTooltipMinGold == 50, "moneyTooltipMinGold carried 1:1")
     ck(db.autoDisplay.merchant == false, "display.merchant off -> autoDisplay.merchant off")
