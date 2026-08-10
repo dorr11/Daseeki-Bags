@@ -32,9 +32,10 @@
 -- secure/combat-correct handlers (pickup / place / split / use / real-slot tooltip)
 -- operate on the right (bag, slot) with zero behavior re-implemented — the public
 -- Blizzard template contract, not transcribed addon code. Structural (re)builds are
--- deferred out of combat (secure frames are protected). The ONE routed handler is
--- OnEnter, and only for the BANK MAIN CONTAINER (-1), which the container template
--- cannot draw a tooltip for at all — see the BAG-6 banner above Items._liveOnEnter.
+-- deferred out of combat (secure frames are protected). The ONE routed surface is the
+-- TOOLTIP (OnEnter + the UpdateTooltip refresh field), and only for the BANK MAIN
+-- CONTAINER (-1), which the container template cannot draw a tooltip for at all — see
+-- the BAG-6 / BAG-6b banners above Items._liveOnEnter.
 -- OFFLINE / REMOTE owners: render-only ItemButtonTemplate buttons — icon/count/quality
 -- from cached data, hyperlink tooltip + "cached Xd ago", clicks inert (shift-link only).
 --
@@ -2270,6 +2271,65 @@ local function nativeEnter(button)
     if s then return s(button) end
 end
 
+----------------------------------------------------------------------
+-- BAG-6b — THE REFRESH SURFACE (the field's answer to the first fix)
+--
+-- The first fix routed the HOVER and the owner's bank tooltips came back — for about a
+-- fifth of a second each. They rendered and then blanked: a new failure mode with the same
+-- cause, one surface further out.
+--
+-- A tooltip in this UI is not drawn once. GameTooltip_OnUpdate re-asks its OWNER to redraw
+-- itself every TOOLTIP_UPDATE_TIME (that is how a tooltip follows a modifier key, a
+-- cooldown, a stack change), and it asks through a FIELD ON THE OWNER FRAME:
+-- `owner.UpdateTooltip` — capital U, a function, distinct from the lowercase numeric
+-- `updateTooltip` countdown. ContainerFrameItemButton_OnEnter parks its own handler in that
+-- field, so a pooled cell that was ever hovered as a bag carries the BAG updater around
+-- with it. Hover it as a bank-main cell and our correct render is overwritten on the very
+-- next refresh tick by the client re-running SetBagItem(-1, slot) — nothing — through a
+-- field we had never touched.
+--
+-- CATALOG-VERIFIED ON 11509 (globals.txt), which decides which surfaces can re-enter:
+--   ContainerFrameItemButton_OnEnter   PRESENT — global function, so the template is the
+--                                      OLD (non-mixin) shape; the button's OnEnter script
+--                                      calls this global directly.
+--   ContainerFrameItemButton_OnUpdate  ABSENT  — the item button has NO per-frame OnUpdate,
+--                                      so the lowercase numeric `updateTooltip` countdown
+--                                      has no consumer on the button at all. Clearing it
+--                                      (what the first fix did) defended a mechanism this
+--                                      client does not have.
+--   GameTooltip_OnUpdate               PRESENT — the real periodic refresh, and it drives
+--                                      the owner's UpdateTooltip field.
+--   No *Mixin globals for item buttons — the mixin-shaped bindings are handled anyway, but
+--                                      this client does not use them.
+--
+-- So EVERY surface that can re-enter a live cell's tooltip is now routed by the same
+-- current-container rule: the OnEnter script, the OnEnter method (mixin shape), and
+-- UpdateTooltip (the refresh). A refresh on a bank-main cell re-runs OUR inventory path —
+-- which also RESTORES what the first fix traded away: holding shift mid-hover now
+-- re-renders with the comparison, because the redraw is a real redraw again.
+----------------------------------------------------------------------
+
+-- The client's own refresh handler for this cell, if it has parked one. Never our own
+-- router (that would be a loop) — the capture below refuses to record it.
+local function captureNativeUpdateTooltip(button)
+    local cur = button.UpdateTooltip
+    if cur ~= nil and cur ~= button._dsRoutedUpdateTooltip then
+        button._dsNativeUpdateTooltip = cur
+    end
+end
+Items._captureNativeUpdateTooltip = captureNativeUpdateTooltip
+
+-- Put OUR refresh handler in the field GameTooltip_OnUpdate reads. Done at every bank-main
+-- render, not once at construction, because the native OnEnter re-parks its own handler
+-- there on every bag hover — the same pooling truth as the hover route, one field over.
+local function installUpdateTooltipRoute(button)
+    captureNativeUpdateTooltip(button)
+    if not button._dsRoutedUpdateTooltip then
+        button._dsRoutedUpdateTooltip = function(self) return Items._liveUpdateTooltip(self or button) end
+    end
+    button.UpdateTooltip = button._dsRoutedUpdateTooltip
+end
+
 -- The bank main container's own tooltip path. Returns true when it rendered an item.
 function Items.ShowBankMainTooltip(button)
     local GT = _G.GameTooltip
@@ -2281,16 +2341,19 @@ function Items.ShowBankMainTooltip(button)
     if not hasItem then
         -- An empty bank slot draws no tooltip, exactly as an empty carried slot does.
         if GT.Hide then GT:Hide() end
+        -- Still take the refresh field: an empty slot the client keeps re-asking about must
+        -- not be answered by the bag updater a tick later either.
+        installUpdateTooltipRoute(button)
         return false
     end
     if GT.Show then GT:Show() end
-    -- The template's OnUpdate re-enters OnEnter every TOOLTIP_UPDATE_TIME while
-    -- self.updateTooltip is set, and on a non-mixin client that re-entry goes to the
-    -- GLOBAL container handler — SetBagItem(-1, slot) — which would blank the tooltip we
-    -- just drew, a fifth of a second after the cursor lands. Clearing the timer costs
-    -- nothing that the native path ever gave a bank-main cell (it gave it no tooltip at
-    -- all); GameTooltip's own MODIFIER_STATE_CHANGED handling still drives comparison
-    -- tooltips, and leaving the cell re-enters this function on the next hover anyway.
+    -- THE REFRESH, taken over for as long as this cell owns the tooltip. A re-render is one
+    -- SetInventoryItem — the same cost the client pays on every bag cell — and it is what
+    -- keeps the tooltip live for modifier changes.
+    installUpdateTooltipRoute(button)
+    -- The lowercase countdown has no consumer on this client (no ContainerFrameItemButton_
+    -- OnUpdate) but a shape that HAS one would re-enter through a global we cannot route,
+    -- so it stays disarmed. The capital-U field above is the refresh we actually own.
     button.updateTooltip = nil
     if _G.CursorUpdate then _G.CursorUpdate(button) end   -- the default bank's cursor pass
     return true
@@ -2312,6 +2375,23 @@ function Items._liveOnEnter(button)
         Items.ShowBankMainTooltip(button)
         return
     end
+    return nativeEnter(button)
+end
+
+-- The single live REFRESH (GameTooltip_OnUpdate -> owner:UpdateTooltip()). Same rule, read
+-- at the same moment: a cell recycled between the hover and the tick — an in-combat
+-- repaint can do exactly that — refreshes as whatever it is NOW, not what it was.
+function Items._liveUpdateTooltip(button)
+    if not button then return end
+    if Items.LiveTooltipRoute(button._cid) == "inventory" and Items.BankMainCanRoute(button) then
+        Items.ShowBankMainTooltip(button)
+        return
+    end
+    -- Bag route: give the refresh back to the client's own updater, and if this cell has
+    -- never carried one, to the template's OnEnter — which is the function the client
+    -- parks in that field anyway.
+    local u = button._dsNativeUpdateTooltip
+    if u and u ~= button._dsRoutedUpdateTooltip then return u(button) end
     return nativeEnter(button)
 end
 
@@ -2359,12 +2439,18 @@ function Items.CreateButton(parent, opts)
         -- (secure, combat-correct pickup/place/split/use) untouched — none of them is
         -- touched here.
         --
-        -- OnEnter is the ONE exception, and only as a ROUTER (BAG-6): the template's own
-        -- handler stays the tooltip for every real container id, and the bank main
-        -- container (-1) — which that handler cannot draw at all — takes the inventory-slot
-        -- path instead. Both bindings are captured first: a mixin template binds the script
-        -- to a wrapper that calls the method, so replacing only one of them either misses
-        -- the client's own re-entry or loops back into us.
+        -- The TOOLTIP SURFACE is the one exception, and only as a ROUTER (BAG-6): the
+        -- template's own handler stays the tooltip for every real container id, and the
+        -- bank main container (-1) — which that handler cannot draw at all — takes the
+        -- inventory-slot path instead. There are THREE ways into a live cell's tooltip and
+        -- all three are routed, because the field proved that routing two of them leaves
+        -- the third to overwrite the answer a tick later (BAG-6b):
+        --   OnEnter script          — the hover, on this client (non-mixin) the real one
+        --   OnEnter method          — the hover on a mixin-shaped template; captured first,
+        --                             because such a template binds the SCRIPT to a wrapper
+        --                             that calls the METHOD, and replacing only one of them
+        --                             either misses the client's re-entry or loops into us
+        --   UpdateTooltip (field)   — the periodic REFRESH GameTooltip_OnUpdate drives
         button._dsNativeEnterScript = button.GetScript and button:GetScript("OnEnter") or nil
         button._dsNativeEnterMethod = button.OnEnter
         if button.SetScript then
@@ -2373,6 +2459,11 @@ function Items.CreateButton(parent, opts)
         if button._dsNativeEnterMethod then
             button.OnEnter = function(self) Items._liveOnEnter(self) end
         end
+        -- Whatever the template parked in the refresh field at load. The route itself is
+        -- (re)installed at every bank-main render — the native OnEnter re-parks its own
+        -- handler there on every bag hover, so a once-at-construction install would be
+        -- displaced by the first bag hover the pooled cell ever serves.
+        Items._captureNativeUpdateTooltip(button)
         -- An INSECURE OnEnter post-hook clears the new-item mark on hover (1.x MarkSeen
         -- fact) — a non-secure hook that never touches the secure click path. It is hooked
         -- AFTER the router so it still runs on every hover, on either route.
@@ -4154,6 +4245,14 @@ end
 -- same button serves bank slot 3 on one layout and (bag 1, slot 3) on the next, by
 -- SetParent + _setSlot (or by repaintGroup rewriting _cid in place during combat). A cell
 -- must take the right path in BOTH directions, every time it is recycled.
+--
+-- BAG-6b — and the sim now also TICKS. GameTooltip_OnUpdate re-asks the tooltip's owner to
+-- redraw itself through owner.UpdateTooltip (capital U) every TOOLTIP_UPDATE_TIME; the
+-- container template parks its BAG handler in that field, so a pooled cell carries it. The
+-- first fix routed the hover and not the refresh, and the owner watched his bank tooltips
+-- appear and blank a fifth of a second later. T:tick() is that refresh, and the second red
+-- control is the field failure itself: leave the native updater in the field and one tick
+-- wipes a correct render.
 local function testBankMainTooltip(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -4218,16 +4317,36 @@ local function testBankMainTooltip(fails)
         self:log(("SetInventoryItem(%s,%s)"):format(tostring(unit), tostring(invSlot)))
         local link = inv[invSlot]
         self.rendered = link
+        -- A rendered item carries the comparison when the modifier is down — this is the
+        -- behaviour a live tooltip has and a frozen one does not.
+        self.compared = (link ~= nil) and self.shiftHeld or false
         return link ~= nil
+    end
+    -- GameTooltip_OnUpdate: every TOOLTIP_UPDATE_TIME the tooltip asks its OWNER to redraw
+    -- itself, through the owner's UpdateTooltip FIELD. This is the whole of BAG-6b.
+    function T:tick()
+        local owner = self.owner
+        if not owner or not owner.UpdateTooltip then return false end
+        owner:UpdateTooltip()
+        return true
     end
 
     -- The template's own OnEnter, as the client binds it on ContainerFrameItemButtonTemplate.
-    local nativeEnters = 0
-    local function nativeOnEnter(self)
+    -- ContainerFrameItemButton_OnEnter is a GLOBAL on 11509 (globals.txt) and it parks
+    -- ITSELF in the cell's UpdateTooltip field — which is how a pooled cell ends up
+    -- carrying the bag updater into the bank.
+    local nativeEnters, nativeUpdates = 0, 0
+    local nativeOnEnter
+    local function nativeUpdateTooltip(self)
+        nativeUpdates = nativeUpdates + 1
+        return nativeOnEnter(self)
+    end
+    nativeOnEnter = function(self)
         nativeEnters = nativeEnters + 1
         T:SetOwner(self, "ANCHOR_RIGHT")
         if not T:SetBagItem(self:GetParent():GetID(), self:GetID()) then T:Hide() else T:Show() end
-        self.updateTooltip = 0.25          -- the template arms its own OnUpdate re-entry
+        self.UpdateTooltip = nativeUpdateTooltip   -- the client's own refresh, parked
+        self.updateTooltip = 0.25                  -- …and the lowercase countdown, armed
     end
 
     local function newTexture()
@@ -4267,7 +4386,8 @@ local function testBankMainTooltip(fails)
         end
         if template == "ContainerFrameItemButtonTemplate" then
             f.scripts.OnEnter = nativeOnEnter
-            f.scripts.OnLeave = function() T:Hide() end
+            f.scripts.OnLeave = function(self) T:Hide(); self.UpdateTooltip = nil end
+            f.UpdateTooltip = nativeUpdateTooltip   -- parked at OnLoad, as the template does
         end
         return f
     end
@@ -4297,6 +4417,8 @@ local function testBankMainTooltip(fails)
         ck(cell ~= nil and cell.scripts.OnEnter ~= nil, "a live cell has an OnEnter to fire")
         ck(cell._dsNativeEnterScript == nativeOnEnter,
            "the template's own handler is CAPTURED, not discarded (the bag path still uses it)")
+        ck(cell._dsNativeUpdateTooltip == nativeUpdateTooltip,
+           "…and so is the refresh handler the template parks at load (BAG-6b)")
 
         -------------------------------------------------- 1) bank main: our path renders
         Items._setSlot(cell, owner, Store.BANK_CONTAINER, 3, { id = 1, quality = 1, link = BANKLINK })
@@ -4313,6 +4435,44 @@ local function testBankMainTooltip(fails)
            "…with the template's OnUpdate re-entry disarmed (it would blank us via SetBagItem(-1))")
         ck(seen[#seen] == "-1:3", "the insecure MarkSeen post-hook still runs on the new path")
         ck(cursorPasses == 1, "…and the default bank's cursor pass runs with it")
+
+        -------------------------------------------------- 1b) IT SURVIVES THE REFRESH (BAG-6b)
+        ck(cell.UpdateTooltip == cell._dsRoutedUpdateTooltip and cell.UpdateTooltip ~= nil,
+           "our render TAKES the refresh field GameTooltip_OnUpdate reads")
+        local uBefore = nativeUpdates
+        ck(T:tick() == true, "the client's refresh tick reaches an owner that answers it")
+        ck(nativeUpdates == uBefore,
+           "…and it does NOT reach the client's bag updater (which would ask for bag -1)")
+        ck(T.rendered == BANKLINK and T.shown == true,
+           "…so the tooltip is STILL THERE after a refresh tick (the owner's blank-out, fixed)")
+        for _ = 1, 5 do T:tick() end
+        ck(T.rendered == BANKLINK, "…and after five more ticks (it is a hover, not a flash)")
+
+        -- MODIFIER MID-HOVER: the refresh is a real re-render, so shift brings the
+        -- comparison up on a bank item exactly as it does on a bag item. This is the
+        -- behaviour the first fix traded away by disarming the refresh instead of routing it.
+        ck(T.compared == false, "no comparison while no modifier is held")
+        T.shiftHeld = true
+        T:tick()
+        ck(T.compared == true and T.rendered == BANKLINK,
+           "holding shift mid-hover re-renders the bank tooltip WITH its comparison")
+        T.shiftHeld = false
+        T:tick()
+        ck(T.compared == false and T.rendered == BANKLINK, "…and releasing it re-renders without")
+
+        -------------------------------------------------- 1c) RED CONTROL: the field failure
+        -- Exactly the shipped state the owner hit: a correct render whose refresh field
+        -- still holds the client's BAG updater (parked there by an earlier bag hover).
+        T:reset(); cell.scripts.OnEnter(cell)
+        ck(T.rendered == BANKLINK, "…(re-render for the control)")
+        cell.UpdateTooltip = nativeUpdateTooltip        -- the un-routed refresh surface
+        T:tick()
+        ck(T.rendered == nil and T:has("SetBagItem(-1,3)"),
+           "RED CONTROL (BAG-6b): with the refresh left un-routed, ONE tick asks for bag -1 " ..
+           "and blanks the tooltip — the appear-then-disappear the owner reported")
+        T:reset(); cell.scripts.OnEnter(cell)           -- restore the routed state
+        ck(cell.UpdateTooltip == cell._dsRoutedUpdateTooltip,
+           "…and the next hover takes the field back")
 
         -- ...and the anchor really does follow the cell's position, as the container rule does.
         cell._right = 1500
@@ -4341,6 +4501,12 @@ local function testBankMainTooltip(fails)
            "…and asks for (bag 1, slot 3) — the recycled cell carries no bank routing with it")
         ck(T.rendered == BAGLINK, "…and that tooltip renders")
         ck(seen[#seen] == "1:3", "…MarkSeen followed the recycled (cid, slot) too")
+        -- The refresh follows it back to the client, which re-parked its own updater.
+        local uB = nativeUpdates
+        T:tick()
+        ck(nativeUpdates == uB + 1 and T.rendered == BAGLINK,
+           "…and the bag cell's REFRESH is the client's own again (we hold no field we " ..
+           "should not) — a bag tooltip still refreshes exactly as Blizzard drew it")
 
         -------------------------------------------------- 4) …and back again
         cell:SetParent(bankHolder)
@@ -4352,6 +4518,14 @@ local function testBankMainTooltip(fails)
            "recycled BACK to bank-main, the same cell leaves the native handler alone again")
         ck(T:has("SetInventoryItem(player,42)") and T.rendered == BANKLINK,
            "…and renders through the inventory slot (both directions, same button)")
+        -- THE FIELD FAILURE'S EXACT SHAPE: this cell was hovered as a bag a moment ago, so
+        -- the client's bag updater was sitting in its refresh field. Our render must take
+        -- that field back, or the first tick blanks it (which is what the owner saw).
+        local uB2 = nativeUpdates
+        T:tick()
+        ck(nativeUpdates == uB2 and T.rendered == BANKLINK,
+           "a cell recycled BAG -> BANK-MAIN survives the refresh: our render took back the " ..
+           "field the client's bag hover had parked its own updater in")
 
         -------------------------------------------------- 5) the COMBAT repaint recycle
         -- repaintGroup rewrites _cid/_slot in place, touching no script and no parent. The
@@ -4363,6 +4537,21 @@ local function testBankMainTooltip(fails)
         cell.scripts.OnEnter(cell)
         ck(T:has("SetInventoryItem(player,44)"),
            "an in-combat data-only repaint (repaintGroup) re-routes with the new slot (5 -> 44)")
+        -- …and the REFRESH reads the container at TICK time, not at hover time. (A live
+        -- relayout cannot move a hovered cell to another container behind the cursor —
+        -- CombatLayoutMode only takes the repaint branch when the layout signature, cids
+        -- included, is identical — so this is belt: whatever writes _cid, the next tick is
+        -- answered as what the cell IS, and a cell that is no longer bank-main hands the
+        -- refresh straight back to the client.) The cursor never left, so the tooltip is
+        -- still owned by this cell; only the call log is cleared.
+        cell._cid = 1
+        T.calls = {}
+        local uB3 = nativeUpdates
+        T:tick()
+        ck(nativeUpdates == uB3 + 1 and not T:has("SetInventoryItem(player,44)"),
+           "a cell that is no longer bank-main hands the REFRESH back to the client's own " ..
+           "updater (the route is re-read on every tick, never cached from the hover)")
+        cell._cid = Store.BANK_CONTAINER
 
         -------------------------------------------------- 6) an EMPTY bank slot
         Items._setSlot(cell, owner, Store.BANK_CONTAINER, 9, nil)
@@ -4426,6 +4615,11 @@ local function testBankMainTooltip(fails)
         mx:OnEnter()          -- the client's OWN re-entry (its OnUpdate calls the method)
         ck(T.rendered == BANKLINK,
            "…and the client's own method re-entry lands on our route, not on SetBagItem(-1)")
+        T:reset(); mx.scripts.OnEnter(mx)
+        local mu = mixinEnters
+        T:tick()
+        ck(T.rendered == BANKLINK and mixinEnters == mu,
+           "…and the REFRESH is routed on a mixin client too (same field, same rule)")
 
         mx:SetParent(bagHolder)
         Items._setSlot(mx, owner, 1, 3, { id = 2, quality = 1, link = BAGLINK })

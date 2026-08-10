@@ -60,11 +60,20 @@ the game's bag tooltip has nothing to say; Blizzard's bank asks a different ques
 there, and now so does Bags. Every bank slot shows its item, on the same side of the
 window and with the same comparisons as every other cell.
 
+A tooltip is also not drawn once and left alone: while your cursor rests on a slot, the
+game keeps asking the cell to draw itself again — that is how a tooltip picks up a
+comparison the moment you hold shift. The first pass at this fix answered the hover and
+not those follow-up questions, so a bank tooltip appeared and then vanished a fraction of
+a second later, which is arguably worse than never appearing. The cell now answers both,
+the same way, so a bank tooltip stays up for as long as you are pointing at it and gains
+its comparison when you hold shift, exactly like an item in your bags.
+
 Nothing else moved: dragging, clicking, splitting and depositing in the bank are the
-game's own handlers exactly as before, an alt's bank (or your own, viewed away from the
-bank) still shows its cached tooltip with the "cached Xd ago" line, and the keyring was
-checked and left alone — the game draws the keyring the same way it draws a bag, so its
-tooltips were never affected.
+game's own handlers exactly as before, tooltips on your carried bags are still drawn and
+refreshed entirely by the game, an alt's bank (or your own, viewed away from the bank)
+still shows its cached tooltip with the "cached Xd ago" line, and the keyring was checked
+and left alone — the game draws the keyring the same way it draws a bag, so its tooltips
+were never affected.
 
 ## 2.0.5 — 2026-08-08
 
