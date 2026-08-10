@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — rides 2.0.6
+## 2.0.6 — 2026-08-10
 
 ### The "new item" marker is Bags 1's again
 
