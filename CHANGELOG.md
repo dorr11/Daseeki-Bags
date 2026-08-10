@@ -2,6 +2,49 @@
 
 ## Unreleased — rides 2.0.6
 
+### The "new item" marker is Bags 1's again
+
+Bags 2 marked a freshly-looted item by painting its slot crimson and breathing it slowly.
+That was built on a wrong reading of Bags 1: the check went looking for a new-item cue,
+found the line where Bags 1 hides the game's own "new loot" glow, and stopped there —
+missing that the bag view turns it straight back on for every new item, in the item's own
+rarity colour, with the game's flash. Bags 1 has always used the standard marker, and it
+has a switch for it in its own options.
+
+So Bags 2 uses it too now. A new item wears the game's coloured burst and pulse over the
+slot, and it clears the moment you hover it, exactly as before.
+
+The part you will notice most is what it *stopped* doing. The crimson was a replacement
+for the slot's border colour, so anything new lost its rarity colour until you looked at
+it — a purple you just picked up read as crimson, not epic. The marker now draws **over**
+the slot instead of recolouring it, so a new epic is a purple-bordered epic wearing a
+new-item glow. Quest gold, the red "can't use this" edge and the equipment-set colour all
+keep their slots too.
+
+"Glow newly-acquired items" in the options still turns the whole thing off, and if you
+switched Bags 1's own version of it off, that choice now carries across on import.
+
+### Watch the sort happen, instead of waiting for it
+
+Sorting looked frozen. You pressed sort, the window sat perfectly still for several
+seconds, and then every item appeared in its final place at once. In Bags 1 you could
+watch items move.
+
+There was no rendering delay to fix — the stillness was deliberate, and it was ours. A
+sort fires dozens of item-lock events per wave, and re-reading every bag on each of them
+was slowing the sort down measurably, so Bags 2 switches the bag re-read off for the
+duration of a run. The trouble is that the window is drawn from that reading. It was
+being redrawn five times a second the whole time, faithfully, from a picture that could
+not change until the sort finished.
+
+During a sort the grid now updates itself directly from the game, cell by cell, several
+times a second — a repaint only, no re-reading of your bags. Items visibly move as the
+sort works, and the run itself is untouched: on the 88-cell test bag this build sorts in
+the same number of moves, the same number of waves and the same wall-clock time as the
+build before it, to the millisecond. Your saved bag contents are not touched mid-sort
+either, so anything reading them — Find, alt summaries, the Daseeki network — sees one
+clean update at the end, exactly as before.
+
 ### The top rows of your bank had no item tooltips
 
 Open the bank, hover anything in the first few rows, and nothing came up — or worse, just

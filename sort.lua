@@ -779,6 +779,7 @@ Sort.MOVE_SLACK         = 32     -- upward on every improvement (see Sort._tick)
 Sort.PLAN_BUSY          = false
 Sort.LOCK_TTL           = 3.00   -- backstop only: a slot locked THIS long is pathological
 Sort.QUIET_REFRESH      = 0.20   -- 5 Hz grid heartbeat while the refresh storm is muted
+Sort.LIVE_REPAINT       = 0.12   -- ~8 Hz coalesced LIVE-cell repaint (BAG-7; see beginQuiet)
 
 -- =====================================================================
 -- 2.0.3 — SETTLE-AWARE ARMING, and the over-issue it fixes
@@ -1364,8 +1365,28 @@ local function refKey(r) return r.cid .. ":" .. r.slot end
 -- EVERY exit path (completion and every abort). Identity-guarded in both directions: we
 -- only install over the function we captured, and only restore if OUR stub is still the
 -- one installed — so a reload or another consumer replacing them mid-sort is never
--- clobbered. A `Sort.QUIET_REFRESH` heartbeat still repaints the grid at ~5 Hz so the
--- sort stays visible, and the restore does one full capture + rebuild unconditionally.
+-- clobbered. The restore does one full capture + rebuild unconditionally.
+--
+-- ── BAG-7 (2.0.6): WHY THE HEARTBEAT NO LONGER CALLS Frame.RequestRefresh ──────────────
+-- OWNER REPORT: "when sorting bags the icon locations dont update until the sort is
+-- concluded, but with bags 1 you could see the sort happening live. is there a bag render
+-- delay?"  There is not. The delay IS this mute, and the ~5 Hz heartbeat that was supposed
+-- to keep the sort visible could not do it: Frame.RequestRefresh rebuilds the grid FROM THE
+-- CAPTURED STORE, and the store is exactly what the capture stub above has frozen. So the
+-- heartbeat was faithfully re-drawing the same frozen picture 5 times a second for the whole
+-- run, and the grid only moved when endQuiet's final capture landed. (1.x had no capture
+-- layer: its item groups repainted straight off the raw bag events, which is why its sort
+-- was visible.)
+--
+-- The heartbeat now drives ui_items.LiveSlotRepaint instead — a data-only sweep that reads
+-- each visible LIVE cell's own (cid, slot) straight from C_Container and repaints the
+-- button in place, bypassing the muted capture entirely. It writes NOTHING to the store, so
+-- the captured snapshot stays byte-stable for the whole run and no mesh consumer ever sees
+-- mid-sort churn (the invariant is stated in full over Items.LiveSlotRepaint). It is also
+-- strictly cheaper than what it replaces: one API read per visible cell instead of a full
+-- grid rebuild. Bag events drive the same sweep at Sort.LIVE_REPAINT (~8 Hz), which is where
+-- the responsiveness actually comes from; the heartbeat is the backstop for a run whose
+-- events are sparse.
 ----------------------------------------------------------------------
 local function beginQuiet()
     if Sort._quiet then return end
@@ -1384,14 +1405,38 @@ local function beginQuiet()
     Sort._quiet = q
 end
 
--- ~5 Hz repaint through the ORIGINAL refresh fn so the user watches the sort happen.
+-- THE LIVE REPAINT (BAG-7). Read-only and data-only: it asks ui_items to re-read each
+-- visible live cell from C_Container and repaint it in place. It issues no container
+-- operation, no capture request and no lock write, so it cannot perturb the executor's
+-- settle timing or its move accounting — the sort suite pins both against the simulator's
+-- own mutation counters. Coalesced at Sort.LIVE_REPAINT; returns true when it actually ran.
+local function liveRepaint(now)
+    if not Sort._running then return false end
+    now = now or nowSeconds()
+    if (now - (Sort._liveRepaintAt or 0)) < Sort.LIVE_REPAINT then return false end
+    Sort._liveRepaintAt = now
+    local I = ns.Items
+    if not (I and I.LiveSlotRepaint) then return false end
+    Sort._liveRepaints = (Sort._liveRepaints or 0) + 1
+    if ns.SafeCall then ns:SafeCall(I.LiveSlotRepaint) else I.LiveSlotRepaint() end
+    return true
+end
+Sort._liveRepaint = liveRepaint
+
+-- How many live repaints the LAST run performed (telemetry handle for the harness and for
+-- a future /bags sortlog column; deliberately NOT a persisted sortLog field — it is a
+-- rendering statistic, not a convergence one, and the log schema stays where it is).
+function Sort.LiveRepaintCount() return Sort._lastLiveRepaints or 0 end
+
+-- The mid-sort heartbeat. See the BAG-7 block above for why this is a live-cell sweep and
+-- not the full Frame.Rebuild it used to be.
 local function quietHeartbeat(now)
     local q = Sort._quiet
-    if not (q and q.frameFn) then return end
+    if not q then return end
     if now - (Sort._lastRefresh or 0) < Sort.QUIET_REFRESH then return end
     Sort._lastRefresh = now
     q.refreshes = q.refreshes + 1
-    if ns.SafeCall then ns:SafeCall(q.frameFn) else q.frameFn() end
+    liveRepaint(now)
 end
 
 local function endQuiet()
@@ -1430,6 +1475,10 @@ local function stopDriver()
     -- 2.0.3 settle-aware accumulators (same "no state between runs" contract).
     Sort._bagErrors, Sort._settleWaits, Sort._settleHolds = nil, nil, nil
     Sort._settleDrops, Sort._inFlightPeak, Sort._cleanupMoves = nil, nil, nil
+
+    -- BAG-7 live-repaint accumulators (same "no state between runs" contract; logRun has
+    -- already stashed the count into Sort._lastLiveRepaints by the time this runs).
+    Sort._liveRepaints, Sort._liveRepaintAt = nil, nil
 
     Sort._settleSecs, Sort._waitingRound = nil, nil
     Sort._idleSecs, Sort._noProgressSecs, Sort._runawaySecs = nil, nil, nil
@@ -1472,6 +1521,10 @@ local function logRun(aborted, reason)
     }
     -- Test hook: the finished record, in full, for a harness with no settings store.
     Sort._lastRun = Sort.NewLogRecord(rec)
+    -- BAG-7: a RENDERING statistic, kept beside the record rather than inside it. The
+    -- persisted sortLog schema (Sort.NewLogRecord) is a convergence contract and does not
+    -- move for a repaint counter — no SavedVariables change, nothing for the report to skip.
+    Sort._lastLiveRepaints = Sort._liveRepaints or 0
     local write = function() Sort.LogAppend(nil, rec) end
     if ns.SafeCall then ns:SafeCall(write) else pcall(write) end
 end
@@ -2072,21 +2125,27 @@ local function ensureDriver()
         -- them a settle-aware executor would sit out the whole window on the slow
         -- backstop tick; with them the round re-arms the moment the contents land.
         if event == "BAG_UPDATE" or event == "BAG_UPDATE_DELAYED" then
-            if not (Sort._running and Sort._pred) then return end
-            local now = nowSeconds()
-            local settled = false
-            for k in pairs(Sort._pred) do
-                releasePred(k, now)
-                if Sort._pred[k] == nil then
-                    settled = true
-                    if Sort._waiting then Sort._waiting[k] = nil end
+            if Sort._running and Sort._pred then
+                local now = nowSeconds()
+                local settled = false
+                for k in pairs(Sort._pred) do
+                    releasePred(k, now)
+                    if Sort._pred[k] == nil then
+                        settled = true
+                        if Sort._waiting then Sort._waiting[k] = nil end
+                    end
                 end
+                -- Only a round that is actually WAITING gains anything from being pulled
+                -- forward, and only when something really settled. Everything else stays on
+                -- the cadence it was already on — a bag-update burst must not become a
+                -- re-plan storm (see the EVENT-DRIVEN ISSUING banner's measured cost).
+                if settled and Sort._waitingRound then kickTick(now) end
             end
-            -- Only a round that is actually WAITING gains anything from being pulled
-            -- forward, and only when something really settled. Everything else stays on
-            -- the cadence it was already on — a bag-update burst must not become a
-            -- re-plan storm (see the EVENT-DRIVEN ISSUING banner's measured cost).
-            if settled and Sort._waitingRound then kickTick(now) end
+            -- BAG-7: these two events are the CONTENTS publication — the moment the cells
+            -- the owner is watching actually changed. The executor's work above runs FIRST
+            -- (the repaint must never sit between an event and the round it arms), then the
+            -- coalesced, read-only visual sweep. This is the path 1.x repainted on.
+            liveRepaint()
             return
         end
         if event == "ITEM_LOCK_CHANGED" then
@@ -2223,6 +2282,11 @@ function Sort.Run(cids, opts)
     Sort._budget    = #plan.moves * Sort.MAX_MOVE_FACTOR + Sort.MOVE_SLACK
     Sort._start     = nowSeconds()
     Sort._lastRefresh = Sort._start
+    -- BAG-7: seed the live-repaint throttle at the run start. Nothing has moved yet, so the
+    -- first sweep is due one LIVE_REPAINT window in — which is also the first moment any
+    -- bag event can have landed.
+    Sort._liveRepaintAt = Sort._start
+    Sort._liveRepaints  = 0
     Sort._lastTickAt  = 0            -- so the FIRST kick is never held back by KICK_GAP
     Sort._lastProgressAt = Sort._start
 
@@ -4918,6 +4982,166 @@ local function testOwnerLiveFailure(fails)
     for _, f in ipairs(ownerFixtureAssertions()) do fails[#fails + 1] = f end
 end
 
+----------------------------------------------------------------------
+-- BAG-7 — LIVE SORT REPAINTS, on the owner's own 88-cell fixture.
+--
+-- The owner: "when sorting bags the icon locations dont update until the sort is
+-- concluded." The answer (see beginQuiet) is that the freeze IS the deliberate capture
+-- mute, not a render latency — so the gate has to prove three things at once:
+--
+--   A. THE WINDOW MOVES. Bag events drive data-only repaints during the run, at the
+--      throttle, and cells actually change while the sort is still going.
+--   B. THE SORT IS UNMOVED. Every convergence number of a run WITH the repaint path
+--      populated is IDENTICAL to the same seeded run without it — executed moves, waves,
+--      wall clock, avgAckMs, settle counters, and the simulator's own container-op tallies.
+--      Same simulator, same seed, same virtual clock: "statistically unchanged" is too weak
+--      a claim to settle for here, so the assertion is EQUALITY.
+--   C. THE SNAPSHOT IS UNTOUCHED. The store records the cells were handed at layout time
+--      come back byte-identical, and exactly one capture happens — at the end. That is the
+--      invariant mesh consumers depend on.
+--
+-- Run A drives the REAL ui_items.LiveSlotRepaint over synthetic live cells bound to the
+-- simulator's containers, so the sweep does real work against a real (simulated) client.
+-- Run B leaves the button registry empty, which is 2.0.5's behaviour exactly.
+----------------------------------------------------------------------
+local function testLiveSortRepaint(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+    local Items = ns.Items
+    if not (Items and Items.LiveSlotRepaint) then
+        fails[#fails + 1] = "ui_items exposes no LiveSlotRepaint — BAG-7 is not wired"
+        return
+    end
+
+    ck(Sort.LIVE_REPAINT and Sort.LIVE_REPAINT >= 0.10 and Sort.LIVE_REPAINT <= 0.15,
+        "the live-repaint throttle is in the 0.10-0.15s band (got "
+        .. tostring(Sort.LIVE_REPAINT) .. ")")
+
+    -- One seeded fixture, built the same way both times.
+    local function fixture()
+        local S = ownerSim()
+        local filled = seedToFill(S, newRng(74074), 65)          -- 65/88 == 73.9%
+        return S, filled
+    end
+
+    ------------------------------------------------------------------ RUN A: repaints on
+    local savedButtons = Items._buttons
+    Items._buttons = setmetatable({}, { __mode = "k" })
+
+    local SA, filledA = fixture()
+    ck(filledA == 65, "fixture A seeded 65/88 cells (got " .. filledA .. ")")
+
+    -- The captured snapshot the cells were laid out from: one store record per filled cell.
+    -- These are the tables the sweep must never write.
+    -- `cells` is a STRONG list on purpose: Items._buttons is a weak-keyed registry (the
+    -- live grid holds its buttons through the frame tree), so a test that only put them
+    -- there would watch the collector empty the sweep out from under it.
+    local storeRecs, snapshotOf, repaints, cells = {}, {}, 0, {}
+    for cid, bag in pairs(SA.bags) do
+        for slot = 1, bag.n do
+            local it = bag.slots[slot]
+            -- Built from what the client reports AT LAYOUT TIME, so the sweep's first pass
+            -- is not inflated by a synthetic mismatch: every re-draw counted below is a
+            -- cell that genuinely moved DURING the sort.
+            local rec = it and Store.NewSlot(it.id, it.count,
+                (SIMCAT[it.id] and SIMCAT[it.id].quality) or 1) or nil
+            local b = { _live = true, _cid = cid, _slot = slot, _data = rec }
+            b.IsShown = function() return true end
+            b._dsRepaint = function() repaints = repaints + 1 end
+            Items._buttons[b] = true
+            cells[#cells + 1] = b
+            if rec then
+                storeRecs[#storeRecs + 1] = rec
+                snapshotOf[rec] = { id = rec.id, count = rec.count,
+                                    quality = rec.quality, link = rec.link }
+            end
+        end
+    end
+    ck(#cells == 88, "…across all 88 cells (got " .. #cells .. ")")
+    ck(#storeRecs == 65, "…and 65 store records are under the filled ones")
+
+    local planA = #Sort.Plan({ cells = SA:cells(), meta = simMetaFn }).moves
+    local tallyA = runSortInSim(SA, { 0, 1, 2, 3, 4 }, { limit = 240 })
+    local recA   = Sort._lastRun or {}
+    local sweepsA = Sort.LiveRepaintCount()
+    local statsA = { pickups = SA.stats.pickups, drops = SA.stats.drops,
+                     rejected = SA.stats.rejected, lockedIssue = SA.stats.lockedIssue,
+                     bagErrors = SA.stats.bagErrors }
+
+    ------------------------------------------------------------------ A: the window moved
+    ck(sweepsA > 0, "the sort performed live repaints (got " .. sweepsA .. ")")
+    ck(repaints > 0, "…and cells actually re-drew WHILE the sort was running (" .. repaints .. ")")
+    -- Throttle: no more sweeps than the run's wall clock allows at LIVE_REPAINT, +2 for
+    -- the opening/closing windows. This is the "coalesced" half of the contract.
+    local ceiling = math.ceil(((recA.durationMs or 0) / 1000) / Sort.LIVE_REPAINT) + 2
+    ck(sweepsA <= ceiling, string.format(
+        "repaints held to the ~%.0f Hz throttle (%d <= %d over %.2fs)",
+        1 / Sort.LIVE_REPAINT, sweepsA, ceiling, (recA.durationMs or 0) / 1000))
+
+    ------------------------------------------------------------------ C: snapshot stable
+    local drift = 0
+    for _, rec in ipairs(storeRecs) do
+        local s = snapshotOf[rec]
+        if rec.id ~= s.id or rec.count ~= s.count
+            or rec.quality ~= s.quality or rec.link ~= s.link then drift = drift + 1 end
+    end
+    ck(drift == 0, "the captured snapshot is BYTE-STABLE across the whole sort ("
+        .. drift .. " record(s) drifted)")
+    ck(tallyA.capture == 1, "exactly ONE capture, at the end (got " .. tallyA.capture .. ")")
+    ck(tallyA.refresh == 1,
+        "…and exactly ONE full grid rebuild, also at the end — the heartbeat no longer "
+        .. "re-draws the frozen snapshot 5x/second (got " .. tallyA.refresh .. ")")
+
+    -- ZERO MUTATION, asserted directly against the simulator's own counters: drive the
+    -- real sweep by hand with the sim installed and prove it issues no container op.
+    SA:install()
+    local p0, d0, r0 = SA.stats.pickups, SA.stats.drops, SA.stats.rejected
+    Items.LiveSlotRepaint()
+    Items.LiveSlotRepaint()
+    ck(SA.stats.pickups == p0 and SA.stats.drops == d0 and SA.stats.rejected == r0,
+        "the repaint path issues ZERO container-mutating calls")
+    SA:restore()
+
+    ------------------------------------------------------------------ RUN B: repaints off
+    Items._buttons = setmetatable({}, { __mode = "k" })   -- empty registry == 2.0.5
+    local SB, filledB = fixture()
+    ck(filledB == 65, "fixture B seeded identically")
+    local planB = #Sort.Plan({ cells = SB:cells(), meta = simMetaFn }).moves
+    local tallyB = runSortInSim(SB, { 0, 1, 2, 3, 4 }, { limit = 240 })
+    local recB   = Sort._lastRun or {}
+    Items._buttons = savedButtons
+
+    ------------------------------------------------------------------ B: sort unmoved
+    ck(planA == planB, "the two runs opened on the same plan (" .. planA .. " vs " .. planB .. ")")
+    for _, k in ipairs({ "executedMoves", "waves", "durationMs", "avgAckMs",
+                         "settleWaits", "settleHolds", "settleDrops", "inFlightPeak",
+                         "bagErrors", "cleanupMoves", "stallTicks", "busyFallbackTicks" }) do
+        ck(recA[k] == recB[k], string.format(
+            "convergence UNCHANGED by the repaint path: %s %s vs %s",
+            k, tostring(recA[k]), tostring(recB[k])))
+    end
+    for _, k in ipairs({ "pickups", "drops", "rejected", "lockedIssue", "bagErrors" }) do
+        ck(statsA[k] == SB.stats[k], string.format(
+            "the CLIENT saw the same traffic either way: %s %s vs %s",
+            k, tostring(statsA[k]), tostring(SB.stats[k])))
+    end
+    -- and the plan/exec parity contract the owner fixture pins still holds in run A
+    ck((recA.executedMoves or 0) >= planA and (recA.executedMoves or 0) <= planA + 8,
+        string.format("plan/exec parity holds with repaints on (%d executed for %d planned)",
+            recA.executedMoves or 0, planA))
+    ck(recA.aborted == false and recB.aborted == false, "neither run aborted")
+
+    -- The numbers themselves, on the record: this is the owner-facing answer to "is there
+    -- a bag render delay?" — the sort is bit-for-bit the same run, and the window moved.
+    if ns.Print then
+        ns:Print(string.format(
+            "  live-sort: 88 cells @74%%, plan %d -> exec %d in %d waves, %.0fms, ack %dms | "
+            .. "repaints on: %d sweeps / %d cell re-draws | repaints off: exec %d waves %d %.0fms",
+            planA, recA.executedMoves or 0, recA.waves or 0, recA.durationMs or 0,
+            recA.avgAckMs or 0, sweepsA, repaints,
+            recB.executedMoves or 0, recB.waves or 0, recB.durationMs or 0))
+    end
+end
+
 -- MUTATION GATE for the settle rule. Sort.PredSettled IS the fix, so the 2.0.2 executor
 -- is expressible as one replacement for it — which is what makes this a real red→green
 -- pin rather than a test that merely passes today.
@@ -5123,6 +5347,7 @@ function Sort.RunSelfTests(verbose)
         { name = "converge: owner's live failure (2.0.3)", fn = testOwnerLiveFailure },
         { name = "converge: settle mutation gate", fn = testSettleMutants },
         { name = "converge: graceful abort", fn = testGracefulAbort },
+        { name = "live sort repaints (BAG-7)", fn = testLiveSortRepaint },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

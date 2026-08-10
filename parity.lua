@@ -107,8 +107,19 @@ Parity.ONE_X = {
 
     ICONBORDER_DRIVEN = true,    -- :194 SetItemButtonQuality, :210 SetVertexColor, :220 SetShown(r)
     JUNKICON_DRIVEN   = true,    -- :222 SetShown(glowPoor and quality == 0 and not hasNoValue)
-    NEWITEM_KILLED    = true,    -- :49  b.NewItemTexture:Hide()  -> 1.x shows NO new-item cue
     COUNT_RESTYLED    = false,   -- :168 bare SetItemButtonCount; no font/colour/anchor call
+
+    -- NEW-ITEM. `NEWITEM_KILLED = true` used to sit here, cited to core/classes/item.lua:49
+    -- (`b.NewItemTexture:Hide()`), and it was WRONG: :49 is the BASE class's initial hide and
+    -- the bag SUBCLASS re-shows the region on every update. The corrected rows, all from
+    -- Daseeki-Bags/frames/inventory/item.lua unless noted:
+    NEWITEM_DRIVEN    = true,    -- :99  self.NewItemTexture:SetShown(new)
+    NEWITEM_ATLAS     = true,    -- :103 SetAtlas(NEW_ITEM_ATLAS_BY_QUALITY[q] or 'bags-glow-white')
+    NEWITEM_ANIMS     = 2,       -- :104-105 newitemglowAnim:Play(); flashAnim:Play()
+    NEWITEM_IN_CHAIN  = false,   -- core/classes/item.lua:196-205 has FOUR branches, none `new`
+    GLOWNEW_DEFAULT   = true,    -- core/api/settings.lua:35   glowNew = true (and a checkbox
+                                 -- at config/panels/slotOptions.lua:67)
+    NEWITEM_CLEARS_ON = "hover", -- :56 OnEnter -> :112-117 MarkSeen -> C.NewItems.RemoveNewItem
 
     -- SLOT BORDER — again the owner's profile, not the default. 1.x CREATES a 2px backdrop
     -- edge on every cell (:65-71) and re-colours it on every update from slotBorderColor
@@ -225,7 +236,8 @@ function Parity.OneXElementCount(ctx)
                                        --            when filled, Backgrounds[slotBackground]
                                        --            at slotAlpha when empty)
     -- :51-52 the NormalTexture is hidden and nothing replaces it -> no substrate FILL
-    -- :48-49 BattlepayItemTexture / NewItemTexture hidden -> no new-item cue at all
+    -- :48 BattlepayItemTexture hidden and never re-shown on Era (info.isPaid is retail-only)
+    -- :49 NewItemTexture hidden HERE, but re-shown by the bag subclass — counted below
 
     -- :65-71 / :171-174 SlotBorder — created for EVERY cell and coloured on every update.
     -- Drawn iff the profile's slotBorderColor alpha is above zero, which the owner's is.
@@ -249,6 +261,11 @@ function Parity.OneXElementCount(ctx)
     if ctx.quality == 0 and not ctx.hasNoValue and not ctx.dimmed then
         n = n + 1                      -- :222 JunkIcon (the vendor coin)
     end
+    -- frames/inventory/item.lua:97-107 UpdateGlow — the NewItemTexture sheet, drawn ON TOP
+    -- of whatever the tint chain above decided (it is not a branch of it), gated by
+    -- sets.glowNew (default ON). Counted under this file's convention that a dimmed cell's
+    -- cues are not counted, the same convention the glow chain above uses.
+    if ctx.isNew and Parity.ONE_X.GLOWNEW_DEFAULT and not ctx.dimmed then n = n + 1 end
     return n
 end
 
@@ -266,17 +283,16 @@ function Parity.TwoOhElementCount(ctx)
     -- the set cue only reaches the chain when the (default-OFF) toggle is on, exactly as
     -- 1.x's only reaches it when ItemSearch bound BelongsToSet to something real
     local setLive = ctx.isSet and Items.SetCueEnabled()
-    -- The NEW-ITEM cue is a BRANCH of this same chain now (crimson + pulse), not a corner
-    -- element — so a new item adds NO element to the cell, it only changes which colour the
-    -- halo already there is painted. That is what closes the last knowing divergence from
-    -- 1.x's element count.
+    -- NEWNESS IS NOT IN THIS CHAIN, in either model. 1.x's UpdateBorder has four branches
+    -- and none of them is `new`; 2.0's crimson branch (which DID pass isNew here) is retired.
     local glows = B.GlowShown(ctx.quality, ctx.isUnusable,
-        (ctx.isQuest or ctx.isQuestStarter), setLive, true, B.DEFAULT_MIN_QUALITY,
-        nil, ctx.isNew)
+        (ctx.isQuest or ctx.isQuestStarter), setLive, true, B.DEFAULT_MIN_QUALITY, nil)
     if ctx.dimmed then glows = false end
     if glows then n = n + 2 end        -- halo + template IconBorder (borders.Apply)
     if spec.showQuestTab then n = n + 1 end
     if spec.junkCoin      then n = n + 1 end
+    -- the template's NewItemTexture sheet, exactly the element 1.x's UpdateGlow draws
+    if spec.showNewGlow   then n = n + 1 end
     if spec.showNewDot    then n = n + 1 end   -- retired (was the wax dot); must never fire
     if spec.showSetMark   then n = n + 1 end   -- retired; must never fire
     return n
@@ -486,16 +502,12 @@ local function testCellComposition(fails)
     -- SEARCH DIM.
     ck(Items.DressAlpha(true) == X.DIM_ALPHA, "dim alpha == 1.x item.lua:233 (0.3)")
 
-    -- CORNER PIPS. 1.x draws none, and 2.0 now draws none either — this row used to record
-    -- ONE knowing divergence (the crimson new-item wax dot) and no longer does. The dot is
-    -- retired in favour of a crimson BRANCH of the glow chain plus a slow pulse, which is
-    -- 1.x's own model (one cue per cell, expressed as a branch) applied to a fact 1.x had no
-    -- cue for at all. See borders.lua's NEW-ITEM ARCHAEOLOGY block for the evidence that
-    -- 1.x genuinely had no new-item treatment: item.lua:49 hides NewItemTexture outright and
-    -- the glow chain at :196-205 has no `new` branch and no `glowNew` setting behind it.
-    ck(X.CORNER_PIPS == 0 and X.NEWITEM_KILLED == true, "1.x model: no corner pips at all")
+    -- CORNER PIPS. 1.x draws no ADDON-OWNED corner marks, and 2.0 draws none either. Both
+    -- 2.0 pips are retired: the set cue is 1.x's teal glow branch, and the new-item cue is
+    -- 1.x's own NewItemTexture sheet (a TEMPLATE region, not addon art).
+    ck(X.CORNER_PIPS == 0, "1.x model: no addon-owned corner pips at all")
     ck(Items.MarkerArt("set") == nil, "2.0: the set pip is retired (1.x makes it a teal glow)")
-    ck(Items.MarkerArt("new") == nil, "2.0: the new-item wax dot is retired (now a glow branch)")
+    ck(Items.MarkerArt("new") == nil, "2.0: the new-item wax dot is retired (1.x uses the template sheet)")
     ck(Items.MarkerArt("quest") ~= nil, "…and the quest bang glyph, which 1.x DOES draw, stays")
     ck(Items.ResolveState({ quality = 3, isSet = true }).showSetMark == false,
         "…and no state can turn the set pip back on")
@@ -526,36 +538,56 @@ local function testCellComposition(fails)
         == Parity.TwoOhElementCount(ctxOf(3)),
         "…so a RARE set member draws the same cell as a rare non-member")
 
-    -- NEW ITEM: the row that used to carry the single knowing divergence. It is now ZERO
-    -- extra elements — a new COMMON item draws icon + slot border + halo + ring, which is
-    -- two MORE than 1.x's bare common cell only because 1.x would not glow a common at all.
-    -- The pin that matters is that 2.0 adds no ELEMENT for newness beyond the halo/ring pair
-    -- the glow chain already owns: a new cell and a rare cell draw the same COUNT.
-    local newCtx = ctxOf(1, { isNew = true })
-    ck(Parity.TwoOhElementCount(newCtx) == Parity.TwoOhElementCount(ctxOf(3)),
-        "NEW item: same element count as any other glowing cell — the cue is the tint, not a mark")
-    ck(Parity.TwoOhElementCount(ctxOf(3, { isNew = true }))
-        == Parity.TwoOhElementCount(ctxOf(3)),
-        "…and a new RARE adds nothing over a plain rare (it only recolours the halo)")
-    -- PRECEDENCE: new sits above rarity and below the three item-facts.
-    local nr = { B.NewRGB() }
-    ck(nr[1] and nr[1] > nr[2] and nr[1] > nr[3], "the new-item tint is the brand crimson")
+    -- NEW ITEM — the row that used to carry a knowing divergence, and now carries none at
+    -- all. 1.x's cue is the template's NewItemTexture sheet (frames/inventory/item.lua:99),
+    -- so it is ONE extra element on a new cell in BOTH models, at every rarity and next to
+    -- every other cue. The counts are compared model-to-model rather than to a literal.
+    ck(X.NEWITEM_DRIVEN == true and X.GLOWNEW_DEFAULT == true,
+        "1.x model: the new-item sheet IS driven, and glowNew ships ON")
+    ck(X.NEWITEM_IN_CHAIN == false,
+        "…and it is NOT a branch of the tint chain (item.lua:196-205 has four, none `new`)")
+    for _, q in ipairs({ 0, 1, 2, 3, 4, 5 }) do
+        local c = ctxOf(q, { isNew = true })
+        ck(Parity.TwoOhElementCount(c) == Parity.OneXElementCount(c),
+            "NEW q" .. q .. " cell: same element count as 1.x")
+        ck(Parity.TwoOhElementCount(c) == Parity.TwoOhElementCount(ctxOf(q)) + 1,
+            "…and it is exactly ONE element more than the same cell not-new (q" .. q .. ")")
+    end
+    -- next to the other cues, in both models
+    for _, extra in ipairs({ { isQuestStarter = true }, { isUnusable = true }, { isSet = true } }) do
+        local c = ctxOf(3, { isNew = true })
+        for k, v in pairs(extra) do c[k] = v end
+        ck(Parity.TwoOhElementCount(c) == Parity.OneXElementCount(c),
+            "NEW + another cue: same element count as 1.x")
+    end
+    -- SEARCH DIM drops it, like every other cue, in both models.
+    local dn = ctxOf(3, { isNew = true, dimmed = true })
+    ck(Parity.TwoOhElementCount(dn) == Parity.OneXElementCount(dn),
+        "a dimmed NEW cell matches 1.x too (the cue is withheld, not layered)")
+
+    -- THE TINT CHAIN IS UNTOUCHED BY NEWNESS. This is the regression the crimson branch
+    -- caused: it made "new" outrank rarity, so a freshly-looted epic lost its purple halo.
     local MIN = B.DEFAULT_MIN_QUALITY
-    ck(select(1, B.ResolveTint(4, false, false, false, true, MIN, nil, true)) == nr[1],
-        "new beats RARITY (a new epic glows crimson, not purple)")
-    ck(select(1, B.ResolveTint(4, false, true, false, true, MIN, nil, true)) == select(1, B.QuestRGB()),
-        "…but quest gold still beats new")
-    ck(select(1, B.ResolveTint(4, true, false, false, true, MIN, nil, true)) == select(1, B.UnusableRGB()),
-        "…and unusable red still beats new, so crimson only ever marks a USABLE item")
-    ck(B.GlowShown(1, false, false, false, true, MIN, nil, true) == true,
-        "a new COMMON glows even though its rarity is below the floor")
-    ck(B.GlowShown(1, false, false, false, true, MIN, nil, false) == false,
-        "…and stops the moment it is no longer new")
-    -- The pulse is real and subtle (a slow breathe, not 1.x's FlashFind strobe).
-    ck(B.PULSE_DURATION and B.PULSE_DURATION >= 0.5,
-        "the new-item pulse is slow (>=0.5s per half-cycle), not a strobe")
-    ck(B.PULSE_MIN and B.PULSE_MIN > 0.25 and B.PULSE_MIN < B.PULSE_MAX,
-        "…and shallow: it never fades the halo out, it breathes it")
+    ck(B.ResolveTint(4, false, false, false, true, MIN) ~= nil,
+        "an epic glows on its own rarity…")
+    ck(select(1, B.ResolveTint(4, false, false, false, true, MIN))
+        == select(1, B.QualityRGB(4)),
+        "…and a NEW epic glows the SAME purple (newness cannot recolour the halo)")
+    ck(B.GlowShown(1, false, false, false, true, MIN) == false,
+        "a COMMON does not glow, new or not (the floor is a rarity fact)")
+    ck(Items.ResolveState({ quality = 1, isNew = true, filled = true }).showNewGlow == true,
+        "…yet a new COMMON still shows the sheet — that is where its cue lives")
+    ck(B.NewRGB == nil and B.PULSE_DURATION == nil,
+        "the crimson tint and the halo pulse are RETIRED, not merely unused")
+
+    -- THE ATLAS + THE LIFECYCLE, against 1.x's own two lines.
+    ck(X.NEWITEM_ATLAS == true and Items.NewItemAtlas(4) == "bags-glow-purple"
+        and Items.NewItemAtlas(1) == "bags-glow-white",
+        "the sheet takes NEW_ITEM_ATLAS_BY_QUALITY with the white fallback (item.lua:103)")
+    ck(X.NEWITEM_ANIMS == 2 and type(Items._applyNewCue) == "function",
+        "…and both template motors are driven (item.lua:104-105)")
+    ck(X.NEWITEM_CLEARS_ON == "hover" and type(Items.MarkSeen) == "function",
+        "…and it clears on hover through C_NewItems, exactly as 1.x's MarkSeen does")
 end
 
 -- MUTATION TESTS. A parity suite that cannot fail is worthless. These flip a row of the
@@ -654,6 +686,29 @@ local function testMutations(fails)
     X.SET_BRANCH_LIVE = savedLive
     ck(Parity.OneXElementCount(setCtx) == Parity.TwoOhElementCount(setCtx),
         "…and restoring the nop makes the row pass again")
+
+    -- MUTATION 6b — the NEW-ITEM row, and the one that would have caught the archaeology
+    -- error this release fixes. Put the superseded verdict back into the 1.x model ("1.x
+    -- kills NewItemTexture, so it shows no new-item cue at all") and a new cell must be
+    -- detected as a mismatch; restoring `glowNew = true` must close it again.
+    local savedNew = X.GLOWNEW_DEFAULT
+    X.GLOWNEW_DEFAULT = false
+    local newCtx = ctxOf(3, { isNew = true })
+    ck(Parity.OneXElementCount(newCtx) ~= Parity.TwoOhElementCount(newCtx),
+        "MUTATION: a 1.x model with NO new-item cue is detected (the new-item row is live)")
+    X.GLOWNEW_DEFAULT = savedNew
+    ck(Parity.OneXElementCount(newCtx) == Parity.TwoOhElementCount(newCtx),
+        "…and restoring 1.x's shipped glowNew makes the row pass again")
+    -- ...and mutated on the 2.0 side: withhold the sheet and the same row must break.
+    local realResolve = ns.Items.ResolveState
+    ns.Items.ResolveState = function(c)
+        local s = realResolve(c); s.showNewGlow = false; return s
+    end
+    ck(Parity.OneXElementCount(newCtx) ~= Parity.TwoOhElementCount(newCtx),
+        "MUTATION: a 2.0 that draws no new-item sheet is detected too")
+    ns.Items.ResolveState = realResolve
+    ck(Parity.OneXElementCount(newCtx) == Parity.TwoOhElementCount(newCtx),
+        "…and restoring the sheet makes the row pass again")
 
     -- MUTATION 7 — the ELEMENT-COUNT row, mutated on the 2.0 side. Re-introduce a cell
     -- substrate (the retired well) as one more drawn element and the count row must break.

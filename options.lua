@@ -240,13 +240,12 @@ function Options.Build(flow)
         set = function(v) local db = DB(); if db then db.setMarkers = v and true or false end regrid() end,
     }).Refresh)
 
-    -- New-item crimson + pulse. DEFAULT ON: unlike the set teal this cue is transient (it
-    -- clears the moment the game's own new-item set does), so it cannot permanently repaint
-    -- the bag. It replaced the crimson corner dot 2.0 used to draw — see borders.lua's
-    -- NEW-ITEM ARCHAEOLOGY block for why Bags 1 has no counterpart to copy here.
+    -- New-item glow sheet. DEFAULT ON, which is Bags 1's own shipped `glowNew`. This is
+    -- Bags 1's indicator restored: the game's own per-quality "new loot" glow plus its
+    -- flash, on its own layer — so it never takes a colour away from anything else.
     register(ib:Checkbox({
         label = "Glow newly-acquired items",
-        tooltip = "Glow items you have picked up but not looked at yet in crimson, with a slow pulse. The cue clears as soon as you interact with the item. It sits below the quest, unusable and equipment-set colours, so it never hides one of those — but it does win over the plain rarity colour while the item is new.",
+        tooltip = "Show the game's own 'new item' glow — the coloured burst and slow pulse Bags 1 used — on items you have picked up but not looked at yet. The cue clears as soon as you hover the item. It draws OVER the slot rather than recolouring it, so a new epic still shows its purple border.",
         get = function() return not (ns.Borders and ns.Borders.NewCueEnabled) or ns.Borders.NewCueEnabled() end,
         set = function(v) local db = DB(); if db then db.newItemMarkers = v and true or false end regrid() end,
     }).Refresh)
