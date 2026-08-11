@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### The search box stops lying about items it already has
+
+Type a search while your bags hold something the game has not fully loaded yet and Bags
+asks the game for the missing details. Sometimes the game answers *instantly* — inside the
+same request, before Bags has finished asking. Bags was not listening yet at that moment,
+so those answers went nowhere: the matching item stayed greyed out as if it did not match,
+and the Find window kept saying "still loading 3 items" about items it had been handed
+already. Typing another character fixed it, which is why it looked like nothing was wrong.
+Bags now starts listening before it asks, so an instant answer lands the first time.
+
+### Sorting keeps its own receipts straight
+
+The sort engine writes down what each move is going to do, then tells the game to do it.
+Those two steps were the wrong way round. When the game reported a slot's progress from
+*inside* the move request — which it does — the report arrived before the note existed, so
+the engine ignored its own confirmation, fell back to a slower timer, and recorded
+round-trip times that were too high (which then made every later sort more patient than it
+needed to be). The note is written first now. Nothing about the sort looks different; it
+simply hears itself.
+
+### An interrupted sort stops once, not twice
+
+If a sort has to give up it first pulls your items back to close the gaps it opened. Get
+pulled into combat while that tidy-up is going out and Bags could start the whole shutdown
+a second time from inside the first — two "sort stopped" lines, two entries in the sort
+log, and a handful of item moves issued after the sort had already packed up. It now stops
+exactly once, and refuses any further shutdown until the first one has finished.
+
+Also in this release: the sort engine now refuses, with a note, any attempt to start a new
+wave of moves from inside a wave already going out, rather than stacking them up. Nothing
+in Bags does that today; it is there so that a future change, or another addon reacting to
+the same game events, degrades into a skipped wave instead of a frozen client.
+
 ## 2.0.7 — 2026-08-10
 
 ### Your bags work in combat again

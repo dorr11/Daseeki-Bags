@@ -289,12 +289,23 @@ function Search.Filter()
         button:SetDimmed(not matched)
         if pending then
             Search._watch[data.id] = true
+            -- ── CLASS 9 (2026-08-11): SUBSCRIBE BEFORE THE ASK ───────────────────────
+            -- ensureEventFrame() used to run BELOW this loop, after every request had
+            -- already gone out. RequestLoadItemDataByID does not always schedule its
+            -- answer — for an id the client already holds it dispatches
+            -- GET_ITEM_INFO_RECEIVED from inside the request — so on the FIRST filter pass
+            -- (the one that builds the frame) every in-call answer was delivered to no
+            -- listener at all. `_watch[id]` stayed set, nothing re-filtered, and the cell
+            -- kept whatever dim state the cold read gave it until the owner typed again.
+            -- Called per pending id rather than once above the loop so the warm path is
+            -- untaxed exactly as before: nothing pending, no frame (the gate the old
+            -- `if next(Search._watch)` provided). EnsureEventFrame is idempotent.
+            ensureEventFrame()
             if _G.C_Item and _G.C_Item.RequestLoadItemDataByID then
                 _G.C_Item.RequestLoadItemDataByID(data.id)
             end
         end
     end)
-    if next(Search._watch) then ensureEventFrame() end
 end
 
 -- Debounced filter (coalesce as-you-type keystrokes + info-received bursts into one
@@ -485,12 +496,143 @@ local function testSetMatcher(fails)
     ck(m2 == false and p2 == false, "Armory absent -> named set: inert too")
 end
 
+----------------------------------------------------------------------
+-- CLASS 9 — the LIVE filter chain under synchronous in-call dispatch (2026-08-11)
+--
+-- Search.Filter walks every live button, and for each one it cannot judge it puts the id
+-- on the watch and asks the client for the data. The client does not always SCHEDULE the
+-- answer: for an id it already holds, GET_ITEM_INFO_RECEIVED is dispatched from INSIDE
+-- RequestLoadItemDataByID, so the pass's FIRST ask is also its first echo. Whether that
+-- echo is heard depends entirely on whether the listener existed before it.
+--
+-- The client double below defaults to the UNKIND posture (answer in the call) with the
+-- old one kept as a named variant, and the suite runs the same pass both ways plus a red
+-- control that rebuilds the shipped ordering exactly.
+----------------------------------------------------------------------
+local function testLiveFilterInCall(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedFrame, savedCI, savedCF = ns.Frame, _G.C_Item, _G.CreateFrame
+    local savedWatch, savedEvt, savedQ = Search._watch, Search._evt, Search._query
+    local savedQueued, savedTimer = Search._filterQueued, _G.C_Timer
+
+    local CAT = { [11] = { name = "Frostweave", quality = 2, itype = "Trade Goods" },
+                  [12] = { name = "Frostmourne", quality = 5, itype = "Weapon" } }
+
+    -- `dispatch` is the posture; `instantWarm` is "the client already holds this id".
+    -- `deaf` is the RED CONTROL knob: the number of listeners that existed when the pass
+    -- started. While it is set, an in-call echo reaches only those — which is precisely
+    -- what "the watch frame is built AFTER the asks" means, with no need to break
+    -- CreateFrame and no edit to the file under test.
+    local dispatch, warm, asks, frames, dimmed, passes, deaf
+    local function fire(id)
+        local last = deaf or #frames
+        for i = 1, last do
+            local f = frames[i]
+            if f and f._events["GET_ITEM_INFO_RECEIVED"] and f._onEvent then
+                f._onEvent(f, "GET_ITEM_INFO_RECEIVED", id)
+            end
+        end
+    end
+    local function world()
+        warm, asks, frames, dimmed, passes, deaf = {}, {}, {}, {}, 0, nil
+        _G.C_Item = {
+            GetItemInfoInstant = function(id)
+                local e = CAT[id]; if not e then return nil end
+                return id, e.itype, e.itype, "", 7000 + id
+            end,
+            GetItemInfo = function(id)
+                local e = CAT[id]
+                if not (e and warm[id]) then return nil end
+                return e.name, "item:" .. id, e.quality
+            end,
+            RequestLoadItemDataByID = function(id)
+                asks[id] = (asks[id] or 0) + 1
+                if dispatch == "sync" then warm[id] = true; fire(id) end
+            end,
+        }
+        _G.CreateFrame = function()
+            local f = { _events = {} }
+            function f:RegisterEvent(e) self._events[e] = true end
+            function f:SetScript(which, fn) if which == "OnEvent" then self._onEvent = fn end end
+            frames[#frames + 1] = f
+            return f
+        end
+        -- Deferrals run inline here: this suite is about ORDERING inside one call, and the
+        -- debounce is not what is under test.
+        _G.C_Timer = { After = function(_, fn) fn() end }
+        ns.Frame = { ForEachButton = function(fn)
+            passes = passes + 1
+            for _, id in ipairs({ 11, 12 }) do
+                fn({ _data = { id = id, count = 1, quality = CAT[id].quality },
+                     SetDimmed = function(_, v) dimmed[id] = v end })
+            end
+        end }
+        Search._watch, Search._evt, Search._filterQueued = {}, nil, false
+        Search._query = Search.Compile("frostmourne")
+    end
+    local function watchLeft()
+        local n = 0
+        for _ in pairs(Search._watch) do n = n + 1 end
+        return n
+    end
+
+    ------------------------------------------------------------------ GREEN (as shipped)
+    dispatch = "sync"; world()
+    Search.Filter()
+    ck(asks[11] == 1 and asks[12] == 1, "both cold ids were asked for exactly once")
+    ck(#frames == 1, "…and ONE listener was built for the answers")
+    ck(watchLeft() == 0,
+        "GREEN: every in-call answer landed — the watch emptied inside Filter itself (left "
+        .. watchLeft() .. ")")
+    ck(passes >= 2, "…and the answers re-filtered the grid without further input ("
+        .. passes .. " passes)")
+    ck(dimmed[12] == false and dimmed[11] == true,
+        "…so the matching item ends UNDIMMED and the other dimmed (the visible outcome)")
+
+    ------------------------------------------------------------------ RED CONTROL
+    -- The shipped ordering, reproduced: no listener exists while the asks go out.
+    dispatch = "sync"; world()
+    deaf = 0                                          -- nothing was listening beforehand
+    local okRed = pcall(Search.Filter)
+    deaf = nil
+    ck(okRed, "the red-control pass ran")
+    ck(watchLeft() == 2,
+        "RED CONTROL: with no listener up when the asks go out, both in-call answers are "
+        .. "delivered to nothing and both ids stay on the watch (left " .. watchLeft() .. ")")
+    ck(passes == 1, "…the grid is never re-filtered: one pass, and the dim state is the "
+        .. "cold one (" .. passes .. " pass)")
+    ck(dimmed[12] == true,
+        "…so the item the owner searched for stays DIMMED even though the client answered "
+        .. "for it inside the very call that asked")
+
+    ------------------------------------------------------------------ THE BLIND SPOT
+    -- Same late-listener sequence, async delivery: nothing arrives in the call, the frame
+    -- is built afterwards, and the later answer is caught. This posture cannot see it.
+    dispatch = "async"; world()
+    deaf = 0
+    Search.Filter()
+    deaf = nil
+    ck(watchLeft() == 2, "async premise: nothing answered in the call")
+    warm[11], warm[12] = true, true
+    fire(11); fire(12)                                -- the answers arrive later, as before
+    ck(dimmed[12] == false,
+        "…and under async the answer still lands: a sim that delivers after the call "
+        .. "returns can never see this defect")
+
+    ns.Frame, _G.C_Item, _G.CreateFrame = savedFrame, savedCI, savedCF
+    _G.C_Timer = savedTimer
+    Search._watch, Search._evt, Search._query = savedWatch, savedEvt, savedQ
+    Search._filterQueued = savedQueued
+end
+
 function Search.RunSelfTests(verbose)
     local suites = {
         { name = "tokenize",       fn = testTokenize },
         { name = "parse quality",  fn = testParseQuality },
         { name = "match matrix",   fn = testMatchMatrix },
         { name = "set matcher",    fn = testSetMatcher },
+        { name = "class 9: live filter in-call answers", fn = testLiveFilterInCall },
     }
     local allPass = true
     for _, suite in ipairs(suites) do
