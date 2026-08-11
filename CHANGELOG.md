@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.7 — 2026-08-10
 
 ### Your bags work in combat again
 
