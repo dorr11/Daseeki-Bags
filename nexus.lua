@@ -220,6 +220,52 @@ local function carryNumber(fromPayload, fromCurrent)
     return 0                                 -- nothing known anywhere -> the record default
 end
 
+-- BAG-4b (honesty brief) — ABSENT IS ABSENT, NOT EMPTY.
+--
+-- BAG-4's rule, carried to the fields that are not sums. Same mechanism (rule 3
+-- replaces WHOLESALE), same lie in a different shape, and this half is worse
+-- because there is no arithmetic reason to invent a default at all:
+--
+--   * class / race / sex / faction — a payload that says nothing about them used
+--     to blank what we already knew. The row loses its class colour and its
+--     race/sex portrait, and `ui_owner.lua:518`'s faction gate stops being able
+--     to place the character on a side.
+--   * itemCounts — a payload with NO count map at all used to land as an EMPTY
+--     one, and an empty map is not silence. `Features.CountItemInOwner` reads it
+--     as the affirmative claim "this owner holds none of that item" and returns
+--     nil, so Find and the item tooltip drop the alt from the results entirely.
+--     A bankalt holding 40 Runecloth reports zero, and nothing on screen looks
+--     broken — the same signature as BAG-4's silently short gold total.
+--
+-- The three cases, exactly as `carryNumber`'s, with one difference in the last:
+--   present                -> the payload wins.
+--   absent                 -> what we already hold stands.
+--   nothing known anywhere -> **nil**, not a default. Nothing downstream sums
+--     these, so absence can and must stay absent: `classRGB(nil)` is the neutral
+--     colour, `Owner.IconMarkup` skips an icon it cannot name, and the faction
+--     gate deliberately does not filter a nil faction. Rendering "unknown" is
+--     the honest answer and every consumer already has one.
+--
+-- "" is not an answer for any of these fields — no character's class is the empty
+-- string — so an empty string reads as absent rather than as an affirmative.
+local function carryField(fromPayload, fromCurrent)
+    if fromPayload ~= nil and fromPayload ~= "" then return fromPayload end
+    if fromCurrent ~= nil and fromCurrent ~= "" then return fromCurrent end
+    return nil
+end
+
+-- Copy an aggregate count map into `dst`, dropping junk ids and non-positive
+-- counts. Shared by the payload and carry-forward branches so a carried map is
+-- sanitised on exactly the same terms as a fresh one, and so the merged view
+-- never hands out the store's own table by reference.
+local function copyCounts(dst, src)
+    if type(src) ~= "table" then return end
+    for id, n in pairs(src) do
+        id, n = tonumber(id), tonumber(n)
+        if id and n and id > 0 and n > 0 then dst[id] = n end
+    end
+end
+
 -- Convert { rev, updatedAt, data = <wire payload> } into a store-shaped owner record.
 -- Always source = "summary": the wire contract carries aggregate itemCounts and money,
 -- never per-slot containers, which is precisely what "summary" means here (store.lua
@@ -240,19 +286,21 @@ function Nexus.ToOwnerRecord(ownerKey, entry, cur)
     local o = Store.NewOwner(ownerKey, name, realm)
     o.source  = "summary"
     o.account = ""                       -- remote/unknown, as migrate.ConvertSummaryChar
-    o.class   = d.class
-    o.race    = d.race
-    o.sex     = tonumber(d.sex)
-    o.faction = d.faction
+    o.class   = carryField(d.class, cur.class)
+    o.race    = carryField(d.race, cur.race)
+    o.sex     = carryField(tonumber(d.sex), tonumber(cur.sex))
+    o.faction = carryField(d.faction, cur.faction)
     o.level   = carryNumber(d.level, cur.level)
     o.money   = carryNumber(d.money, cur.money)
     o.rev     = tonumber(entry.rev) or 0
     o.ts      = Nexus.EntryTimestamp(entry)
+    -- BAG-4b: a count map that is PRESENT is the answer, empty included — an alt
+    -- scanned down to nothing is a real state and has to be able to say so. A
+    -- count map that is ABSENT is silence, and the counts we already hold stand.
     if type(d.itemCounts) == "table" then
-        for id, n in pairs(d.itemCounts) do
-            id, n = tonumber(id), tonumber(n)
-            if id and n and id > 0 and n > 0 then o.itemCounts[id] = n end
-        end
+        copyCounts(o.itemCounts, d.itemCounts)
+    else
+        copyCounts(o.itemCounts, cur.itemCounts)
     end
     o.nexus = true
     return o
@@ -279,9 +327,10 @@ end
 --      normal case for the same snapshot reaching both stores, and a stable
 --      tiebreak keeps the money tooltip from flickering between two equal copies.
 --      The replacement is WHOLESALE, which is why the record being replaced is handed
---      to ToOwnerRecord: a number the winning payload does not carry is UNKNOWN and
---      carries forward from the record it displaces (BAG-4). "Newer" means the payload
---      supersedes what it actually says, not that it erases what it never mentioned.
+--      to ToOwnerRecord: anything the winning payload does not carry is UNKNOWN and
+--      carries forward from the record it displaces — numbers (BAG-4), identity fields
+--      and the aggregate count map (BAG-4b). "Newer" means the payload supersedes what
+--      it actually says, not that it erases what it never mentioned.
 --
 -- KEY ALIASING (gold is sacred): two graphs that disagree about realm spacing or
 -- capitalisation for the SAME character would merge as two owners, and the money
@@ -655,6 +704,149 @@ local function testAbsentIsAbsent(fails)
         "a staler omitting payload is refused before conversion, as before")
 end
 
+-- BAG-4b — ABSENT IS ABSENT, NOT EMPTY: the same rule on the fields that are not
+-- sums, through the real merge path.
+--
+-- BAG-4 proved the numbers. The rest of the record had the identical exposure and
+-- was left standing as a recorded latent: rule 3 replaces WHOLESALE, so a payload
+-- that omits class/race/sex/faction blanked the identity we already had, and a
+-- payload with no `itemCounts` key at all landed as an EMPTY count map. Empty is
+-- not silence — `Features.CountItemInOwner` reads an empty map as the affirmative
+-- "this owner holds none of it" and returns nil, which is how an omitted map
+-- DROPS THAT ALT FROM FIND. Nothing reaches disk, nothing looks broken, and the
+-- answer on screen is a flat lie about a bankalt's stock.
+local function testAbsentIsAbsentFields(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local RUNECLOTH = 14047
+
+    -- A relayed payload carrying money and nothing else about the character: no
+    -- identity fields, no count map. An older Nexus build, or a trimmed frame.
+    local function bare(key, ts)
+        return { rev = 9, updatedAt = ts + 100,
+                 data = { key = key, money = 777, ts = ts } }
+    end
+    local function bagsSummary(key, ts)
+        return { nameRealm = key, name = key:match("^[^-]+"), source = "summary",
+                 class = "MAGE", race = "Gnome", sex = 2, faction = "Alliance",
+                 money = 1, level = 60, ts = ts,
+                 containers = {}, equip = {}, itemCounts = { [RUNECLOTH] = 40 } }
+    end
+
+    -- ── THE RED CONTROL ──────────────────────────────────────────────────────
+    -- The pre-fix conversion, transcribed from the code this row replaces. Run on
+    -- the very payload the shipping path now survives, it must be SEEN to tell the
+    -- lie — otherwise the rows below are passing on a fixture that could never
+    -- have caught the defect.
+    local function legacyRecord(entry, cur)
+        local d = entry.data
+        local o = { class = d.class, race = d.race, sex = tonumber(d.sex),
+                    faction = d.faction, source = "summary",
+                    containers = {}, equip = {}, itemCounts = {} }
+        if type(d.itemCounts) == "table" then
+            for id, n in pairs(d.itemCounts) do
+                id, n = tonumber(id), tonumber(n)
+                if id and n and id > 0 and n > 0 then o.itemCounts[id] = n end
+            end
+        end
+        return o, cur
+    end
+    -- Resolved at CALL time (features.lua loads after this file) and ASSERTED, so
+    -- the consumer-facing rows below can never silently skip themselves.
+    local Features = ns and ns.Features
+    ck(Features and Features.CountItemInOwner,
+        "BAG-4b: ns.Features.CountItemInOwner is unreachable — the rows that prove the "
+        .. "user-visible consequence cannot run")
+    local lie = legacyRecord(bare("Banker-Whitemane", 1700009000),
+                             bagsSummary("Banker-Whitemane", 1700000000))
+    ck(lie.class == nil and lie.race == nil and lie.sex == nil and lie.faction == nil,
+        "BAG-4b RED CONTROL: the old conversion did NOT blank the identity fields — "
+        .. "the fixture cannot expose the defect")
+    ck(next(lie.itemCounts) == nil,
+        "BAG-4b RED CONTROL: the old conversion did NOT empty the count map")
+    if Features and Features.CountItemInOwner then
+        ck(Features.CountItemInOwner(lie, RUNECLOTH) == nil,
+            "BAG-4b RED CONTROL: the emptied map did not read as 'holds none' — "
+            .. "the user-visible lie is not being reproduced")
+    end
+
+    -- ── THE FIX, through the real merge path ────────────────────────────────
+    local localOwners = { ["Banker-Whitemane"] = bagsSummary("Banker-Whitemane", 1700000000) }
+    local merged = Nexus.MergeOwners(localOwners,
+        { ["Banker-Whitemane"] = bare("Banker-Whitemane", 1700009000) })   -- strictly NEWER
+    local rec = merged["Banker-Whitemane"]
+
+    ck(rec ~= nil and rec.nexus == true and rec.money == 777,
+        "the newer payload still supersedes, and what it DOES carry is taken (rule 3 unchanged)")
+    -- Per field, one row each.
+    ck(rec.class == "MAGE",   "an omitted class does not blank the row's class colour")
+    ck(rec.race == "Gnome",   "an omitted race does not blank the portrait")
+    ck(rec.sex == 2,          "an omitted sex does not blank the portrait")
+    ck(rec.faction == "Alliance",
+        "an omitted faction does not un-side the character (ui_owner's faction gate)")
+    ck(rec.itemCounts[RUNECLOTH] == 40,
+        "an omitted itemCounts map does not claim the bankalt holds nothing")
+    if Features and Features.CountItemInOwner then
+        local n = Features.CountItemInOwner(rec, RUNECLOTH)
+        ck(n ~= nil and n.total == 40,
+            "…and Find still finds the 40 Runecloth: the alt is not dropped from the results")
+    end
+    ck(localOwners["Banker-Whitemane"].itemCounts[RUNECLOTH] == 40
+        and rec.itemCounts ~= localOwners["Banker-Whitemane"].itemCounts,
+        "the carried map is a COPY — the merged view never aliases the store's table")
+
+    -- ── THE OTHER HALF: what the payload DOES say is an answer, empty included ─
+    local present = Nexus.MergeOwners(
+        { ["Sold-Whitemane"] = bagsSummary("Sold-Whitemane", 1700000000) },
+        { ["Sold-Whitemane"] = { rev = 9, updatedAt = 1700009100, data = {
+              key = "Sold-Whitemane", class = "ROGUE", race = "Troll", sex = 3,
+              faction = "Horde", itemCounts = {}, ts = 1700009000 } } })
+    local p = present["Sold-Whitemane"]
+    ck(p.class == "ROGUE" and p.race == "Troll" and p.sex == 3 and p.faction == "Horde",
+        "a PRESENT identity field overwrites outright — this is a different character now")
+    ck(next(p.itemCounts) == nil,
+        "a PRESENT but EMPTY count map writes through: an alt scanned down to nothing "
+        .. "is a real state, not an absence")
+    if Features and Features.CountItemInOwner then
+        ck(Features.CountItemInOwner(p, RUNECLOTH) == nil,
+            "…so the alt that genuinely sold its stock correctly reports none")
+    end
+
+    -- ── NOTHING KNOWN ANYWHERE -> nil, not a default ────────────────────────
+    -- Nothing sums these, so there is no arithmetic reason to invent an answer.
+    -- Store.NewOwner already defaults them to nil and every consumer renders
+    -- unknown; the record must not quietly acquire a fake one.
+    local fresh = Nexus.MergeOwners({}, { ["New-Faerlina"] = bare("New-Faerlina", 1700009000) })
+    local f = fresh["New-Faerlina"]
+    ck(f.class == nil and f.race == nil and f.sex == nil and f.faction == nil,
+        "a brand-new Nexus-only owner with no identity in the payload stays UNKNOWN, not blank-but-present")
+    ck(next(f.itemCounts) == nil,
+        "…and its count map is empty because nothing is known, which is the same reading Find already had")
+
+    -- An empty string is not an answer for any of these fields.
+    local blankish = Nexus.ToOwnerRecord("A-R",
+        { data = { key = "A-R", class = "", race = "", faction = "" } },
+        { class = "MAGE", race = "Gnome", faction = "Alliance" })
+    ck(blankish.class == "MAGE" and blankish.race == "Gnome" and blankish.faction == "Alliance",
+        "an empty string reads as absent, not as an affirmative 'no class'")
+
+    -- Junk in a carried map is dropped on the same terms as junk in a fresh one.
+    local dirty = Nexus.ToOwnerRecord("A-R", { data = { key = "A-R", money = 1 } },
+        { itemCounts = { [0] = 5, ["x"] = 2, [7] = -1, [RUNECLOTH] = 40 } })
+    ck(dirty.itemCounts[RUNECLOTH] == 40 and dirty.itemCounts[0] == nil
+        and dirty.itemCounts[7] == nil,
+        "a carried count map is sanitised exactly like a payload one")
+
+    -- Rule 2 and the stale case are untouched: neither reaches the conversion.
+    local full = Nexus.MergeOwners(
+        { ["Main-Whitemane"] = { nameRealm = "Main-Whitemane", name = "Main", source = "full",
+              class = "MAGE", money = 5, level = 60, ts = 1700000000,
+              containers = {}, equip = {}, itemCounts = { [RUNECLOTH] = 40 } } },
+        { ["Main-Whitemane"] = bare("Main-Whitemane", 1700009000) })
+    ck(full["Main-Whitemane"].source == "full" and full["Main-Whitemane"].class == "MAGE",
+        "a full local owner is still untouchable")
+end
+
 -- THE PRECEDENCE RULE, in both directions.
 local function testNewestWins(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
@@ -812,6 +1004,7 @@ function Nexus.RunSelfTests(verbose)
         { name = "presence + enablement probes", fn = testProbes },
         { name = "wire payload -> owner record", fn = testConversion },
         { name = "absent is absent, not zero",   fn = testAbsentIsAbsent },
+        { name = "absent is absent, not empty",  fn = testAbsentIsAbsentFields },
         { name = "newest-wins precedence",       fn = testNewestWins },
         { name = "key aliasing (no phantom gold)", fn = testKeyAliasing },
         { name = "live fallback + cache",        fn = testLiveFallback },
