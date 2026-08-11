@@ -1,7 +1,7 @@
 # CurseForge Description — Daseeki Bags
 
 <!-- Canonical CurseForge project description. Update here first, then paste to
-     the CurseForge project (1592410). Last synced: 2026-08-10 (v2.0.7). -->
+     the CurseForge project (1592410). Last synced: 2026-08-11 (v2.0.8). -->
 
 A complete bag replacement for WoW Classic Era — one combined, sortable, searchable window for your bags, bank, and keyring, rebuilt from the ground up for 2.0.
 

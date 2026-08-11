@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.8 — 2026-08-11
 
 ### A trimmed update from another computer can no longer blank an alt
 
