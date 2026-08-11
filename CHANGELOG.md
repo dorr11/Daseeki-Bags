@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+### Your bags work in combat again
+
+Open your bags during a pull and you got a partial first row and then a black rectangle for
+the rest of the fight. The counter at the bottom cheerfully said 9/92, so Bags knew exactly
+what was in there — it just refused to draw it. Loot something or drink a potion with the
+window already open and it went the same way. In a raid, where your bags change every few
+seconds, the window was effectively dead from the moment combat started until it ended.
+
+That was not a bug in the drawing code. It was a rule Bags 2 was built with, and the rule
+was simply wrong. Somewhere in 2.0.4 the belief took hold that moving or creating a bag
+slot during combat is forbidden by the game — so Bags stopped doing it and queued the whole
+layout until the fight was over. 2.0.5 softened it enough to let a slot's *contents* redraw,
+which is why an equip swap started updating mid-fight, but anything that changed the shape
+of the grid — including simply opening it — still waited for combat to end.
+
+The restriction the rule was guarding against is real, but it applies to a kind of frame
+Bags does not use. Bags 1 laid your bags out mid-combat for years on this same account and
+never had this problem; the standard Blizzard bags do it on every loot; and Bags 2 asks the
+game directly now rather than assuming. So the deferral is gone. In combat, your bags draw
+exactly the way they draw out of combat.
+
+Two things are deliberately kept. When nothing has actually moved — you swapped your
+off-hand and one slot changed — Bags still takes the cheap "just repaint that cell" path
+rather than re-placing 92 slots, which is what keeps the live sort smooth. And on the day
+some future game patch really does lock these slots down, Bags will notice, tell you why,
+and fall back to drawing when the fight ends instead of throwing errors at you mid-pull.
+
+Nothing else changed: sorting mid-combat, the live sort animation, bank slots and the
+equip-swap refresh all behave as they did in 2.0.6.
+
 ## 2.0.6 — 2026-08-10
 
 ### The "new item" marker is Bags 1's again

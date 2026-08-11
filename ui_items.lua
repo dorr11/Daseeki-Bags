@@ -31,8 +31,9 @@
 -- carrying holder:SetID(cid); with button:SetID(slot) the template's OWN default
 -- secure/combat-correct handlers (pickup / place / split / use / real-slot tooltip)
 -- operate on the right (bag, slot) with zero behavior re-implemented — the public
--- Blizzard template contract, not transcribed addon code. Structural (re)builds are
--- deferred out of combat (secure frames are protected). The ONE routed surface is the
+-- Blizzard template contract, not transcribed addon code. Structural (re)builds run in
+-- combat like any other layout: these cells are OUR frames, not protected ones — see the
+-- COMBAT LAYOUT banner above Items.CombatLayoutMode. The ONE routed surface is the
 -- TOOLTIP (OnEnter + the UpdateTooltip refresh field), and only for the BANK MAIN
 -- CONTAINER (-1), which the container template cannot draw a tooltip for at all — see
 -- the BAG-6 / BAG-6b banners above Items._liveOnEnter.
@@ -1478,20 +1479,22 @@ local function applyLockLayer(button)
     local active = (action == "lock") and button._cid ~= nil and button._slot ~= nil
     if not active then
         if button._dsLockMark then button._dsLockMark:Hide() end
-        -- _dsLockCatch is a FRAME parented to a live item button, so hiding it is a frame
-        -- op on something the client may treat as protected. paintButton runs this on every
-        -- repaint, and 2.0.5 lets repaints happen in combat — so skip the call entirely when
-        -- it would change nothing, which is the case on every ordinary paint (the catcher
-        -- only exists at all once lock-configuration mode has been opened once).
+        -- _dsLockCatch is a FRAME this addon created and parented to an item button, so
+        -- hiding it is legal at any time (2.0.7 settled that question: nothing in this
+        -- chain is a protected frame). Skipping the call when it would change nothing is
+        -- now purely about cost — paintButton runs this on every repaint, and repaints run
+        -- at ~8 Hz during a sort. The catcher only exists at all once lock-configuration
+        -- mode has been opened once.
         local catch = button._dsLockCatch
         if catch and not (catch.IsShown and catch:IsShown() == false) then catch:Hide() end
         return
     end
-    -- Building the layer CREATES a frame parented to a live item button, which is
-    -- structural work and must never happen in combat (2.0.5, with the in-combat repaint:
-    -- paintButton reaches this line during a fight now, where before it could not). Lock
-    -- mode is a deliberate out-of-combat gesture, so if it is genuinely open the cells
-    -- already carry their layer and this guard is not reached.
+    -- Building the layer creates a catcher Button + two textures PER CELL. That is legal
+    -- in combat (2.0.7: our frames, not protected ones — see the COMBAT LAYOUT banner), but
+    -- it is not free, and lock-configuration mode is a deliberate out-of-combat gesture: if
+    -- it is genuinely open, the cells already carry their layer and this guard is never
+    -- reached. So the one thing this refuses is building 90-odd catcher frames mid-pull for
+    -- a mode the owner opened during the fight. Cost, not protection.
     if _G.InCombatLockdown and _G.InCombatLockdown() and not button._dsLockCatch then return end
     ensureLockLayer(button)
     if not button._dsLockCatch then return end   -- headless
@@ -2549,32 +2552,73 @@ local function combatFlush(G)
 end
 
 ----------------------------------------------------------------------
--- IN-COMBAT REPAINT  (2.0.5) — the other half of the stale-cell defect
+-- COMBAT LAYOUT  (2.0.7) — the premise 2.0.4 shipped was wrong, and it cost a raid night
 --
--- 2.0.4 deferred EVERY live relayout in combat, wholesale, "for simplicity". The comment
--- was right about the danger and wrong about the scope, and the gap is exactly the owner's
--- report: equip a shield mid-fight and the bag cell that now holds your off-hand keeps
--- drawing the shield, because during combat NOTHING is drawn at all. Fixing capture alone
--- would not have moved that icon by one pixel.
+-- THE LIVE DEFECT. Open the bags mid-fight and the window drew a partial first row and
+-- then nothing — a near-black rectangle for the whole pull, while the counter cheerfully
+-- read 9/92. The model was fine; only rendering was dead. Loot something, consume
+-- something, and the same thing happens to an already-open window, which in a raid is
+-- constantly. The cause was designed in, right here.
 --
--- What is actually unsafe in combat is the STRUCTURAL work: CreateFrame for a new live
--- button (ContainerFrameItemButtonTemplate), SetParent onto a different bag holder,
--- ClearAllPoints/SetPoint, SetSize, Show/Hide. What is safe is a DATA repaint of buttons
--- that already exist, are already anchored and are already shown — SetItemButtonTexture,
--- SetItemButtonCount, SetItemButtonQuality, the border tint chain and the cooldown sweep.
--- That is precisely what Blizzard's own ContainerFrame_Update does on every in-combat
--- BAG_UPDATE, and what 1.x did here for years with no combat gate whatsoever (its
--- core/classes/itemGroup.lua has no InCombatLockdown branch at all) — which is why 1.x
--- never had this bug.
+-- THE HISTORY. 2.0.4 deferred EVERY live relayout in combat, wholesale, on the claim that
+-- "structural work (CreateFrame/SetParent/SetPoint/SetSize/Show/Hide) must never happen in
+-- combat because secure frames are protected". 2.0.5 narrowed it to allow a DATA repaint
+-- when the layout signature was byte-identical to what was on screen AND every needed
+-- button already existed. Anything else — a fresh open (no signature yet), one more or one
+-- fewer entry, a changed (cid, slot) — was still deferred to PLAYER_REGEN_ENABLED. A fresh
+-- combat open is ALWAYS structural, so it always drew nothing.
 --
--- So the gate is narrowed to the thing it protects: when the layout is STRUCTURALLY
--- IDENTICAL to the one already on screen — same cell count, same (cid, slot, live) per
--- index, same grid geometry — combat takes a repaint-only pass that touches no frame
--- geometry. Anything else still defers to PLAYER_REGEN_ENABLED, unchanged.
+-- THE PREMISE, RE-EXAMINED — and it does not survive:
 --
--- The signature is a pure function so the decision can be pinned by a self-test without a
--- client, and Items.LastPaintMode() publishes what actually happened so capture.lua's
--- equip trace can distinguish "captured stale" from "never repainted".
+--   * "Protected" is a property of a FRAME, not of a template's name. IsProtected()
+--     (catalog 1.15.9.68808) answers `isProtected, isProtectedExplicitly`. A frame is
+--     protected when the CLIENT created it, when its template declares protected="true"
+--     (SecureActionButtonTemplate and friends), or when it hangs off a protected parent.
+--     ContainerFrameItemButtonTemplate declares no such thing; our cells are created by
+--     CreateFrame from this addon, parented to our own holder frames, inside our own
+--     window. Nothing in that chain is protected, so nothing in that chain refuses
+--     SetPoint / SetSize / SetParent / SetID / Show / Hide during lockdown.
+--   * We write no secure attributes anywhere. There is not one SetAttribute call in this
+--     addon (grep the tree), no SecureHandler, no RegisterUnitWatch, no keybinding work on
+--     a cell. The template's click behaviour is FrameXML's own insecure
+--     ContainerFrameItemButton_OnClick (a plain global), which we never replace.
+--   * 1.x PROVES IT, for years, on the owner's own account. core/classes/itemGroup.lua's
+--     Layout releases every button, rebuilds the list, SetPoints and SetScales each one,
+--     and SetSizes the grid — with no InCombatLockdown branch anywhere in the file — and
+--     core/classes/item.lua:New does b:SetID(slot) and b:Show() on the SAME
+--     ContainerFrameItemButtonTemplate. Bags 1 never had this bug because Bags 1 never
+--     stopped drawing.
+--   * Blizzard's own ContainerFrame_Update relayouts container item buttons on in-combat
+--     BAG_UPDATEs, which is why the stock bags keep working in a raid.
+--
+--   VERDICT: layout of these cells is combat-legal. The blanket structural deferral is
+--   removed. In combat, layout runs exactly as it does out of combat — as 1.x did.
+--
+-- WHAT THE SEAM IS NOW. CombatLayoutMode stays as the one named place the decision is
+-- made, but its verdict changed. Three answers instead of two:
+--   "repaint" — the structure on screen is already identical and every cell has a button:
+--               take the cheap data-only pass (2.0.5's win, kept). Not a safety measure
+--               any more, just the shortcut that avoids re-anchoring 92 correct cells 8
+--               times a second while a sort runs.
+--   "layout"  — anything else: draw it, in combat, like any other frame.
+--   "defer"   — ONLY if a cell actually reports IsProtected() true. That is the one
+--               specific protected flag that could make the ops above illegal, so it is
+--               asked at runtime rather than assumed; if some future client or template
+--               change ever flips it, we degrade to the old behaviour with a notice
+--               instead of throwing ADDON_ACTION_BLOCKED at the owner mid-pull.
+--
+-- TAINT. Nothing here changes the taint posture, because nothing here is new work — it is
+-- the SAME calls we already make on every out-of-combat open, moved inside the lockdown.
+-- Every op is a frame op on a frame this addon created (SetPoint / SetSize / SetParent /
+-- SetID / Show / Hide) or a texture op on a child region; none is a protected function and
+-- none touches the template's secure click path, which we deliberately never replace (see
+-- the CreateButton banner: only the TOOLTIP is routed, and only for the bank main
+-- container). A cell built during combat is tainted exactly as much as one built out of
+-- it, which is to say: it is an addon frame running FrameXML's own insecure handlers.
+--
+-- The signature and the rule stay pure functions so the decision can be pinned by a
+-- self-test without a client, and Items.LastPaintMode() publishes what actually happened
+-- so capture.lua's equip trace can distinguish "captured stale" from "never repainted".
 ----------------------------------------------------------------------
 
 -- Structural identity of a laid-out grid: cell count, per-cell (cid, slot, live) and the
@@ -2592,13 +2636,51 @@ function Items.LayoutSig(entries, cols, size, gap, runSplit)
 end
 
 -- The combat decision, factored out as one named rule (same treatment as
--- Sort.PredSettled): "repaint" when the grid on screen already has this exact structure
--- and a button for every cell, "defer" otherwise. `nButtons` is how many buttons the group
--- has actually built.
-function Items.CombatLayoutMode(prevSig, nextSig, nButtons, nEntries)
-    if prevSig == nil or prevSig ~= nextSig then return "defer" end
-    if (nButtons or 0) < (nEntries or 0) then return "defer" end
-    return "repaint"
+-- Sort.PredSettled):
+--   "defer"   a cell reports IsProtected() — the ONE case where the frame ops below are
+--             genuinely illegal in combat. Never true for our cells on this client; asked
+--             anyway so the answer comes from the game rather than from a comment.
+--   "repaint" the grid on screen already has this exact structure and a button for every
+--             cell: nothing to move, so only the contents are redrawn.
+--   "layout"  everything else — including a FRESH OPEN in combat, which is the owner's
+--             defect. Draw it. (2.0.6 answered "defer" here and the window stayed black.)
+-- `nButtons` is how many buttons the group has actually built; `protectedCells` is the
+-- count from Items.ProtectedCells.
+function Items.CombatLayoutMode(prevSig, nextSig, nButtons, nEntries, protectedCells)
+    if (protectedCells or 0) > 0 then return "defer" end
+    if prevSig ~= nil and prevSig == nextSig and (nButtons or 0) >= (nEntries or 0) then
+        return "repaint"
+    end
+    return "layout"
+end
+
+-- How many of these buttons the CLIENT considers protected. IsProtected() is the real
+-- flag behind "you may not move this frame in combat" (catalog: isProtected,
+-- isProtectedExplicitly); a frame this addon created from a non-secure template, parented
+-- into our own window, answers false. Headless and on any client where the accessor is
+-- absent this is 0, which is the truthful answer for a frame that cannot be protected.
+function Items.ProtectedCells(buttons)
+    if type(buttons) ~= "table" then return 0 end
+    local n = 0
+    for i = 1, #buttons do
+        local b = buttons[i]
+        if b and b.IsProtected and b:IsProtected() then n = n + 1 end
+    end
+    return n
+end
+
+-- If the escape hatch above ever fires, say so ONCE per session rather than leaving the
+-- owner with a black window and no reason (that is precisely how 2.0.4-2.0.6 read in the
+-- field). Nothing else depends on this; it is a diagnostic.
+Items._protectedNoticed = false
+function Items._noticeProtected(count)
+    if Items._protectedNoticed then return end
+    Items._protectedNoticed = true
+    if ns and ns.Print then
+        ns:Print(("bag cells report protected (%d) — deferring the in-combat layout until " ..
+                  "combat ends. Please report this: it should never happen on Classic Era.")
+                 :format(count))
+    end
 end
 
 -- What the last live layout DID. Read by capture.lua's equip trace.
@@ -2625,27 +2707,35 @@ local function layoutGroup(G, entries)
 
     local cols, size, gap = G._columns, G._size, G._gap
 
-    -- Secure item buttons are protected frames — never create/reparent/anchor them in
-    -- combat. A structurally identical grid takes the data-only repaint instead of being
-    -- deferred; see the IN-COMBAT REPAINT banner above.
+    -- COMBAT. These cells are not protected frames, so a relayout during lockdown is
+    -- ordinary work and falls straight through to the loop below — exactly as 1.x did, and
+    -- exactly why 1.x never went black in a raid. See the COMBAT LAYOUT banner above. The
+    -- only two special answers left are the repaint SHORTCUT (nothing moved) and the
+    -- IsProtected() escape hatch (never true on this client; asked, not assumed).
     if _G.InCombatLockdown and _G.InCombatLockdown() then
         local anyLive = false
         for _, e in ipairs(entries) do
             if Items.IsLive(e.owner) then anyLive = true; break end
         end
         if anyLive then
-            local sig  = Items.LayoutSig(entries, cols, size, gap, G._runSplit)
-            local mode = Items.CombatLayoutMode(G._sig, sig, #G._buttons, n)
+            local sig    = Items.LayoutSig(entries, cols, size, gap, G._runSplit)
+            local nProt  = Items.ProtectedCells(G._buttons)
+            local mode   = Items.CombatLayoutMode(G._sig, sig, #G._buttons, n, nProt)
             if mode == "repaint" then
                 G._pendingEntries = nil   -- this pass fully applied the entries
                 repaintGroup(G, entries)
                 Items._lastPaint = "repaint"
                 return
+            elseif mode == "defer" then
+                Items._noticeProtected(nProt)
+                G._pendingEntries = entries
+                combatFlush(G)
+                Items._lastPaint = "defer"
+                return
             end
-            G._pendingEntries = entries
-            combatFlush(G)
-            Items._lastPaint = "defer"
-            return
+            -- mode == "layout": fall through and DRAW. Anything the previous pass parked
+            -- for PLAYER_REGEN_ENABLED is superseded by the entries we are about to apply.
+            G._pendingEntries = nil
         end
     end
 
@@ -4537,12 +4627,12 @@ local function testBankMainTooltip(fails)
         cell.scripts.OnEnter(cell)
         ck(T:has("SetInventoryItem(player,44)"),
            "an in-combat data-only repaint (repaintGroup) re-routes with the new slot (5 -> 44)")
-        -- …and the REFRESH reads the container at TICK time, not at hover time. (A live
-        -- relayout cannot move a hovered cell to another container behind the cursor —
-        -- CombatLayoutMode only takes the repaint branch when the layout signature, cids
-        -- included, is identical — so this is belt: whatever writes _cid, the next tick is
-        -- answered as what the cell IS, and a cell that is no longer bank-main hands the
-        -- refresh straight back to the client.) The cursor never left, so the tooltip is
+        -- …and the REFRESH reads the container at TICK time, not at hover time. (This is
+        -- load-bearing since 2.0.7: a full relayout now runs IN COMBAT, so a hovered cell
+        -- genuinely can be recycled onto another container behind the cursor. Whatever
+        -- writes _cid — repaintGroup or layoutGroup — the next tick is answered as what the
+        -- cell IS, and a cell that is no longer bank-main hands the refresh straight back to
+        -- the client.) The cursor never left, so the tooltip is
         -- still owned by this cell; only the call log is cleared.
         cell._cid = 1
         T.calls = {}
@@ -4864,6 +4954,334 @@ local function testLiveSlotRepaint(fails)
     Items._buttons, _G.C_Container = savedButtons, savedCC
 end
 
+----------------------------------------------------------------------
+-- COMBAT OPEN + RELAYOUT  (2.0.7) — the owner's black window, end to end
+--
+-- THE FIELD REPORT, verbatim in shape: mid-raid, open the bags during a pull. A partial
+-- first row draws and then nothing — a near-black rectangle for the whole fight — while
+-- the window's own counter reads 9/92. The model was right; rendering was dead. 2.0.6's
+-- gate is the entire cause: a fresh open has no prior signature, so CombatLayoutMode
+-- answered "defer" and layoutGroup parked all 92 entries on PLAYER_REGEN_ENABLED. Loot or
+-- consume anything mid-fight and an ALREADY-drawn window falls into the same hole, because
+-- the entry list changes shape and that is structural too.
+--
+-- RED CONTROL. The 2.0.6 rule is transcribed below and driven through the REAL layoutGroup
+-- against the REAL 92-cell scenario, so the blackness is asserted, not described: the
+-- painted-cell count stays at the stale remnant the previous out-of-combat open left. Then
+-- the shipping rule runs the same scenario and every entry lands.
+--
+-- THE SIM IS UNKIND (Class 9 doctrine, CLIENT_ASYNC_LESSONS.md). Every cell here is a
+-- lockdown-aware frame double: if a cell is marked protected and a frame op is attempted
+-- while InCombatLockdown() is true, it ERRORS — loudly, exactly as ADDON_ACTION_BLOCKED
+-- would. That is the only way "we make no protected call" can be PROVEN rather than
+-- assumed, and the sim proves itself first (a direct op on a protected cell in lockdown
+-- must raise, or the whole assertion is vacuous). Both postures are run: cells reporting
+-- IsProtected() false (this client — layout proceeds) and true (the escape hatch — defers,
+-- touching nothing).
+----------------------------------------------------------------------
+local function testCombatOpenLayout(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local savedCreate, savedCombat  = _G.CreateFrame, _G.InCombatLockdown
+    local savedCC                   = _G.C_Container
+    local savedSelf, savedButtons   = Items._self, Items._buttons
+    local savedMake, savedRule      = Items.CreateButton, Items.CombatLayoutMode
+    local savedEvt, savedPaint      = Items._evt, Items._lastPaint
+
+    local savedNoticed = Items._protectedNoticed
+    Items._protectedNoticed = true      -- the one-shot owner notice is not this suite's chat
+    Items._buttons = setmetatable({}, { __mode = "k" })
+    Items.SetSelf("Tester-TestRealm")
+    local live = { source = "full", nameRealm = "Tester-TestRealm" }
+
+    local inCombat = false
+    _G.InCombatLockdown = function() return inCombat end
+
+    -- Plain frames (holders, the grid event frame, the PLAYER_REGEN_ENABLED flusher).
+    local regenHandlers = {}
+    _G.CreateFrame = function()
+        local f = {}
+        function f:SetID() end
+        function f:SetAllPoints() end
+        function f:RegisterEvent(e) self._evt = e end
+        function f:SetScript(k, fn)
+            if k == "OnEvent" and self._evt == "PLAYER_REGEN_ENABLED" then
+                regenHandlers[#regenHandlers + 1] = fn
+            end
+        end
+        return f
+    end
+
+    ------------------------------------------------------------------ the unkind cell
+    -- Frame ops that a PROTECTED frame would refuse during lockdown. Anything we call on a
+    -- cell while `protected` is set and combat is up raises, which is the point.
+    local PROTECTED_OPS = { "SetPoint", "ClearAllPoints", "SetSize", "SetParent",
+                            "Show", "Hide", "SetID" }
+    local ops = {}
+    local function newCell(opts)
+        local b = { _live = opts.live, protected = false, shown = false }
+        b.IsProtected = function(self) return self.protected end
+        for _, op in ipairs(PROTECTED_OPS) do
+            b[op] = function(self, ...)
+                if self.protected and _G.InCombatLockdown() then
+                    error("ADDON_ACTION_BLOCKED: " .. op .. "() on a protected frame in combat", 2)
+                end
+                ops[#ops + 1] = op
+                if op == "Show" then self.shown = true
+                elseif op == "Hide" then self.shown = false end
+                return self
+            end
+        end
+        b.SetSlot = function(self, o, c, s, d)
+            self._owner, self._cid, self._slot, self._data = o, c, s, d
+            self:Show(); self._paints = (self._paints or 0) + 1
+        end
+        b.SetEmpty = function(self, o, c, s)
+            self._owner, self._cid, self._slot, self._data = o, c, s, nil
+            self:Show(); self._paints = (self._paints or 0) + 1
+        end
+        b.IsShown    = function(self) return self.shown end
+        b._dsRepaint = function(self) self._paints = (self._paints or 0) + 1 end
+        Items._buttons[b] = true
+        return b
+    end
+    Items.CreateButton = function(_, o) return newCell({ live = o.live }) end
+
+    local function newGroup()
+        local G = { _columns = 11, _size = 37, _gap = 2, _buttons = {}, _holders = {} }
+        G.SetSize   = function(self, w, h) self._w, self._h = w, h end
+        -- combatFlush's PLAYER_REGEN_ENABLED handler calls this to drain a deferral.
+        G.ShowSlots = function(self, e) self._lastEntries = e; Items._layoutGroup(self, e) end
+        return G
+    end
+    -- What the owner would actually SEE: cells that are shown and stand for a slot.
+    local function paintedCells(G)
+        local n = 0
+        for _, b in ipairs(G._buttons) do if b.shown and b._slot ~= nil then n = n + 1 end end
+        return n
+    end
+    local function withData(G)
+        local n = 0
+        for _, b in ipairs(G._buttons) do if b.shown and b._data ~= nil then n = n + 1 end end
+        return n
+    end
+
+    ------------------------------------------------------------------ the owner's model
+    -- 92 slots across the backpack and four bags; 9 of them hold something. This is the
+    -- "9/92" the counter was reporting while the grid drew nothing.
+    local BAGS = { [0] = 16, [1] = 16, [2] = 16, [3] = 20, [4] = 24 }
+    local ORDER = { 0, 1, 2, 3, 4 }
+    local function ownerEntries(extra)
+        local e, filled = {}, 0
+        for _, cid in ipairs(ORDER) do
+            for slot = 1, BAGS[cid] do
+                local data = nil
+                if filled < 9 and (slot % 7) == 1 then
+                    filled = filled + 1
+                    data = { id = 6948 + filled, count = 1, quality = 1 }
+                end
+                e[#e + 1] = { owner = live, cid = cid, slot = slot, data = data }
+            end
+        end
+        for i = 1, (extra or 0) do
+            e[#e + 1] = { owner = live, cid = 5, slot = i, data = { id = 4234, count = 1 } }
+        end
+        return e
+    end
+    local ENTRIES = ownerEntries(0)
+    ck(#ENTRIES == 92, "PREMISE: the owner's model is 92 slots (got " .. #ENTRIES .. ")")
+
+    ------------------------------------------------------------------ 0) the sim is unkind
+    do
+        local probe = newCell({ live = true })
+        probe.protected = true
+        inCombat = true
+        ck(pcall(function() probe:SetPoint("TOPLEFT") end) == false,
+           "SIM CHECK: a protected cell RAISES on a frame op in lockdown (an unkind client)")
+        inCombat = false
+        ck(pcall(function() probe:SetPoint("TOPLEFT") end) == true,
+           "SIM CHECK: …and the same op out of combat is fine (the sim is not just broken)")
+        Items._buttons[probe] = nil
+    end
+
+    ------------------------------------------------------------------ 1) RED CONTROL: 2.0.6
+    -- The shipped 2.0.6 rule, transcribed exactly, driven through the real layoutGroup.
+    local function rule206(prevSig, nextSig, nButtons, nEntries)
+        if prevSig == nil or prevSig ~= nextSig then return "defer" end
+        if (nButtons or 0) < (nEntries or 0) then return "defer" end
+        return "repaint"
+    end
+
+    local Gred = newGroup()
+    -- The stale remnant the owner actually saw: a partial first row left over from an
+    -- earlier, smaller out-of-combat render.
+    inCombat = false
+    local remnant = {}
+    for slot = 1, 11 do remnant[slot] = { owner = live, cid = 0, slot = slot, data = nil } end
+    Items._layoutGroup(Gred, remnant)
+    ck(paintedCells(Gred) == 11, "PREMISE: a partial first row is on screen before the pull")
+
+    inCombat = true
+    Items.CombatLayoutMode = rule206
+    ops = {}
+    local okRed = pcall(Items._layoutGroup, Gred, ENTRIES)
+    Items.CombatLayoutMode = savedRule
+    ck(okRed, "RED CONTROL runs (no error) — the failure is silent, which is why it shipped")
+    ck(Items.LastPaintMode() == "defer", "2.0.6: a fresh 92-slot open in combat DEFERS")
+    ck(paintedCells(Gred) == 11,
+       "THE BLACKNESS: the painted-cell count stays at the 11-cell remnant, so 81 of the " ..
+       "owner's 92 slots never render for the whole fight (got " .. paintedCells(Gred) .. ")")
+    ck(Gred._pendingEntries == ENTRIES, "…all 92 entries parked on PLAYER_REGEN_ENABLED")
+    ck(#ops == 0, "…and 2.0.6 touched not one frame, which is exactly the defect")
+    -- The deferral DID heal when the fight ended — which is why this shipped: out of
+    -- combat everything looked perfect, and the owner only ever saw it mid-pull.
+    inCombat = false
+    for _, fn in ipairs(regenHandlers) do pcall(fn) end
+    ck(paintedCells(Gred) == 92, "…and only healed once combat ended (why 2.0.6 tested green)")
+    regenHandlers = {}
+
+    ------------------------------------------------------------------ 2) GREEN: the fix
+    local G = newGroup()
+    inCombat = true                 -- combat begins, window opens FRESH: no prior layout
+    ops = {}
+    local okG, errG = pcall(Items._layoutGroup, G, ENTRIES)
+    ck(okG, "a fresh in-combat open runs clean: " .. tostring(errG))
+    ck(Items.LastPaintMode() == "layout", "…as a real LAYOUT, in combat (got " ..
+       tostring(Items.LastPaintMode()) .. ")")
+    ck(#G._buttons == 92, "…building all 92 cells (got " .. #G._buttons .. ")")
+    ck(paintedCells(G) == 92, "…and painting every one of them (got " .. paintedCells(G) .. ")")
+    ck(withData(G) == 9, "…with the 9 occupied slots carrying their items (the 9/92 counter)")
+    ck(G._pendingEntries == nil, "…and nothing left waiting for the fight to end")
+    ck(G._sig == Items.LayoutSig(ENTRIES, 11, 37, 2, nil),
+       "…and the structure it drew is remembered for the next pass")
+    ck(#ops > 0, "…by doing real frame work inside the lockdown (this is the whole change)")
+
+    ------------------------------------------------------------------ 3) loot mid-fight
+    -- The signature drifts because the entry list grew. 2.0.6 called that structural and
+    -- went black; the grid must simply get bigger, still in combat.
+    local LOOTED = ownerEntries(2)
+    local okL = pcall(Items._layoutGroup, G, LOOTED)
+    ck(okL and Items.LastPaintMode() == "layout", "loot arriving mid-fight LAYS OUT")
+    ck(#LOOTED == 94 and paintedCells(G) == 94,
+       "…the full grid stays correct at 94 cells (got " .. paintedCells(G) .. ")")
+    ck(withData(G) == 11, "…including the two new stacks")
+    ck(G._buttons[93]._cid == 5 and G._buttons[93]._slot == 1, "…anchored to the right slot")
+
+    -- …and consuming one shrinks it again, with the surplus cell hidden, not orphaned.
+    local CONSUMED = ownerEntries(1)
+    pcall(Items._layoutGroup, G, CONSUMED)
+    ck(paintedCells(G) == 93 and G._buttons[94].shown == false,
+       "consuming mid-fight shrinks the grid and hides the surplus cell")
+
+    ------------------------------------------------------------------ 4) the 2.0.5 case
+    -- An equip swap changes one cell's CONTENTS and nothing else. Identical signature, so
+    -- the repaint shortcut still takes it: no frame op, because there is nothing to move.
+    local SWAPPED = ownerEntries(1)
+    for _, e in ipairs(SWAPPED) do
+        if e.cid == 0 and e.slot == 1 then e.data = { id = 99999, count = 1, quality = 3 } end
+    end
+    ops = {}
+    pcall(Items._layoutGroup, G, SWAPPED)
+    ck(Items.LastPaintMode() == "repaint",
+       "the 2.0.5 equip-swap case is untouched: identical structure -> REPAINT")
+    ck(#ops == 0, "…still moving nothing, because nothing moved")
+    ck(G._buttons[1]._data and G._buttons[1]._data.id == 99999,
+       "…and the swapped cell shows the new item, in combat")
+
+    ------------------------------------------------------------------ 5) escape hatch
+    -- If this client ever DID call our cells protected, the code must defer rather than
+    -- attempt the op. The unkind cells would raise if it got that wrong.
+    for _, b in ipairs(G._buttons) do b.protected = true end
+    Items._protectedNoticed = true      -- silence the one-shot owner notice inside the suite
+    ops = {}
+    local GROWN = ownerEntries(3)
+    local okP, errP = pcall(Items._layoutGroup, G, GROWN)
+    ck(okP, "protected cells: the layout DEFERS instead of raising (" .. tostring(errP) .. ")")
+    ck(Items.LastPaintMode() == "defer", "…the one surviving defer, keyed to IsProtected()")
+    ck(#ops == 0, "…and NOT ONE protected op was attempted (the sim would have raised)")
+    ck(G._pendingEntries == GROWN, "…queued for PLAYER_REGEN_ENABLED, the old behaviour")
+    ck(#regenHandlers > 0, "…with a PLAYER_REGEN_ENABLED flusher armed to drain it")
+    for _, b in ipairs(G._buttons) do b.protected = false end
+    ck(Items.ProtectedCells(G._buttons) == 0,
+       "THE VERDICT ON THIS CLIENT: not one bag cell is a protected frame")
+
+    -- The queued work still drains when the fight ends, exactly as before.
+    inCombat = false
+    for _, fn in ipairs(regenHandlers) do pcall(fn) end
+    ck(paintedCells(G) == 95, "…and the deferred grid drains at PLAYER_REGEN_ENABLED")
+
+    ------------------------------------------------------------------ 6) sort / LIVE_REPAINT
+    -- The 2.0.6 live-sort repaint (Sort.LIVE_REPAINT, ~8 Hz) sweeps the same cells from
+    -- C_Container while a sort runs. Composed with an in-combat layout the two must not
+    -- fight: the sweep repaints in place, the layout re-seats the store records, and the
+    -- grid ends up agreeing with the entries rather than oscillating between them.
+    local S = ns.Sort
+    ck(S and type(S.LIVE_REPAINT) == "number" and type(S._liveRepaint) == "function",
+       "PREMISE: the 2.0.6 live-repaint path is present to compose with")
+
+    inCombat = true
+    local SORTED = ownerEntries(1)
+    pcall(Items._layoutGroup, G, SORTED)          -- a grid laid out DURING the fight
+    -- One window, one grid: scope the weak registry to THIS group's cells, the way the
+    -- live addon's is (the red-control group above is a fixture, not a second window).
+    Items._buttons = setmetatable({}, { __mode = "k" })
+    for _, b in ipairs(G._buttons) do Items._buttons[b] = true end
+
+    -- The client's world starts out agreeing with the capture the grid was drawn from —
+    -- otherwise the sweep "changes" every cell and proves nothing about the sort.
+    local world = {}
+    for _, e in ipairs(SORTED) do
+        if e.data then
+            world[e.cid .. ":" .. e.slot] =
+                { itemID = e.data.id, stackCount = e.data.count, quality = e.data.quality }
+        end
+    end
+    _G.C_Container = { GetContainerItemInfo = function(cid, slot) return world[cid .. ":" .. slot] end }
+    ops = {}
+    ck(select(2, Items.LiveSlotRepaint()) == 0,
+       "PREMISE: with the client agreeing with the capture, the sweep repaints nothing")
+    -- Now the sort moves the stack in (0,1) to (0,2); the client knows before we recapture.
+    world["0:1"] = nil
+    world["0:2"] = { itemID = 12345, stackCount = 4, quality = 2, hyperlink = "item:12345" }
+    local touched, changed = Items.LiveSlotRepaint()
+    ck(touched == 93, "the 8 Hz sweep reaches every combat-built live cell (got " .. touched .. ")")
+    ck(changed == 2, "…and repaints only the two cells the sort actually moved")
+    ck(#ops == 0, "…with no frame op at all — it is a data sweep, in or out of combat")
+    ck(G._buttons[2]._data and G._buttons[2]._data.id == 12345,
+       "…the moved stack shows up mid-sort, mid-combat")
+
+    -- Now the capture catches up and the grid relayouts with the SAME structure: the
+    -- shortcut takes it and the store records replace the sweep's scratch, one way only.
+    local AFTER = ownerEntries(1)
+    for _, e in ipairs(AFTER) do
+        if e.cid == 0 and e.slot == 1 then e.data = nil end
+        if e.cid == 0 and e.slot == 2 then e.data = { id = 12345, count = 4, quality = 2 } end
+    end
+    ops = {}
+    pcall(Items._layoutGroup, G, AFTER)
+    ck(Items.LastPaintMode() == "repaint",
+       "the post-sort capture lands as a REPAINT — the sweep and the layout agree")
+    ck(#ops == 0, "…so the live-repaint path never provokes frame churn during a sort")
+    ck(G._buttons[2]._data.id == 12345 and G._buttons[1]._data == nil,
+       "…and the grid ends up as the STORE says, not as the scratch left it")
+    ck(G._buttons[2]._data ~= G._buttons[2]._dsLiveData,
+       "…the cell is back on the captured record, not the sweep's scratch table")
+
+    -- Finally, a structural change WHILE the sweep's scratch is live still lays out clean.
+    world["0:3"] = { itemID = 777, stackCount = 1, quality = 1 }
+    Items.LiveSlotRepaint()
+    local okF = pcall(Items._layoutGroup, G, ownerEntries(4))
+    ck(okF and Items.LastPaintMode() == "layout" and paintedCells(G) == 96,
+       "a structural relayout on top of a live sweep, in combat, still draws every cell")
+
+    ------------------------------------------------------------------ restore
+    _G.CreateFrame, _G.InCombatLockdown, _G.C_Container = savedCreate, savedCombat, savedCC
+    Items.CreateButton, Items.CombatLayoutMode = savedMake, savedRule
+    Items._self, Items._buttons = savedSelf, savedButtons
+    Items._evt, Items._lastPaint = savedEvt, savedPaint
+    Items._protectedNoticed = false
+end
+
 function Items.RunSelfTests(verbose)
     local suites = {
         { name = "grid math",          fn = testGridMath },
@@ -4891,6 +5309,7 @@ function Items.RunSelfTests(verbose)
         { name = "bank-main tooltip route (BAG-6)", fn = testBankMainTooltip },
         { name = "new-item layering (BAG-7)", fn = testNewItemLayering },
         { name = "live-slot repaint (BAG-7)", fn = testLiveSlotRepaint },
+        { name = "combat open + relayout (2.0.7)", fn = testCombatOpenLayout },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

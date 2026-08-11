@@ -1312,18 +1312,32 @@ local function testCombatPaintGate(fails)
     local sigA, sigC = I.LayoutSig(A, 12, 37, 4), I.LayoutSig(C, 12, 37, 4)
     ck(I.CombatLayoutMode(sigA, sigA, 2, 2) == "repaint",
         "same structure + enough buttons -> REPAINT in combat (this is the owner's case)")
-    ck(I.CombatLayoutMode(nil, sigA, 2, 2) == "defer",
-        "nothing drawn yet -> defer (there is nothing to repaint)")
-    ck(I.CombatLayoutMode(sigA, sigC, 1, 1) == "defer", "a structural change still defers")
-    ck(I.CombatLayoutMode(sigA, sigA, 1, 2) == "defer",
-        "a missing button defers rather than silently skipping a cell")
+    -- 2.0.7 — these three USED to answer "defer", and that is the whole live defect: a
+    -- fresh combat open, a longer/shorter grid and a half-built pool are all ordinary
+    -- layout, not danger. The verdicts changed on purpose; see the COMBAT LAYOUT banner.
+    ck(I.CombatLayoutMode(nil, sigA, 2, 2) == "layout",
+        "nothing drawn yet -> LAYOUT (a fresh open in combat must draw, not go black)")
+    ck(I.CombatLayoutMode(sigA, sigC, 1, 1) == "layout",
+        "a structural change in combat LAYS OUT (loot arriving mid-fight must render)")
+    ck(I.CombatLayoutMode(sigA, sigA, 1, 2) == "layout",
+        "a missing button builds the missing button rather than skipping the whole grid")
+    -- The one surviving defer, and it is keyed to a real runtime flag rather than a claim.
+    ck(I.CombatLayoutMode(sigA, sigC, 2, 2, 1) == "defer",
+        "a cell that actually reports IsProtected() -> defer (the only protected op left)")
+    ck(I.CombatLayoutMode(sigA, sigA, 2, 2, 3) == "defer",
+        "…and it outranks even the repaint shortcut")
+    ck(I.ProtectedCells({ {}, { IsProtected = function() return false end } }) == 0,
+        "ProtectedCells: no accessor / false -> 0")
+    ck(I.ProtectedCells({ { IsProtected = function() return true end }, {} }) == 1,
+        "ProtectedCells counts the cells the CLIENT calls protected")
     ck(type(I.LastPaintMode()) == "string", "the paint mode is published for the equip trace")
 
     ------------------------------------------------------------------------------------
     -- DRIVE IT. The rule above is a decision; this is the grid actually obeying it. A
     -- synthetic group with two already-built buttons takes the changed entries IN COMBAT
-    -- and the cell that changed must end up holding the new item, with no frame op
-    -- attempted on any button (a real one is a protected secure-template frame).
+    -- and the cell that changed must end up holding the new item. The equip-swap case is
+    -- structurally identical, so it must take the SHORTCUT: no frame op at all, because
+    -- there is nothing to move — not because moving would be illegal (2.0.7 settled that).
     ------------------------------------------------------------------------------------
     if not I._layoutGroup then fails[#fails + 1] = "ui_items did not export _layoutGroup"; return end
     local savedCombat, savedSelf = _G.InCombatLockdown, I._self
@@ -1335,6 +1349,8 @@ local function testCombatPaintGate(fails)
                               "SetSize", "SetID" }) do
             b[op] = function() frameOps[#frameOps + 1] = op end
         end
+        b.SetSlot  = function(self, o, c, s, d) self._owner, self._cid, self._slot, self._data = o, c, s, d end
+        b.SetEmpty = function(self, o, c, s)    self._owner, self._cid, self._slot, self._data = o, c, s, nil end
         return b
     end
     local live = { source = "full", nameRealm = "Tester-TestRealm" }
@@ -1347,6 +1363,7 @@ local function testCombatPaintGate(fails)
                    { owner = live, cid = 0, slot = 4, data = nil } }
     local G = { _columns = 12, _size = 37, _gap = 4,
                 _buttons = { stubButton(), stubButton() }, _holders = {} }
+    G.SetSize = function(self, w, h) self._w, self._h = w, h end
     G._sig = I.LayoutSig(pre, 12, 37, 4, nil)   -- premise: `pre` is what is on screen
 
     I._layoutGroup(G, post)
@@ -1360,14 +1377,28 @@ local function testCombatPaintGate(fails)
         table.concat(frameOps, ",") .. ")")
     ck(G._pendingEntries == nil, "…and nothing was left queued for PLAYER_REGEN_ENABLED")
 
-    -- A STRUCTURAL change in combat must still defer — the half of the old gate that was
-    -- always right, and the reason this is a narrowing and not a removal.
+    -- A STRUCTURAL change in combat now LAYS OUT (2.0.7) — it used to defer, and deferring
+    -- is what left the owner staring at a black window for a whole pull. The full scenario
+    -- (a 92-cell fresh open, loot mid-fight, the unkind protected-op sim, the sort leg) is
+    -- the ui_items "combat open + relayout (2.0.7)" suite; this is the same seam from the
+    -- capture side, so the equip trace's paint mode stays honest.
+    local savedCreate = _G.CreateFrame
+    _G.CreateFrame = function()
+        local h = {}
+        h.SetID, h.SetAllPoints = function() end, function() end
+        return h
+    end
     local shorter = { post[1] }
+    frameOps = {}
     I._layoutGroup(G, shorter)
-    ck(I.LastPaintMode() == "defer", "a structural change in combat still defers")
-    ck(G._pendingEntries == shorter, "…queued for PLAYER_REGEN_ENABLED, as before")
-    ck(#frameOps == 0, "…still touching no frame in combat")
+    ck(I.LastPaintMode() == "layout", "a structural change in combat now DRAWS (got " ..
+        tostring(I.LastPaintMode()) .. ")")
+    ck(#frameOps > 0, "…by doing real frame work in the lockdown (anchors/sizes), not none")
+    ck(G._buttons[1]._data and G._buttons[1]._data.id == OHWEAPON,
+        "…and the surviving cell is laid out with the right item")
+    ck(G._pendingEntries == nil, "…and queues nothing for PLAYER_REGEN_ENABLED — it is done")
 
+    _G.CreateFrame = savedCreate
     _G.InCombatLockdown, I._self, I._lastPaint = savedCombat, savedSelf, "idle"
 end
 
