@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### A trimmed update from another computer can no longer blank an alt
+
+When Daseeki Nexus hands Bags a fresher copy of one of your other characters, that copy
+replaces the one Bags was holding. If the incoming copy simply did not mention something —
+an older Nexus, a trimmed message, a scan taken before the game answered — Bags treated the
+silence as an answer. A character could lose its class colour, its portrait and its side
+(Alliance/Horde) to an update that never said a word about any of them. Worse, an update
+with no item list in it was read as "this character holds nothing", so a bank alt with 40
+Runecloth vanished from Find and from the "who has this?" tooltip while quietly still
+holding it.
+
+Silence is now treated as silence: anything an incoming copy does not mention is left
+exactly as Bags already had it, and only what the copy actually says gets overwritten. An
+update that genuinely reports an empty bank still reports an empty bank — that is a real
+answer, and it still lands. Same rule the gold figures already followed; this extends it to
+the rest of the record. Nothing here touches your saved data.
+
 ### The search box stops lying about items it already has
 
 Type a search while your bags hold something the game has not fully loaded yet and Bags
