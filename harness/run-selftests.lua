@@ -1456,9 +1456,18 @@ ns:RegisterSelfTest("cold-find-chain", function(verbose)
             itemCounts = { [102] = 99 } },
     }
 
-    local warm, asks, evtFrames
+    local warm, asks, evtFrames, instantWarm
+    local fireInfoReceived
+    -- CLASS 9 (2026-08-11). `dispatch` is the sim's delivery posture and it defaults to the
+    -- UNKIND one. RequestLoadItemDataByID does not always SCHEDULE its answer: for an id the
+    -- client already holds, GET_ITEM_INFO_RECEIVED is dispatched from INSIDE the request and
+    -- every handler in the session runs before it returns. This sim used to record the ask
+    -- and nothing else — it never echoed at all, which is even kinder than echoing late, and
+    -- it is why "subscribe after the asks" survived here for two releases. "async" is the
+    -- named variant (the old behaviour: an answer only ever arrives via fireInfoReceived).
+    local dispatch = "sync"
     local function newSim()
-        warm, asks, evtFrames = {}, {}, {}
+        warm, asks, evtFrames, instantWarm = {}, {}, {}, {}
         _G.C_Item = {
             GetItemInfoInstant = function(id)
                 local e = CATALOG[id]; if not e then return nil end
@@ -1471,7 +1480,16 @@ ns:RegisterSelfTest("cold-find-chain", function(verbose)
                 if not (e and warm[id]) then return nil end
                 return e.name, "item:" .. id, e.quality
             end,
-            RequestLoadItemDataByID = function(id) asks[id] = (asks[id] or 0) + 1 end,
+            RequestLoadItemDataByID = function(id)
+                asks[id] = (asks[id] or 0) + 1
+                -- THE CLASS-9 BIT: for an id the client already holds, the request
+                -- MATERIALISES the data and announces it from inside itself. The addon's
+                -- own first ask is therefore also its first echo.
+                if dispatch == "sync" and instantWarm[id] then
+                    warm[id] = true
+                    fireInfoReceived(id)
+                end
+            end,
         }
         _G.CreateFrame = function()
             local f = { _events = {} }
@@ -1482,7 +1500,7 @@ ns:RegisterSelfTest("cold-find-chain", function(verbose)
             return f
         end
     end
-    local function fireInfoReceived(id, success)
+    function fireInfoReceived(id, success)
         for _, f in ipairs(evtFrames) do
             if f._events["GET_ITEM_INFO_RECEIVED"] and f._onEvent then
                 f._onEvent(f, "GET_ITEM_INFO_RECEIVED", id, success ~= false)
@@ -1620,6 +1638,71 @@ ns:RegisterSelfTest("cold-find-chain", function(verbose)
     ck(HTIMER.pending() == 0, "…and arms no timer: the healthy path is untaxed")
     HTIMER.flush()
     ck(view.renders == 1, "…and never re-runs itself (got " .. view.renders .. " render(s))")
+
+    -- ══ 5. CLASS 9: THE CLIENT ANSWERS INSIDE THE ASK ═════════════════════════════
+    -- The posture the sim was blind to until 2026-08-11. Every id here is one the client
+    -- already holds: cold to the matcher when it is judged, warm the instant it is asked
+    -- for, and announced from INSIDE RequestLoadItemDataByID. The whole first pass is
+    -- therefore its own echo, and whether it is heard depends entirely on whether the
+    -- listener existed BEFORE the first ask.
+    local function class9Round(buildFrameLate)
+        freshWorld("songflower")
+        for id in pairs(CATALOG) do instantWarm[id] = true end
+        local realEnsure = Find.EnsureWatchFrame
+        if buildFrameLate then
+            -- 2.0.7's ordering, reproduced exactly: no listener exists while the asks go
+            -- out, and the frame is built afterwards.
+            Find.EnsureWatchFrame = function() end
+        end
+        render(false)
+        Find.EnsureWatchFrame = realEnsure
+        if buildFrameLate then Find.EnsureWatchFrame() end
+        local left = 0
+        for _ in pairs(Find._watch) do left = left + 1 end
+        return left
+    end
+
+    ck(class9Round(true) == 3,
+       "RED CONTROL: with the watch frame built AFTER the asks, all 3 in-call answers are " ..
+       "delivered to nothing and every id stays on the watch")
+    ck(view.rows == 0 and view.pending == 3,
+       "…so the first pass shows NOTHING for three items the client answered for in the " ..
+       "very calls that asked (rows=" .. view.rows .. " pending=" .. view.pending .. ")")
+    ck(view.empty ~= nil and view.empty:find("Still loading", 1, true) == 1,
+       "…and tells the owner it is still loading them: " .. tostring(view.empty))
+    -- It is not permanent — the ladder's first rung re-asks and the frame exists by then —
+    -- but the heal costs a rung of latency and a SECOND request per id against the ceiling,
+    -- for data the client had already handed over.
+    HTIMER.advance(Find.WATCH_LADDER[1]); HTIMER.advance(0)
+    ck(view.rows == 3, "…the ladder eventually heals it (rows=" .. view.rows .. ")")
+    ck(asks[100] == 2, "…having spent a second ask per id to get there (asked "
+       .. tostring(asks[100]) .. "x of a ceiling of " .. Find.MAX_ASKS .. ")")
+    HTIMER.flush()
+
+    ck(class9Round(false) == 0,
+       "GREEN: subscribed before the first ask, every in-call answer lands and the watch " ..
+       "empties inside the render itself")
+    HTIMER.advance(0)
+    ck(view.rows == 3, "…all three holders resolve on the FIRST pass (got " .. view.rows .. ")")
+    ck(view.pending == 0 and view.status == nil and view.empty == nil,
+       "…with nothing left to claim about loading")
+    ck(asks[100] == 1, "…for ONE request per id (got " .. tostring(asks[100]) .. ")")
+    ck(Find._watchExhausted == false, "…and the ladder never had to run out")
+    HTIMER.flush()
+
+    -- THE BLIND SPOT, NAMED: run the SAME late-built sequence with async delivery and it
+    -- looks perfectly healthy — the answers simply have not arrived yet, and the ladder
+    -- heals it. That posture is why the ordering above survived two releases.
+    dispatch = "async"
+    ck(class9Round(true) == 3, "async premise: nothing answered in the call")
+    HTIMER.advance(0)
+    for id in pairs(CATALOG) do warm[id] = true; fireInfoReceived(id) end
+    HTIMER.advance(0)
+    ck(view.rows == 3,
+       "…and under async the late-built frame still catches every answer — a sim that " ..
+       "delivers after the call returns can never see this defect")
+    dispatch = "sync"
+    HTIMER.flush()
 
     -- ── restore ───────────────────────────────────────────────────────────────────
     HTIMER.flush(); HTIMER.reset()

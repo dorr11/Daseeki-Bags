@@ -1459,6 +1459,35 @@ end
 -- Run lifecycle
 ----------------------------------------------------------------------
 
+----------------------------------------------------------------------
+-- THE TEARDOWN LATCH  (CLASS 9, 2026-08-11)
+--
+-- `abort()` issues container operations of its own (cleanupWave) BEFORE it tears the run
+-- down, and it does so with the driver still registered and `Sort._running` still true —
+-- because the cleanup needs both. Under a client that dispatches events from inside the
+-- call, those cleanup pickups deliver the run's own echoes straight back into the driver,
+-- and one of the events the driver acts on is an ABORT TRIGGER: a mob pulling on the frame
+-- the tidy-up wave goes out is PLAYER_REGEN_DISABLED delivered inside PickupContainerItem.
+-- `abort`'s only guard was `if not Sort._running then return end`, which the outer abort
+-- has not yet cleared, so the inner abort ran the whole teardown — log record, chat line,
+-- stopDriver, endQuiet — and then RETURNED INTO the outer cleanup loop, which carried on
+-- issuing container operations against a torn-down run with the refresh mute already
+-- lifted. The owner saw it as two "sort stopped" lines and two sortLog records for one
+-- sort; the second record is all zeroes, because stopDriver had already dropped the
+-- accumulators it is computed from.
+--
+-- The latch is armed at the TOP of the teardown — before the first client call of the
+-- whole sequence, which is the only place that is early enough — and released by
+-- stopDriver, the last step both teardown paths take. Sort.Run clears it too, so a throw
+-- between the two can never wedge the next run's ability to stop. Every handler that can
+-- start a teardown reads it and treats what it sees as this teardown's own echo.
+----------------------------------------------------------------------
+local function beginTeardown()
+    if Sort._teardown then return false end
+    Sort._teardown = true
+    return true
+end
+
 local function stopDriver()
     Sort._running = false
     Sort._cids, Sort._pred, Sort._meta, Sort._canHold, Sort._cache = nil, nil, nil, nil, nil
@@ -1481,12 +1510,21 @@ local function stopDriver()
     Sort._liveRepaints, Sort._liveRepaintAt = nil, nil
 
     Sort._settleSecs, Sort._waitingRound = nil, nil
+    -- CLASS 9 accumulators (same "no state between runs" contract; logRun has already
+    -- stashed the fuse verdict into Sort._lastReentryRefused by the time this runs).
+    Sort._reentryRefused, Sort._reentryWhere = nil, nil
+    Sort._issueDepth = 0
     Sort._idleSecs, Sort._noProgressSecs, Sort._runawaySecs = nil, nil, nil
     Sort._cellCount, Sort._fillPct, Sort._planMoves0, Sort._context = nil, nil, nil, nil
     Sort._tickGen = (Sort._tickGen or 0) + 1   -- invalidate any queued tick
     if Sort._driver then Sort._driver:UnregisterAllEvents() end
+    -- ORDER (class 9): the driver is unregistered BEFORE the last client call of the
+    -- sequence, so ClearCursor's own in-call echoes reach nothing of ours. The quiet
+    -- stubs are still installed at this point, so the ns:RegisterEvent subscribers see
+    -- only a dirty flag; endQuiet's unconditional recapture below is what heals it.
     if _G.ClearCursor then _G.ClearCursor() end
     endQuiet()
+    Sort._teardown = nil   -- the sequence has returned; release the latch
 end
 
 -- Fold this run's accumulators into one flat telemetry record and append it (2.0.2a).
@@ -1525,6 +1563,12 @@ local function logRun(aborted, reason)
     -- persisted sortLog schema (Sort.NewLogRecord) is a convergence contract and does not
     -- move for a repaint counter — no SavedVariables change, nothing for the report to skip.
     Sort._lastLiveRepaints = Sort._liveRepaints or 0
+    -- CLASS 9: the fuse's verdict for this run, kept beside the record for the same reason
+    -- the repaint count is — the persisted sortLog schema is a convergence contract and does
+    -- not move for a re-entry counter. Non-zero here means a handler reached an issue pass
+    -- from inside a client call and was refused; the build stamp says which pass.
+    Sort._lastReentryRefused = Sort._reentryRefused or 0
+    Sort._lastReentryWhere   = Sort._reentryWhere
     local write = function() Sort.LogAppend(nil, rec) end
     if ns.SafeCall then ns:SafeCall(write) else pcall(write) end
 end
@@ -1549,7 +1593,15 @@ local cleanupWave
 
 local function abort(reason)
     if not Sort._running then return end
-    local tidied = cleanupWave and cleanupWave(reason) or 0
+    -- CLASS 9: this teardown's own cleanup echoes must not start a second teardown.
+    if not beginTeardown() then return end
+    local tidied = 0
+    if cleanupWave then
+        -- pcall-protected: a throw inside the cleanup's client calls must still reach
+        -- stopDriver, which is what releases the latch.
+        local ok, n = pcall(cleanupWave, reason)
+        if ok then tidied = n or 0 end
+    end
     local stats = runStats()
     local left  = Sort._residual or 0
     logRun(true, reason)
@@ -1570,6 +1622,7 @@ end
 
 local function finish()
     if not Sort._running then return end
+    if not beginTeardown() then return end   -- CLASS 9, same rule as abort()
     local stats = runStats()
     logRun(false, nil)
     stopDriver()
@@ -1785,7 +1838,38 @@ end
 -- cost 361 moves against wave 1's 101 — 3.5x churn. 1.x can afford it because its plan is a
 -- per-slot goal assignment with no ordering at all; ours is a sequence, so wave 1 is the
 -- correct prefix and the BUSY set is what makes that prefix worth issuing.
+----------------------------------------------------------------------
+-- THE ISSUE-PASS FUSE  (CLASS 9, 2026-08-11)
+--
+-- Everything below issues container operations, and on a client that dispatches events
+-- from inside those calls, every handler in the session runs before the call returns —
+-- ours included. Nothing in the executor reaches an issue pass from a handler today (the
+-- tick is always deferred through C_Timer.After, and the teardown latch now covers the
+-- cleanup path), but "today" is exactly the assumption the Nexus 1.1.8 overflow broke: a
+-- bystander addon on the same event was enough to make the stack unrecognisable. So the
+-- passes carry an explicit fuse — one legitimate depth, and a nested entry REFUSES with a
+-- counted, build-stamped record rather than recursing. A refusal is a missed wave the very
+-- next tick re-plans; an overflow is a dead client.
+----------------------------------------------------------------------
+Sort.MAX_ISSUE_DEPTH = 1
+
+local function enterIssuePass(what)
+    if (Sort._issueDepth or 0) >= Sort.MAX_ISSUE_DEPTH then
+        Sort._reentryRefused = (Sort._reentryRefused or 0) + 1
+        Sort._reentryWhere   = tostring(what) .. "@" .. tostring(ns.VERSION or "?")
+        return false
+    end
+    Sort._issueDepth = (Sort._issueDepth or 0) + 1
+    return true
+end
+
+local function leaveIssuePass()
+    Sort._issueDepth = (Sort._issueDepth or 1) - 1
+    if Sort._issueDepth < 0 then Sort._issueDepth = 0 end
+end
+
 local function issueWave1(plan, cells, now)
+    if not enterIssuePass("wave") then return 0 end
     local byKey = {}
     for _, c in ipairs(cells) do byKey[slotKey(c.cid, c.slot)] = c end
     local maxStackOf = function(id)
@@ -1837,12 +1921,35 @@ local function issueWave1(plan, cells, now)
             -- Claim ONLY on success — 1.x sets from.locked/to.locked after the pickup pair,
             -- never on the refusal path, so a blocked move never reserves its slots.
             for _, r in ipairs(slots) do claimed[refKey(r)] = true end
-            if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
+            -- ── CLASS 9 (2026-08-11): PREDICT BEFORE THE CALL, NOT AFTER ────────────
+            -- Through 2.0.7 this pair read `performMove(m)` THEN `predictMove(...)`, i.e.
+            -- the prediction — the executor's only latch — was armed one client call too
+            -- late. The client does not always SCHEDULE the events a container operation
+            -- causes: ITEM_LOCK_CHANGED for the slot being locked is dispatched from
+            -- INSIDE PickupContainerItem, and every handler in the session (ours included)
+            -- runs to completion before the call returns. With the prediction armed
+            -- afterwards, the driver's own ITEM_LOCK_CHANGED arm found `Sort._pred[k] ==
+            -- nil` and returned: the sequence's FIRST echo walked straight past the latch
+            -- it was supposed to arm, so
+            --   * the settle was never OBSERVED at the event (the round-trip sample and
+            --     every window derived from it — LogAvgAckMs, _settleSecs, _idleSecs — were
+            --     quantized to the tick that noticed it later instead), and
+            --   * event-driven issuing (2.0.2b) was silently dead for any settle the client
+            --     published in-call: `_waiting` was never consumed and no round was ever
+            --     pulled forward, so the whole run fell back on the 0.05s ladder.
+            -- Arming FIRST is also strictly safe on the refusal path: a prediction for a
+            -- move the client refuses was already possible (dropRate / Internal Bag Error
+            -- both leave the pred standing) and is retired by the SETTLE_TTL arm exactly as
+            -- before. The simulator asserts the ordering directly — `stats.echoUnlatched`
+            -- counts every in-call echo that arrived with no prediction armed for the slot
+            -- it names, and the fixtures pin it at zero.
             predictMove(m, byKey, maxStackOf, now)
+            if ns.SafeCall then ns:SafeCall(performMove, m) else performMove(m) end
             issued = issued + 1
             Sort._moveCount = (Sort._moveCount or 0) + 1
         end
     end
+    leaveIssuePass()
     return issued
 end
 
@@ -1859,8 +1966,14 @@ function cleanupWave(reason)
        or reason == "window closed" or reason == "containers unavailable" then return 0 end
     local CC = _G.C_Container
     if not (CC and CC.PickupContainerItem) or not Sort._cids then return 0 end
+    -- THE DEPTH FUSE (class 9). Both issue passes run entirely inside client calls whose
+    -- events reach our own handlers, so an unforeseen composition — a handler that reaches
+    -- an issue path from inside one — must degrade to a REFUSAL with a build-stamped
+    -- record, not to a deeper stack. There is no legitimate nesting: an issue pass is
+    -- always entered from a tick or a teardown, never from another issue pass.
+    if not enterIssuePass("cleanup") then return 0 end
     local cells = snapshot(Sort._cids)
-    if not cells then return 0 end
+    if not cells then leaveIssuePass(); return 0 end
     local moves = Sort.CompactMoves(cells, Sort._canHold, function(c)
         return slotLocked(c.cid, c.slot)
             or (Sort._pred and Sort._pred[slotKey(c.cid, c.slot)] ~= nil) or false
@@ -1882,6 +1995,7 @@ function cleanupWave(reason)
         end
     end
     Sort._cleanupMoves = issued
+    leaveIssuePass()
     return issued
 end
 
@@ -1948,6 +2062,22 @@ end
 -- One optimistic round: snapshot -> overlay predictions -> re-plan -> issue wave 1.
 function Sort._tick()
     if not Sort._running then return end
+
+    -- ── CLASS 9: NEVER RE-PLAN FROM A HALF-ISSUED WAVE ────────────────────────────
+    -- A round snapshots, overlays, re-plans and issues. All of that assumes the wave it
+    -- is looking at is not currently HALF OUT. On a client that dispatches from inside the
+    -- call, a handler woken by move 3's pickup can reach a queued round (a kick whose gap
+    -- has already elapsed is DUE the moment the timer queue is next drained, and the queue
+    -- is drained inside the call), and that round would then plan over a bag with one item
+    -- on the cursor and two slots mid-swap — the Armory E-1 shape, and the state in which
+    -- a settle predicate can retire a move that has not landed. The issue-pass depth IS
+    -- the "a wave is out right now" fact, so the round defers instead: nothing is lost,
+    -- because the wave in flight arms the next round on its own settle anyway.
+    if (Sort._issueDepth or 0) > 0 then
+        Sort._reentryRefused = (Sort._reentryRefused or 0) + 1
+        Sort._reentryWhere   = "tick@" .. tostring(ns.VERSION or "?")
+        return scheduleTick(Sort.KICK_GAP)
+    end
 
     -- Abort guards first, exactly as before (polled AND event-driven).
     if inCombat() then return abort("entered combat") end
@@ -2125,6 +2255,12 @@ local function ensureDriver()
         -- them a settle-aware executor would sit out the whole window on the slow
         -- backstop tick; with them the round re-arms the moment the contents land.
         if event == "BAG_UPDATE" or event == "BAG_UPDATE_DELAYED" then
+            -- CLASS 9: while a teardown is in flight these are the teardown's OWN echoes
+            -- (cleanupWave's pickups, stopDriver's ClearCursor). Sampling round-trips from
+            -- them writes cleanup timings into the record logRun is about to persist, and
+            -- arming a kick schedules a round for a run that is ending. Read the latch and
+            -- treat what it sees as our own echo.
+            if Sort._teardown then return end
             if Sort._running and Sort._pred then
                 local now = nowSeconds()
                 local settled = false
@@ -2153,6 +2289,7 @@ local function ensureDriver()
             -- that prediction the moment the server confirms — no full re-scan, and the
             -- dependent moves become issuable on the very next round.
             if not (Sort._running and Sort._pred) then return end
+            if Sort._teardown then return end          -- CLASS 9, see the BAG_UPDATE arm
             if a == nil or b == nil then return end
             local k = slotKey(a, b)
             if not Sort._pred[k] then return end
@@ -2310,6 +2447,13 @@ function Sort.Run(cids, opts)
     Sort._settleHolds, Sort._settleDrops = 0, 0
     Sort._inFlightPeak, Sort._waitingRound = 0, false
     Sort._cleanupMoves = 0
+    -- CLASS 9 run state. `_teardown` and `_issueDepth` are RE-SEEDED rather than merely
+    -- assumed clean: a throw between arming and releasing either one would otherwise make
+    -- every later run unstoppable / unissuable, and a latch that can wedge is not a fix.
+    Sort._teardown       = nil
+    Sort._issueDepth     = 0
+    Sort._reentryRefused = 0
+    Sort._reentryWhere   = nil
 
     -- Size this run's patience windows off the MEASURED round-trip from the log (2.0.2c).
     -- max(), never min(): the fixed windows are the floor, so an unmeasured or fast
@@ -3180,6 +3324,36 @@ table.sort(SIMIDS)
 -- lands. `settleLag` is the width of that window. At 0 the sim publishes contents and
 -- releases the lock atomically — which is what it did through 2.0.2, and is exactly
 -- why the harness never saw the owner's live failure.
+--
+-- ── dispatch: WHEN THE ECHO ARRIVES (CLASS 9, 2026-08-11) ────────────────────
+-- THE BLIND SPOT, NAMED. Through 2.0.7 this simulator delivered every event through
+-- `S.after`, i.e. strictly AFTER the container call that caused it had returned. That is
+-- one posture out of two, and it is the KIND one: any latch the engine arms after its own
+-- first client call is already up by the time an async echo lands, so the async profile
+-- tests the fix and never the hazard. The live client does not always schedule: on
+-- interface 11509 a setter can DISPATCH its event from inside itself, and every handler
+-- in the session runs to completion before the setter returns (Nexus 1.1.8, proven live).
+--
+--   "sync"  (DEFAULT — the unkind posture)
+--            * a container operation that LOCKS slots announces those locks with
+--              ITEM_LOCK_CHANGED from INSIDE the call. This is the sequence's FIRST echo
+--              and it is the one that walks past a latch armed one call later.
+--            * a pickup announces the slot it put on the cursor the same way (the client
+--              greys it: the lock changed).
+--            * any landing already DUE on the virtual clock is delivered from inside the
+--              call as well, so a zero-latency round-trip publishes its contents before
+--              PickupContainerItem returns.
+--   "async" (the named variant, retained: exactly the 2.0.7 behaviour)
+--
+-- Both postures must be run. `stats.echoUnlatched` is the class-9 gate and, like
+-- `lockedIssue`, it is raised by the SIM and never read by the engine: it counts every
+-- in-call echo naming a slot that a RUNNING sort has an operation out on with no
+-- prediction armed for it — "the latch was not up when your own first echo arrived".
+-- `stats.maxDispatchDepth` fuses the sim itself: a handler that re-enters the container
+-- API without bound fails the run as a test failure instead of a C-stack overflow.
+--
+-- `echoHook(S, api, cid, slot)` is the in-call fault-injection seam — it runs INSIDE the
+-- named client call, which is the only place a class-9 fixture can put an event.
 local function makeSimulator(opts)
     opts = opts or {}
     local S = {
@@ -3188,6 +3362,8 @@ local function makeSimulator(opts)
         jitter    = opts.jitter or 0,
         dropRate  = opts.dropRate or 0,
         settleLag = opts.settleLag or 0,
+        dispatch  = opts.dispatch or "sync",   -- UNKIND BY DEFAULT (class 9)
+        echoHook  = opts.echoHook,
         rng      = newRng(opts.seed or 12345),
         timers   = {}, seq = 0,
         frames   = {},
@@ -3208,7 +3384,9 @@ local function makeSimulator(opts)
         --                 client itself reports LOCKED. Asserted by the SIM, never by
         --                 the engine, so the engine cannot grade its own homework.
         stats    = { pickups = 0, drops = 0, rejected = 0, applied = 0,
-                     bagErrors = 0, lockedIssue = 0 },
+                     bagErrors = 0, lockedIssue = 0,
+                     -- class 9 (see the dispatch banner): both raised by the SIM only.
+                     inCallEchoes = 0, echoUnlatched = 0, maxDispatchDepth = 0 },
         saved    = {},
     }
     -- Stands in for ERR_INTERNAL_BAG_ERROR. The live numeric id is build-specific, so
@@ -3260,6 +3438,71 @@ local function makeSimulator(opts)
         for _, f in ipairs(S.frames) do
             if f._events[event] and f._script then f._script(f, event, a, b) end
         end
+    end
+
+    ------------------------------------------------------------------
+    -- CLASS 9: dispatch from INSIDE the client call
+    ------------------------------------------------------------------
+    S.MAX_DISPATCH_DEPTH = 8   -- the sim's own fuse; see the dispatch banner
+
+    -- Announce a lock STATE CHANGE on one slot. In the sync posture the handler runs before
+    -- the caller's client call returns, and the gate below asks the class-9 question at the
+    -- dispatch site: was the engine's latch up when its own echo arrived?
+    -- `ungated` marks an announcement about a slot the caller's move does not name — the
+    -- ClearCursor tail's parking branches — where "no prediction" is not a latch failure.
+    local function announceLock(cid, slot, ungated)
+        if S.dispatch ~= "sync" then return end
+        if cid == nil or slot == nil then return end
+        S.stats.inCallEchoes = S.stats.inCallEchoes + 1
+        -- The gate. Only meaningful while OUR executor has a run open: an operation is out
+        -- on this slot (we are inside the call that issued it), so a prediction for it must
+        -- already exist. `Sort._pred` is read, never written — the engine cannot see this.
+        if not ungated and Sort._running and Sort._pred and not Sort._teardown
+           and Sort._pred[cid .. ":" .. slot] == nil then
+            S.stats.echoUnlatched = S.stats.echoUnlatched + 1
+        end
+        S.fire("ITEM_LOCK_CHANGED", cid, slot)
+    end
+
+    -- Deliver everything the virtual clock already owes, from inside the call. A zero-
+    -- latency landing therefore publishes its contents before the client call returns.
+    local function drainDue()
+        if S.dispatch ~= "sync" then return end
+        local guard = 0
+        while true do
+            guard = guard + 1
+            if guard > 1000 then error("simulator: in-call dispatch storm") end
+            local best
+            for i, t in ipairs(S.timers) do
+                if t.at <= S.clock and (not best or t.at < S.timers[best].at
+                   or (t.at == S.timers[best].at and t.seq < S.timers[best].seq)) then best = i end
+            end
+            if not best then return end
+            local t = S.timers[best]
+            table.remove(S.timers, best)
+            t.fn()
+        end
+    end
+
+    -- Wrap one client call so everything above happens INSIDE it, with a depth fuse so a
+    -- handler that re-enters the container API fails the run as a test failure rather than
+    -- as a C-stack overflow (the Nexus 1.1.8 symptom).
+    local function inCall(api, fn, cid, slot)
+        S.depth = (S.depth or 0) + 1
+        if S.depth > S.stats.maxDispatchDepth then S.stats.maxDispatchDepth = S.depth end
+        if S.depth > S.MAX_DISPATCH_DEPTH then
+            S.depth = S.depth - 1
+            error("simulator: " .. api .. " nested past depth " .. S.MAX_DISPATCH_DEPTH
+                  .. " (class 9 runaway re-entry)")
+        end
+        local ok, err = pcall(fn)
+        if ok and S.dispatch == "sync" then
+            if S.echoHook then pcall(S.echoHook, S, api, cid, slot) end
+            local ok2, err2 = pcall(drainDue)
+            if not ok2 then ok, err = false, err2 end
+        end
+        S.depth = S.depth - 1
+        if not ok then error(err, 0) end
     end
 
     ------------------------------------------------------------------
@@ -3375,7 +3618,7 @@ local function makeSimulator(opts)
         return free, bag.family
     end
 
-    function C_Container.PickupContainerItem(cid, slot)
+    local function pickupImpl(cid, slot)
         local bag = S.bags[cid]
         if not bag or slot < 1 or slot > bag.n then return end
         local k = key(cid, slot)
@@ -3393,6 +3636,9 @@ local function makeSimulator(opts)
             -- ClearCursor from here is a pure no-op.
             S.heldDetached = false
             S.stats.pickups = S.stats.pickups + 1
+            -- The slot is now cursor-held, i.e. LOCKED as far as the client is concerned,
+            -- and it says so from inside this call (class 9: the sequence's first echo).
+            announceLock(cid, slot)
             return
         end
         ----------------------------------------------------------- drop
@@ -3415,6 +3661,7 @@ local function makeSimulator(opts)
         -- into itself and invent items out of nothing.)
         if k == srcKey and not S.heldDetached then
             S.held, S.holdKey = nil, nil
+            announceLock(scid, sslot)   -- the cursor let go: that slot's lock changed
             return
         end
 
@@ -3444,6 +3691,9 @@ local function makeSimulator(opts)
         local dst  = bag.truth[slot]
         local maxS = (SIMCAT[held.id] and SIMCAT[held.id].maxStack) or 1
         S.locked[srcKey], S.locked[k] = true, true
+        -- Both ends are locked NOW, and the client announces both from inside this call.
+        announceLock(scid, sslot)
+        if k ~= srcKey then announceLock(cid, slot) end
 
         if dst == nil then
             bag.truth[slot]    = { id = held.id, count = held.count }
@@ -3469,6 +3719,35 @@ local function makeSimulator(opts)
             S.held, S.holdKey = nil, nil
         end
         commit(touched)
+    end
+
+    function C_Container.PickupContainerItem(cid, slot)
+        inCall("PickupContainerItem", function() pickupImpl(cid, slot) end, cid, slot)
+    end
+
+    -- ── AN ABSENT SETTER IS A KINDER CLIENT (class 9, secondary blind spot) ─────
+    -- performMove's `split` arm is guarded on `CC.SplitContainerItem`, and this simulator
+    -- did not define it — so on the sim that arm was a silent no-op, one whole client
+    -- entry point the harness could never dispatch an echo from. The planner emits no
+    -- `split` move today (Sort.Plan produces only swap/merge; MoveSlots and performMove are
+    -- the only two places the op name appears), so the arm is unreachable from a plan — but
+    -- "unreachable today" is not "absent from the client", and the stub costs nothing.
+    -- Modelled as the client does it: the split lands on the CURSOR, leaving the source
+    -- locked, and the announcement happens inside the call.
+    function C_Container.SplitContainerItem(cid, slot, amount)
+        inCall("SplitContainerItem", function()
+            local bag = S.bags[cid]
+            if not bag or slot < 1 or slot > bag.n then return end
+            if S.held ~= nil then return end
+            local k = key(cid, slot)
+            if isLocked(cid, slot) then lockedIssue(); return end
+            local it = bag.slots[slot]
+            if not it or not amount or amount <= 0 or amount >= (it.count or 0) then return end
+            S.held, S.holdKey = { id = it.id, count = amount }, k
+            S.heldDetached = false
+            S.stats.pickups = S.stats.pickups + 1
+            announceLock(cid, slot)
+        end, cid, slot)
     end
 
     ------------------------------------------------------------------
@@ -3502,13 +3781,20 @@ local function makeSimulator(opts)
         -- Dropping the cursor returns the held item to the slot it came from (the live
         -- client's behaviour for a container item), so nothing can ever be destroyed by
         -- the executor's belt-and-suspenders ClearCursor().
+        -- Wrapped in inCall for the same reason the container entry points are (class 9):
+        -- ClearCursor changes lock state, and the client announces that from inside it.
         _G.ClearCursor = function()
+          inCall("ClearCursor", function()
             if not S.held then S.holdKey = nil; return end
             local k, held, detached = S.holdKey, S.held, S.heldDetached
             S.held, S.holdKey, S.heldDetached = nil, nil, false
             -- Picked up but never dropped (or the drop was refused): server truth never
-            -- lost the item, so putting the cursor down changes nothing.
-            if not detached then return end
+            -- lost the item, so putting the cursor down changes nothing — except that the
+            -- slot is no longer cursor-held, which IS a lock change.
+            if not detached then
+                if k then local c0, s0 = unkey(k); announceLock(c0, s0, true) end
+                return
+            end
             if not k then return end
             local cid, slot = unkey(k)
             local bag = S.bags[cid]
@@ -3525,6 +3811,7 @@ local function makeSimulator(opts)
                         if not b2.truth[s2] and canHoldSim(c2, held.id) then
                             b2.truth[s2] = { id = held.id, count = held.count }
                             S.locked[key(c2, s2)] = true
+                            announceLock(c2, s2, true)
                             commit({ key(c2, s2) })
                             return
                         end
@@ -3532,7 +3819,9 @@ local function makeSimulator(opts)
                 end
             end
             S.locked[k] = true
+            announceLock(cid, slot, true)
             commit({ k })
+          end)
         end
         _G.bit = { band = bandOf }
         _G.BankFrame = nil
@@ -5184,6 +5473,407 @@ end
 -- "scattered with holes". Convergence is one contract; ending tidily when convergence
 -- is impossible is a separate one, and it is the one the owner actually saw fail.
 -- =====================================================================
+-- =====================================================================
+-- CLASS 9 — SYNCHRONOUS IN-CALL EVENT DISPATCH  (2026-08-11)
+--
+-- The class the whole suite was blind to until 2026-08-10, and the reason it was blind:
+-- this file's simulator delivered every echo AFTER the call that caused it returned. That
+-- posture arms the latch for the engine, so it tests the fix and never the hazard. The
+-- simulator now defaults to SYNC (see makeSimulator's dispatch banner) and the async
+-- profile is a named variant; everything below runs BOTH.
+--
+-- Three things are proven here, in this order:
+--
+--   THE GATE IS REAL      the sim's `echoUnlatched` counter goes red on the exact defect
+--                         shape (prediction armed one client call late) and green on the
+--                         fixed one — driven by hand, with no executor involved, so a
+--                         green verdict from the fixtures below means something.
+--   POSTURE EQUIVALENCE   the full composed leg — plan → waves → settle → final capture →
+--                         store write — issues the SAME moves in the SAME number of waves
+--                         under both postures, ends at the same layout, and holds the
+--                         refresh mute for the whole run either way.
+--   TEARDOWN IS ATOMIC    an abort trigger delivered INSIDE the tidy-up wave's own
+--                         container call does not start a second teardown. Red control:
+--                         clear the latch from inside the same hook and the double
+--                         teardown comes straight back.
+-- =====================================================================
+
+-- The sim's class-9 gate, driven by hand. Two pickups on a running-sort-shaped world:
+-- one with the prediction armed BEFORE the call (2.0.8's order), one with it armed after
+-- (2.0.7's). A gate that cannot go red proves nothing about the runs that pass it.
+local function testClass9Gate(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function probe(armFirst)
+        local S = makeSimulator({ bags = { { cid = 0, size = 4 } }, seed = 991 })
+        S:set(0, 1, 601, 1)
+        S:set(0, 3, 602, 1)
+        S:install()
+        -- Stand in for a live run WITHOUT starting one: the gate reads exactly these two
+        -- fields, and driving them by hand keeps the probe independent of the executor.
+        local savedRunning, savedPred, savedTear = Sort._running, Sort._pred, Sort._teardown
+        Sort._running, Sort._pred, Sort._teardown = true, {}, nil
+        local ok, err = pcall(function()
+            if armFirst then Sort._pred["0:1"] = { cid = 0, slot = 1, id = 602, count = 1, at = 0 } end
+            _G.C_Container.PickupContainerItem(0, 1)
+            if not armFirst then Sort._pred["0:1"] = { cid = 0, slot = 1, id = 602, count = 1, at = 0 } end
+        end)
+        Sort._running, Sort._pred, Sort._teardown = savedRunning, savedPred, savedTear
+        S:restore()
+        if not ok then error(err, 0) end
+        return S
+    end
+
+    local red = probe(false)
+    ck(red.stats.inCallEchoes >= 1,
+        "the sync sim really does echo from INSIDE PickupContainerItem (got "
+        .. red.stats.inCallEchoes .. ")")
+    ck(red.stats.echoUnlatched >= 1,
+        "RED CONTROL: a prediction armed one call LATE lets the sequence's own first echo "
+        .. "walk past the latch (unlatched=" .. red.stats.echoUnlatched .. ")")
+
+    local green = probe(true)
+    ck(green.stats.inCallEchoes >= 1, "…the fixed order still takes the same in-call echo")
+    ck(green.stats.echoUnlatched == 0,
+        "GREEN: armed BEFORE the call, the echo finds its latch up (unlatched="
+        .. green.stats.echoUnlatched .. ")")
+
+    -- ASYNC is the named variant, and it is exactly the posture that could not see this:
+    -- the same late-armed sequence raises nothing at all.
+    local S = makeSimulator({ bags = { { cid = 0, size = 4 } }, seed = 991, dispatch = "async" })
+    S:set(0, 1, 601, 1)
+    S:install()
+    local savedRunning, savedPred = Sort._running, Sort._pred
+    Sort._running, Sort._pred = true, {}
+    pcall(function() _G.C_Container.PickupContainerItem(0, 1) end)
+    Sort._running, Sort._pred = savedRunning, savedPred
+    S:restore()
+    ck(S.stats.inCallEchoes == 0 and S.stats.echoUnlatched == 0,
+        "THE BLIND SPOT, NAMED: under the async posture the same late arming raises nothing "
+        .. "— a sim that echoes at all is not unkind enough; WHEN it echoes is the question")
+
+    -- An absent setter is a kinder client (the secondary blind spot). The engine's `split`
+    -- arm is guarded on this function existing, and the sim used not to define it.
+    local S2 = makeSimulator({ bags = { { cid = 0, size = 4 } }, seed = 7 })
+    S2:set(0, 1, 701, 5)
+    S2:install()
+    local haveSplit = type(_G.C_Container.SplitContainerItem) == "function"
+    local heldAfter
+    if haveSplit then
+        _G.C_Container.SplitContainerItem(0, 1, 2)
+        heldAfter = S2.held
+    end
+    S2:restore()
+    ck(haveSplit, "the sim stubs SplitContainerItem — performMove's split arm is guarded on it")
+    ck(heldAfter ~= nil and heldAfter.count == 2,
+        "…and it behaves: the split lands on the cursor (client semantics)")
+end
+
+-- One fixture, run under both postures, compared field by field.
+local function class9Pair(mk, cids, tag, fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = tag .. ": " .. m end end
+    local out = {}
+    for _, posture in ipairs({ "sync", "async" }) do
+        local S = mk(posture)
+        local before = S:totals()
+        local plan0  = Sort.Plan({ cells = S:cells(), meta = simMetaFn })
+        local tally  = runSortInSim(S, cids, { limit = 240 })
+        local rec    = Sort._lastRun or {}
+        local layout = {}
+        for _, c in ipairs(S:cells()) do
+            layout[#layout + 1] = c.cid .. ":" .. c.slot .. "=" .. tostring(c.id) .. "x" .. c.count
+        end
+        local completed = false
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort complete", 1, true) then completed = true end
+        end
+        out[posture] = {
+            S = S, plan = #plan0.moves, exec = rec.executedMoves or 0, waves = rec.waves or 0,
+            layout = table.concat(layout, "|"), totals = S:totals(), completed = completed,
+            reentry = Sort._lastReentryRefused or 0, tally = tally,
+            residual = #Sort.Plan({ cells = S:cells(), meta = simMetaFn }).moves,
+            before = before,
+        }
+    end
+
+    local sy, as = out.sync, out.async
+
+    ---------------------------------------------------------------- the posture is real
+    ck(sy.S.stats.inCallEchoes > 0, string.format(
+        "the SYNC run really dispatched from inside the client calls (%d in-call echoes)",
+        sy.S.stats.inCallEchoes))
+    ck(as.S.stats.inCallEchoes == 0,
+        "…and the ASYNC variant is the old posture, with none (" .. as.S.stats.inCallEchoes .. ")")
+
+    ---------------------------------------------------------------- the class-9 gate
+    ck(sy.S.stats.echoUnlatched == 0, string.format(
+        "ZERO in-call echoes arrived with no prediction armed (sim counted %d)",
+        sy.S.stats.echoUnlatched))
+    ck(sy.reentry == 0 and as.reentry == 0, string.format(
+        "the issue-pass fuse refused nothing — no handler reached a wave from inside a "
+        .. "call (sync=%d async=%d)", sy.reentry, as.reentry))
+    ck(sy.S.stats.maxDispatchDepth <= 3, string.format(
+        "in-call nesting stayed shallow (depth %d, fuse at %d)",
+        sy.S.stats.maxDispatchDepth, sy.S.MAX_DISPATCH_DEPTH))
+
+    ---------------------------------------------------------------- the permanent gates
+    for _, p in ipairs({ "sync", "async" }) do
+        local r = out[p]
+        ck(r.S.stats.lockedIssue == 0, p .. ": ZERO moves issued against a locked slot")
+        ck(r.S.stats.bagErrors == 0, p .. ": the client refused nothing")
+        ck(r.completed, p .. ": ran to completion")
+        ck(r.residual == 0, p .. ": reached the planner's fixed point (" .. r.residual .. " left)")
+        ck(r.S.held == nil, p .. ": cursor left empty")
+        ck(not r.S:anyLocked(), p .. ": no slot left locked")
+        local same, bad = sameTotals(r.before, r.totals)
+        ck(same, p .. ": every item conserved (id " .. tostring(bad) .. ")")
+    end
+
+    ---------------------------------------------------------------- POSTURE EQUIVALENCE
+    ck(sy.plan == as.plan, string.format(
+        "both postures started from the same plan (%d vs %d)", sy.plan, as.plan))
+    ck(sy.exec == as.exec, string.format(
+        "SAME MOVE COUNT under both postures (sync %d, async %d)", sy.exec, as.exec))
+    ck(sy.waves == as.waves, string.format(
+        "SAME WAVE COUNT under both postures (sync %d, async %d)", sy.waves, as.waves))
+    ck(sy.layout == as.layout, "…and both postures land on byte-identical layouts")
+    return out
+end
+
+local function testClass9Postures(fails)
+    local rng = newRng(90901)
+    for _, cfg in ipairs({
+        { latency = 0,    settleLag = 0,    tag = "instant client (the landing echoes IN the call)" },
+        { latency = 0.10, settleLag = 0.04, tag = "fast client" },
+        { latency = 0.24, settleLag = 0.15, tag = "the owner's 240ms client" },
+    }) do
+        for trial = 1, 2 do
+            local seedBags = newRng(3000 + trial)
+            class9Pair(function(posture)
+                local S = makeSimulator({
+                    bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 }, { cid = 2, size = 16 } },
+                    latency = cfg.latency, jitter = cfg.latency * 0.4,
+                    settleLag = cfg.settleLag, seed = 4400 + trial, dispatch = posture })
+                -- Same layout for both postures: a shared rng would desynchronise them.
+                local r = newRng(3000 + trial)
+                seedRandomBags(S, r, 7, 9)
+                return S
+            end, { 0, 1, 2 }, string.format("%s trial %d", cfg.tag, trial), fails)
+            seedBags(); rng()
+        end
+    end
+end
+
+-- ── THE COMPOSED LEG ────────────────────────────────────────────────────────────
+-- plan → waves → settle → final capture → store write, under both postures, with the
+-- capture layer REAL enough to answer the question the mute exists for: does anything
+-- read the bags mid-run, and does exactly one capture land at the end?
+local function testClass9ComposedLeg(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function leg(posture)
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 20 }, { cid = 1, size = 17 }, { cid = 2, size = 17 } },
+            latency = 0.18, jitter = 0.07, settleLag = 0.09, seed = 5150, dispatch = posture })
+        seedRandomBags(S, newRng(5150), 9, 11)
+        local before = S:totals()
+
+        -- The "store": what a capture would write. Recorded per capture so the test can
+        -- see WHEN it happened relative to the run, not just how often.
+        local writes, midRun = {}, 0
+        local oldFrame, oldCapture, oldPrint = ns.Frame, ns.Capture, ns.Print
+        local prints, refreshes = {}, 0
+        ns.Frame = { IsShown = function() return true end,
+                     RequestRefresh = function() refreshes = refreshes + 1 end }
+        ns.Capture = { RequestCapture = function()
+            if Sort._running then midRun = midRun + 1 end
+            local snap = {}
+            for _, c in ipairs(S:cells()) do
+                snap[#snap + 1] = c.cid .. ":" .. c.slot .. "=" .. tostring(c.id) .. "x" .. c.count
+            end
+            writes[#writes + 1] = table.concat(snap, "|")
+        end }
+        ns.Print = function(_, ...)
+            local parts = {}
+            for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+            prints[#prints + 1] = table.concat(parts, "")
+        end
+
+        S:install()
+        local ok, err = pcall(function()
+            Sort.Run({ 0, 1, 2 })
+            S:pump(240)
+        end)
+        if Sort._running then Sort._running = false end
+        S:restore()
+        ns.Frame, ns.Capture, ns.Print = oldFrame, oldCapture, oldPrint
+        if not ok then error(err, 0) end
+
+        local rec = Sort._lastRun or {}
+        local final = {}
+        for _, c in ipairs(S:cells()) do
+            final[#final + 1] = c.cid .. ":" .. c.slot .. "=" .. tostring(c.id) .. "x" .. c.count
+        end
+        return { S = S, before = before, writes = writes, midRun = midRun, prints = prints,
+                 exec = rec.executedMoves or 0, waves = rec.waves or 0,
+                 final = table.concat(final, "|"), refreshes = refreshes }
+    end
+
+    local sy, as = leg("sync"), leg("async")
+
+    for _, pair in ipairs({ { "sync", sy }, { "async", as } }) do
+        local p, r = pair[1], pair[2]
+        ck(#r.writes == 1, p .. ": EXACTLY ONE capture for the whole run (got " .. #r.writes .. ")")
+        ck(r.midRun == 0, p ..
+            ": …and it is the close-out, not a mid-run read — the mute held end to end (" ..
+            r.midRun .. " mid-run capture(s))")
+        ck(r.writes[1] == r.final, p ..
+            ": the STORE WRITE is the run's final layout, not a mid-sort snapshot")
+        local same, bad = sameTotals(r.before, r.S:totals())
+        ck(same, p .. ": every item conserved through the whole leg (id " .. tostring(bad) .. ")")
+        local done = false
+        for _, line in ipairs(r.prints) do
+            if line:find("sort complete", 1, true) then done = true end
+        end
+        ck(done, p .. ": the leg ended in a completion, not an abort")
+        ck(r.S.stats.lockedIssue == 0 and r.S.stats.bagErrors == 0,
+            p .. ": no locked issue, no bag error")
+    end
+
+    ck(sy.S.stats.inCallEchoes > 0, "the sync leg dispatched inside the calls ("
+        .. sy.S.stats.inCallEchoes .. " echoes)")
+    ck(sy.S.stats.echoUnlatched == 0, "…every one of them found its prediction armed")
+    ck(sy.exec == as.exec and sy.waves == as.waves, string.format(
+        "the composed leg issues the SAME moves in the SAME waves under both postures "
+        .. "(sync %d/%d, async %d/%d)", sy.exec, sy.waves, as.exec, as.waves))
+    ck(sy.final == as.final, "…and writes the SAME final layout to the store")
+end
+
+-- ── TEARDOWN ATOMICITY, WITH ITS RED CONTROL ────────────────────────────────────
+-- The abort path issues container operations of its own (cleanupWave) before it tears the
+-- run down, with the driver still registered. Deliver an abort trigger from INSIDE one of
+-- those calls — a pull landing on the frame the tidy-up wave goes out is exactly that —
+-- and a teardown with no latch runs a second time from inside the first.
+-- ── THE FUSE, EXERCISED ─────────────────────────────────────────────────────────
+-- Nothing in the shipped composition reaches an issue pass from inside a client call —
+-- the tick is always deferred and the teardown latch covers the cleanup — so the fuse
+-- would otherwise be hardening with no gate on it, which is how hardening rots. The hook
+-- below is the UNFORESEEN COMPOSITION, made foreseeable: a handler woken by move N's
+-- pickup reaches straight back into the round. The contract is a counted REFUSAL and a
+-- run that still lands, not a deeper stack and not a plan taken over a half-issued wave.
+local function testClass9Fuse(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local hits = 0
+    local S = makeSimulator({
+        bags = { { cid = 0, size = 16 }, { cid = 1, size = 16 } },
+        latency = 0.12, jitter = 0.04, settleLag = 0.05, seed = 6161, dispatch = "sync",
+        echoHook = function(_, api)
+            if api ~= "PickupContainerItem" then return end
+            if not Sort._running or Sort._teardown then return end
+            if hits >= 6 then return end
+            hits = hits + 1
+            Sort._tick()          -- re-enter the round from inside the wave it is issuing
+        end })
+    seedRandomBags(S, newRng(6161), 8, 8)
+    local before = S:totals()
+    local tally = runSortInSim(S, { 0, 1 }, { limit = 240 })
+    local rec = Sort._lastRun or {}
+
+    ck(hits > 0, "PREMISE: the fixture re-entered the round from inside a pickup ("
+        .. hits .. " times)")
+    ck((Sort._lastReentryRefused or 0) >= hits, string.format(
+        "THE FUSE: every one of them was REFUSED and counted (%d refusals for %d attempts)",
+        Sort._lastReentryRefused or 0, hits))
+    -- WHICH fuse caught it is the whole point. "tick@" means the round refused BEFORE it
+    -- snapshotted — no plan was ever taken over a half-issued wave. "wave@" would mean the
+    -- round re-planned from mid-state and was only stopped at the issue guard, which is the
+    -- Armory E-1 shape reached one step later: the settle predicates and the target map
+    -- would already have run against a bag with an item on the cursor.
+    ck(type(Sort._lastReentryWhere) == "string"
+        and Sort._lastReentryWhere:find("tick@", 1, true) == 1,
+        "…refused at the ROUND, before any re-plan could see the half-issued wave (got "
+        .. tostring(Sort._lastReentryWhere) .. ")")
+    ck(S.stats.maxDispatchDepth <= S.MAX_DISPATCH_DEPTH,
+        "…and the nesting never ran away (depth " .. S.stats.maxDispatchDepth .. ")")
+
+    -- A refusal is not a licence to lose the sort: the run must still land.
+    local completed = false
+    for _, line in ipairs(tally.prints) do
+        if line:find("sort complete", 1, true) then completed = true end
+    end
+    ck(completed, "A LATCH THAT SWALLOWS THE WORK IS NOT A FIX: the sort still completed")
+    ck(#Sort.Plan({ cells = S:cells(), meta = simMetaFn }).moves == 0,
+        "…at the planner's fixed point")
+    local same, bad = sameTotals(before, S:totals())
+    ck(same, "…with every item conserved (id " .. tostring(bad) .. ")")
+    ck(S.stats.lockedIssue == 0 and S.stats.bagErrors == 0,
+        "…and no operation issued at a locked slot, no client refusal")
+    ck(S.stats.echoUnlatched == 0, "…and every in-call echo still found its latch")
+    ck((rec.executedMoves or 0) > 0, "…having actually moved things (" ..
+        tostring(rec.executedMoves) .. " moves)")
+end
+
+local function testClass9TeardownReentry(fails)
+    local function ck(c, m) if not c then fails[#fails + 1] = m end end
+
+    local function run(clearLatch)
+        local fired = false
+        local S = makeSimulator({
+            bags = { { cid = 0, size = 16 } }, latency = 0.10, settleLag = 0.06,
+            seed = 909, dispatch = "sync",
+            echoHook = function(SS, api)
+                if fired or api ~= "PickupContainerItem" then return end
+                if not Sort._teardown then return end   -- only DURING the tidy-up wave
+                fired = true
+                -- THE MUTANT: dropping the latch here reproduces the 2.0.7 build exactly.
+                if clearLatch then Sort._teardown = nil end
+                SS.combat = true
+                SS.fire("PLAYER_REGEN_DISABLED")
+            end })
+        local ids = { 606, 601, 610, 603, 608, 602, 612, 604 }
+        for i, id in ipairs(ids) do S:set(0, i * 2 - 1, id, 1) end
+        S:install()
+        local tally
+        local savedFactor, savedSlack = Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK
+        local ok, err = pcall(function()
+            tally = withFakeUI(function()
+                Sort.Run({ 0 })
+                S:pump(0.12)
+                if Sort._running then
+                    Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK = 0, 0
+                    Sort._budget = Sort._moveCount or 0
+                end
+                S:pump(60)
+            end)
+        end)
+        Sort.MAX_MOVE_FACTOR, Sort.MOVE_SLACK = savedFactor, savedSlack
+        if Sort._running then Sort._running = false end
+        Sort._teardown = nil
+        S:restore()
+        if not ok then error(err, 0) end
+        local stops = 0
+        for _, line in ipairs(tally.prints) do
+            if line:find("sort stopped", 1, true) then stops = stops + 1 end
+        end
+        return { S = S, tally = tally, stops = stops, fired = fired }
+    end
+
+    local green = run(false)
+    ck(green.fired, "PREMISE: the fixture delivered an abort trigger from INSIDE a tidy-up "
+        .. "wave's own PickupContainerItem")
+    ck(green.stops == 1, "ONE teardown for one sort: exactly one 'sort stopped' line (got "
+        .. green.stops .. ")")
+    ck(Sort._running == false, "…and the run is down")
+    ck(green.S.held == nil, "…with the cursor empty")
+    ck(green.S.stats.lockedIssue == 0, "…and nothing issued at a locked slot")
+
+    local red = run(true)
+    ck(red.fired, "…the mutant fixture delivered the same trigger")
+    ck(red.stops >= 2, "RED CONTROL: with the teardown latch cleared, the abort re-enters "
+        .. "itself and tears the same run down twice (" .. red.stops .. " 'sort stopped' lines)")
+end
+
 local function testGracefulAbort(fails)
     local function ck(c, m) if not c then fails[#fails + 1] = m end end
 
@@ -5348,6 +6038,11 @@ function Sort.RunSelfTests(verbose)
         { name = "converge: settle mutation gate", fn = testSettleMutants },
         { name = "converge: graceful abort", fn = testGracefulAbort },
         { name = "live sort repaints (BAG-7)", fn = testLiveSortRepaint },
+        { name = "class 9: in-call dispatch gate", fn = testClass9Gate },
+        { name = "class 9: both postures converge", fn = testClass9Postures },
+        { name = "class 9: composed leg (both postures)", fn = testClass9ComposedLeg },
+        { name = "class 9: issue-pass fuse",   fn = testClass9Fuse },
+        { name = "class 9: teardown re-entry", fn = testClass9TeardownReentry },
     }
     local allPass = true
     for _, suite in ipairs(suites) do

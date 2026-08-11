@@ -586,14 +586,29 @@ end
 -- pending never creates a frame, never arms a timer, and stays a single pass.
 function Find.NotePending(ids)
     if type(ids) ~= "table" or #ids == 0 then return end
+    -- ── CLASS 9 (2026-08-11): SUBSCRIBE BEFORE THE FIRST ASK, NOT AFTER ──────────────
+    -- This call used to sit BELOW the loop, which is one client call too late.
+    -- RequestLoadItemDataByID does not always schedule its answer: for an id the client
+    -- already holds it dispatches GET_ITEM_INFO_RECEIVED from INSIDE the request, and
+    -- every handler registered in the session runs before the request returns. With the
+    -- watch frame built afterwards there was no handler at all, so the answers to the
+    -- FIRST pass — the fresh-login pass, the only one that matters — were delivered into
+    -- nothing. `_watch[id]` then stayed true for an id that was already warm: the surfaces
+    -- kept saying "still loading N items", the ladder burned all its rungs re-asking for
+    -- data it had, and the cycle closed out as `_watchExhausted`, i.e. the window ended up
+    -- telling the owner "N items never sent their data" about items the client had
+    -- answered for before the loop finished. Arming first costs nothing — the frame is
+    -- idempotent and the `#ids == 0` return above still keeps the warm path frameless.
+    Find.EnsureWatchFrame()
     for i = 1, #ids do
         local id = ids[i]
         if id and Find._watch[id] == nil then
+            -- The watch entry is set BEFORE the ask for the same reason (the handler reads
+            -- it); the frame is what was missing.
             Find._watch[id] = true
             askFor(id)
         end
     end
-    Find.EnsureWatchFrame()
     Find.ArmLadder()
 end
 
