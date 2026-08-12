@@ -756,6 +756,24 @@ _G.C_Timer = { After = function(delay, fn) HTIMER.After(delay, fn) end }
 _G.__DaseekiHarnessTimer = HTIMER
 
 ----------------------------------------------------------------------
+-- THE OWNERSHIP BEACON  (2026-08-12 — the container-click taint fix)
+--
+-- Every simulator in this addon installs a fake client over the global table: sort.lua's
+-- swaps eleven globals including C_Container and BankFrame, capture's swaps C_Container and
+-- GetTime, ui_bank's swaps BankFrame, store's nils the SavedVariables tables. That contract
+-- — "I own _G" — is TRUE here and FALSE in a client, and the addon used to assume it either
+-- way: `/bags debug selftest` ran the whole set in-game. Two of those globals are read by
+-- ContainerFrame_Shared.lua:1341 on the way to the protected UseContainerItem call, so one
+-- diagnostic command blocked every right-click-to-use for the rest of the session and put
+-- this addon's name on the error. (It also re-inited the owner's saved data.)
+--
+-- ns:HarnessOwnsGlobals() now answers that question from POSITIVE EVIDENCE only: this
+-- beacon, which exists in this file and nowhere else. Planted before the addon loads so the
+-- suites see it; the taint gate at the bottom takes it away again to prove the refusal.
+----------------------------------------------------------------------
+_G.__DaseekiBagsHarness = true
+
+----------------------------------------------------------------------
 -- ns namespace — the REAL runtime now comes from core.lua (loaded FIRST in
 -- TOC_ORDER below): Print / SafeCall / event dispatch / On-Fire bus / self-test
 -- registry. The harness no longer stubs those; it drives the real core. After
@@ -1830,13 +1848,501 @@ if not ok then
     os.exit(3)
 end
 
-local overall = pass and rosterPass and timerPass
+----------------------------------------------------------------------
+-- TAINT / STOCK-SURFACE GATE   (2026-08-12 — the container-click taint defect)
+--
+-- WHAT THE CLIENT SAID, and what it means:
+--
+--   [ADDON_ACTION_BLOCKED] AddOn 'Daseeki-Bags' tried to call the protected
+--   function 'UseContainerItem()'.
+--   [C]: in function 'UseContainerItem'
+--   [Blizzard_UIPanels_Game/Classic/ContainerFrame_Shared.lua]:1341: in function <...1288>
+--
+-- Line 1288 is `function ContainerFrameItemButton_OnClick(self, button)`; line 1341 is the
+-- right-button branch's protected call, and it reads exactly two GLOBALS on the way:
+--
+--   C_Container.UseContainerItem(self:GetParent():GetID(), self:GetID(), nil, nil,
+--                                BankFrame:IsShown() and (BankFrame.selectedTab == 2));
+--
+-- Reading a value an addon wrote taints the reader; the reader here is one token away from a
+-- protected call. Our self-test rigs write BOTH of those globals — and the addon let them
+-- run in a client.
+--
+-- WHAT THIS GATE CAN PROVE, HONESTLY. It cannot model the client's real taint bits: those
+-- live in Blizzard's Lua VM and no headless rig has them. What it CAN do, and does:
+--
+--   LEG 1  BEHAVIOUR — take the ownership beacon away (i.e. BE a client), ask the addon to
+--          run its self-tests, and assert (a) it refuses and (b) not one watched global or
+--          saved-variable table changed identity. This is the defect itself, reproduced:
+--          against 2.0.8 leg 1 is RED — the suites run, C_Container becomes sort.lua's fake,
+--          BankFrame becomes nil, DaseekiBags2Data is re-inited from defaults.
+--   LEG 2  MECHANISM — a taint MODEL: a transcription of line 1341's read set, plus a rule
+--          ("a global whose identity we changed is a global we tainted"). It is driven twice:
+--          once with the pre-fix write set fed in, which must BLOCK and must name this addon
+--          (proving the model has teeth and pinning the mechanism as a fact); once with
+--          whatever leg 1 actually observed, which must not block.
+--   LEG 3  STRUCTURE — the stock-surface ledger, walked: every Blizzard-owned name the addon
+--          touches, with its kind, checked against two rules (nothing we touch may be read by
+--          the secure click path; `replace` only for the nine enumerated bag toggles). Plus a
+--          SOURCE scan of every `_G.<Name> =` in the shipping tree cross-checked against a
+--          committed roster, so a new stock-surface write cannot arrive quietly — that is the
+--          part that survives a future refactor the model cannot foresee.
+--
+-- WHAT IT STILL CANNOT PROVE: that a taint-clean ledger means a taint-clean client. Widget
+-- taint (SetParent/SetScript on a Blizzard frame, addon-created frames handed to secure code)
+-- is not modelled here and is not modellable headless; ui_bank's BankFrame reparent is
+-- deliberately still in the ledger as a securehook-driven touch, and the only honest claim
+-- about it is that we no longer write a field of ours onto that frame.
+----------------------------------------------------------------------
+realprint("")
+realprint("=== taint / stock-surface gate :: ContainerFrame_Shared.lua:1341 ===")
+local taintFails = 0
+local function tck(cond, msg)
+    if cond then realprint("  [ok] " .. msg)
+    else taintFails = taintFails + 1; realprint("  [FAIL] " .. msg) end
+end
+
+-- Every global a shipping self-test rig is known to swap, plus the saved-variable tables.
+-- The first two are the ones ContainerFrame_Shared.lua:1341 reads.
+local WATCHED = {
+    "C_Container", "BankFrame",
+    "GetTime", "CreateFrame", "InCombatLockdown", "ClearCursor", "CursorHasItem",
+    "C_Item", "C_Timer", "bit", "Enum", "GetMoney", "GetInventoryItemID",
+    "GetInventoryItemLink", "geterrorhandler", "hooksecurefunc",
+    "OpenCoinPickupFrame", "CloseBankFrame", "UIParent", "DaseekiUI",
+    "DaseekiBags2DB", "DaseekiBags2Data", "DaseekiBagsAccount", "DaseekiBagsSets",
+    "DaseekiBagsMesh", "DaseekiNexusData", "DaseekiNexusDB",
+}
+
+------------------------------------------------------------------ LEG 1: the refusal
+do
+    local before = {}
+    for _, n in ipairs(WATCHED) do before[n] = _G[n] end
+
+    -- Tolerate a build that has no gate at all, rather than erroring out: pointing this
+    -- harness at the 2.0.8 tree (`lua5.1 harness/run-selftests.lua <old-dir>`) is how the
+    -- red baseline is demonstrated, and a crash there proves nothing readable.
+    -- `ok and v or nil` would fold the CORRECT answer (false) into "no answer" — the exact
+    -- truthy-fallback trap CLIENT_ASYNC_LESSONS class 5 names. Branch explicitly.
+    local owns = function()
+        if type(ns.HarnessOwnsGlobals) ~= "function" then return "no-predicate" end
+        local ok, v = pcall(function() return ns:HarnessOwnsGlobals() end)
+        if not ok then return "errored" end
+        return v
+    end
+    tck(type(ns.HarnessOwnsGlobals) == "function",
+        "the addon publishes an ownership predicate (ns:HarnessOwnsGlobals)")
+
+    -- WHY A TRAP AND NOT A BEFORE/AFTER COMPARE. The rigs SWAP AND RESTORE, so a compare only
+    -- catches what they forgot to put back (real — store.lua's rig leaves the saved variables
+    -- re-inited — but not the taint). In the client the taint is made by the WRITE and
+    -- survives the restore, because the restore is another write by the same tainted code.
+    -- So catch the write itself: Lua 5.1 fires __newindex only for keys the table does not
+    -- have, and every global that matters here — C_Container and BankFrame included — is
+    -- ABSENT headless. That absence is what makes the trap possible at all.
+    local WATCHED_SET = {}
+    for _, n in ipairs(WATCHED) do WATCHED_SET[n] = true end
+    local trappableN = 0
+    local trappable = {}
+    for _, n in ipairs(WATCHED) do
+        if rawget(_G, n) == nil then trappable[n] = true; trappableN = trappableN + 1 end
+    end
+    tck(trappable.C_Container and trappable.BankFrame and true or false,
+        "the two globals line 1341 reads are absent headless, so a write to either is " ..
+        "trappable (" .. trappableN .. " of " .. #WATCHED .. " watched globals are)")
+
+    local writes, writeOrder = {}, {}
+    local savedMT = getmetatable(_G)
+    setmetatable(_G, { __newindex = function(t, k, v)
+        if WATCHED_SET[k] and not writes[k] then
+            writes[k] = true
+            writeOrder[#writeOrder + 1] = k
+        end
+        rawset(t, k, v)
+    end })
+
+    _G.__DaseekiBagsHarness = nil          -- from here on we are, as far as the addon knows, a client
+    tck(owns() == false, "with the beacon gone the addon knows it is in a client")
+
+    -- Count what actually RAN. A refusal that still ran one suite is not a refusal, and the
+    -- return value alone cannot tell those two apart.
+    local said, savedPrint = {}, ns.Print
+    ns.Print = function(_, ...)
+        local parts = {}
+        for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+        said[#said + 1] = table.concat(parts, "\t")
+    end
+    local ranOk, verdict = pcall(function() return ns:RunRegisteredSelfTests(true) end)
+    ns.Print = savedPrint
+    setmetatable(_G, savedMT)
+
+    tck(ranOk, "the refusal path does not error")
+    tck(verdict == false, "ns:RunRegisteredSelfTests REFUSES in a client (returned " ..
+                          tostring(verdict) .. ")")
+
+    local suiteLines = 0
+    for _, s in ipairs(said) do if s:match("^selftest: ") then suiteLines = suiteLines + 1 end end
+    tck(suiteLines == 0, "…and not one suite started (the verbose run printed " ..
+                         suiteLines .. " suite banner(s))")
+    tck(#said == 1 and said[1] == (ns.SELFTEST_REFUSAL or ""),
+        "…the one thing it said was the refusal, in plain language")
+
+    table.sort(writeOrder)
+    tck(#writeOrder == 0, "…and not one watched global was WRITTEN — trapped at the write, " ..
+        "not inferred from a before/after compare" ..
+        (#writeOrder > 0 and (" — WROTE: " .. table.concat(writeOrder, ", ")) or ""))
+    if #writeOrder > 0 then
+        realprint("         Restoring them afterwards does not take the taint back off.")
+    end
+
+    local changed = {}
+    for _, n in ipairs(WATCHED) do
+        if _G[n] ~= before[n] then changed[#changed + 1] = n end
+    end
+    table.sort(changed)
+    tck(#changed == 0, "…and nothing was left swapped either (identity compare)" ..
+        (#changed > 0 and (" — LEFT CHANGED: " .. table.concat(changed, ", ")) or ""))
+    if #changed > 0 then
+        realprint("         Those are values ContainerFrame_Shared.lua and the rest of")
+        realprint("         FrameXML read. A global this addon writes is a global this")
+        realprint("         addon taints, and C_Container/BankFrame are read one token")
+        realprint("         away from the protected UseContainerItem call on line 1341.")
+        for _, n in ipairs(changed) do _G[n] = before[n] end
+    end
+
+    -- Leg 2 grades its model on what leg 1 actually caught: trapped writes first, leftovers
+    -- second. Nothing here is a guess about what the addon does — it is what it did.
+    local observed = {}
+    for _, n in ipairs(writeOrder) do observed[#observed + 1] = n end
+    for _, n in ipairs(changed) do if not writes[n] then observed[#observed + 1] = n end end
+    _G.__DaseekiBagsHarnessChanged = observed
+
+    -- The published simulator hook has a caller the registry gate never sees, so it carries
+    -- its own belt. Same question, asked of the rig directly.
+    if ns.Sort and ns.Sort._Simulator then
+        local okc, S = pcall(ns.Sort._Simulator, { bags = { { cid = 0, size = 4 } }, seed = 1 })
+        if okc and type(S) == "table" and S.install then
+            local bf, cc = _G.BankFrame, _G.C_Container
+            local oki, res = pcall(function() return S:install() end)
+            tck(oki and res == false, "sort.lua's published simulator refuses to install in a client")
+            tck(_G.BankFrame == bf and _G.C_Container == cc,
+                "…and leaves BankFrame and C_Container exactly as the client set them")
+            if _G.BankFrame ~= bf or _G.C_Container ~= cc then
+                _G.BankFrame, _G.C_Container = bf, cc
+            end
+        else
+            realprint("  [note] sort simulator could not be constructed for the belt check")
+        end
+    end
+
+    _G.__DaseekiBagsHarness = true          -- back to being the harness
+    tck(owns() == true, "the beacon restores headless ownership")
+end
+
+------------------------------------------------------------------ LEG 2: the taint model
+do
+    -- A taint model with exactly two rules, both quoted from the wiki's taint page:
+    --   "When code sets global values, the resulting value has the taint of the execution path"
+    --   "When code accesses tainted values ... the execution path is also tainted"
+    -- so: a global this addon wrote is tainted, and secure code that reads one is tainted.
+    local function newWorld(taintedNames)
+        local W = { tainted = {}, exec = nil }
+        for _, n in ipairs(taintedNames) do W.tainted[n] = "Daseeki-Bags" end
+        function W:read(name)
+            if self.tainted[name] then self.exec = self.tainted[name] end
+            return _G[name]
+        end
+        -- ContainerFrame_Shared.lua:1341, transcribed. `self`/parent are widgets, not
+        -- globals, and are deliberately NOT modelled as taint carriers: every bag addon in
+        -- the ecosystem creates its cells from this template and is not blocked for it, so
+        -- widget identity is demonstrably not what the client is objecting to here.
+        function W:rightClickUse()
+            self.exec = nil
+            local CC = self:read("C_Container")
+            local BF = self:read("BankFrame")
+            local atBankTab = BF and BF.IsShown and BF:IsShown() and (BF.selectedTab == 2)
+            if self.exec then
+                return false, self.exec        -- ADDON_ACTION_BLOCKED, attributed to exec
+            end
+            return true, CC, atBankTab
+        end
+        return W
+    end
+
+    -- (a) The model reproduces the SHIPPED defect. This is the fact 2.0.8 taught us, kept
+    --     as an assertion rather than as prose: write those two globals and the right-click
+    --     is dead, with our name on it.
+    local shipped = newWorld({ "C_Container", "BankFrame" })
+    local okUse, who = shipped:rightClickUse()
+    tck(okUse == false and who == "Daseeki-Bags",
+        "MODEL: writing C_Container/BankFrame blocks the right-click-to-use path and the " ..
+        "client blames Daseeki-Bags (this is 2.0.8's live defect, reproduced)")
+
+    -- (b) Each of the two, alone, is enough. Neither is a "both or nothing" condition.
+    tck(select(1, newWorld({ "BankFrame" }):rightClickUse()) == false,
+        "MODEL: BankFrame alone is enough (line 1341 reads BankFrame:IsShown() and .selectedTab)")
+    tck(select(1, newWorld({ "C_Container" }):rightClickUse()) == false,
+        "MODEL: C_Container alone is enough (line 1341 resolves UseContainerItem through it)")
+
+    -- (c) A global we do NOT touch does not block — the model is not simply always-red.
+    tck(select(1, newWorld({ "GetTime" }):rightClickUse()) == true,
+        "MODEL: a global line 1341 does not read does not block it (the model discriminates)")
+
+    -- (d) THE LIVE ANSWER: feed the model exactly what leg 1 observed the addon do while it
+    --     believed it was in a client. Empty set -> nothing tainted -> nothing blocked.
+    local observed = _G.__DaseekiBagsHarnessChanged or {}
+    local nowWorld = newWorld(observed)
+    local okNow, whoNow = nowWorld:rightClickUse()
+    tck(okNow == true,
+        "LIVE: after the fix the addon writes no global in a client, so the modelled " ..
+        "right-click-to-use is NOT blocked" ..
+        (okNow and "" or (" — blocked by " .. tostring(whoNow) ..
+                          "; observed writes: " .. table.concat(observed, ", "))))
+    _G.__DaseekiBagsHarnessChanged = nil
+end
+
+------------------------------------------------------------------ LEG 3: the ledger + source
+do
+    local SS = ns.StockSurface
+    tck(type(SS) == "table" and type(SS.Record) == "function",
+        "the stock-surface ledger exists (ns.StockSurface)")
+    -- Stand-in so an older tree reports every rule as failed instead of erroring out.
+    if type(SS) ~= "table" or type(SS.Record) ~= "function" then
+        SS = { entries = {}, byName = {}, REPLACE_ALLOWED = {},
+               Record = function() end,
+               Violations = function() return { "ns.StockSurface is missing entirely" } end }
+    end
+    local SECURE_READS = ns.SECURE_CLICK_READS or {}
+
+    -- Drive the four real installers under a minimal client so the ledger is populated by
+    -- the shipping code paths, not by the gate. Everything is restored afterwards.
+    -- NIL IS A VALUE HERE. Most of what we stub does not exist headless, so `savedG[n] = nil`
+    -- would vanish from pairs() and the stub would outlive the gate. Order + explicit table.
+    local savedOrder, savedG = {}, {}
+    local function remember(n)
+        if savedG[n] == nil then savedOrder[#savedOrder + 1] = n; savedG[n] = { _G[n] } end
+    end
+    local function stub(n, v) remember(n); _G[n] = v end
+    local hooked = {}
+    stub("hooksecurefunc", function(name) hooked[name] = (hooked[name] or 0) + 1 end)
+    stub("CreateFrame", function()
+        local f = {}
+        setmetatable(f, { __index = function() return function() end end })
+        return f
+    end)
+    stub("DaseekiUI", { })
+    stub("UIParent", {})
+    stub("SetItemButtonTexture", function() end)
+    stub("SetItemButtonQuality", function() end)
+    stub("HandleModifiedItemClick", function() end)
+    stub("SetItemRef", function() end)
+    for _, n in ipairs({ "ToggleBackpack", "ToggleAllBags", "ToggleBag", "OpenAllBags",
+                         "OpenBackpack", "OpenBag", "CloseAllBags", "CloseBackpack",
+                         "CloseBag" }) do
+        stub(n, function() end)
+    end
+
+    if ns.Frame then ns.Frame._hooked = false; pcall(ns.Frame.HookBagToggles) end
+    if ns.Bank then
+        ns.Bank._overrideInstalled = false; pcall(ns.Bank.InstallOverride)
+    end
+    if ns.Items and ns.Items._installArtHooks then
+        ns.Items._artHooksInstalled = false; pcall(ns.Items._installArtHooks)
+    end
+    if ns.Features and ns.Features.HookAltClick then
+        ns.Features._altHooked = false; pcall(ns.Features.HookAltClick)
+    end
+    -- The BINDING_* block: declared behind `if _G.SlashCmdList` at load, so the harness has
+    -- never run it. Drive it here (and put the strings back) so the ledger's `binding`
+    -- entries are recorded by the shipping path rather than asserted from prose.
+    if ns.DeclareBindingGlobals then
+        local bindingNames = { "BINDING_HEADER_DASEEKIBAGS2", "BINDING_CATEGORY_DASEEKIBAGS2",
+            "BINDING_NAME_DASEEKIBAGS2_TOGGLE", "BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE",
+            "BINDING_NAME_DASEEKIBAGS2_FIND", "BINDING_NAME_DASEEKIBAGS_TOGGLE",
+            "BINDING_NAME_DASEEKIBAGS_BANK_TOGGLE", "DaseekiBags2_ToggleBags",
+            "DaseekiBags2_ToggleBank", "DaseekiBags2_ToggleFind" }
+        for _, n in ipairs(bindingNames) do remember(n) end
+        pcall(ns.DeclareBindingGlobals)
+    end
+    -- The slash registry entry, same reasoning (guarded on _G.SlashCmdList at load).
+    if not ns.StockSurface.byName.SlashCmdList then
+        stub("SlashCmdList", {})
+        for i, cmdText in ipairs(ns.SLASH_COMMANDS or {}) do
+            remember("SLASH_DASEEKIBAGS" .. i)
+            _G["SLASH_DASEEKIBAGS" .. i] = cmdText
+        end
+        _G.SlashCmdList["DASEEKIBAGS"] = function() end
+        ns.StockSurface.Record("SlashCmdList", "registry",
+            "one entry added under our own key (DASEEKIBAGS) — the sanctioned slash mechanism")
+    end
+    -- The StaticPopup registry entry: written lazily the first time the owner deletes a
+    -- cached character, so it has to be driven rather than waited for.
+    if ns.Owner and ns.Owner._ConfirmRemoveOwner then
+        stub("StaticPopupDialogs", {})
+        stub("StaticPopup_Show", function() end)
+        pcall(ns.Owner._ConfirmRemoveOwner, "Someone-Realm", "Someone", nil)
+    end
+
+    for i = #savedOrder, 1, -1 do
+        local n = savedOrder[i]
+        _G[n] = savedG[n][1]
+    end
+
+    local kinds = {}
+    for _, e in ipairs(SS.entries) do kinds[e.kind] = (kinds[e.kind] or 0) + 1 end
+    realprint(string.format("  ledger: %d entr(ies) — %d securehook, %d replace, %d binding, %d registry",
+        #SS.entries, kinds.securehook or 0, kinds.replace or 0, kinds.binding or 0,
+        kinds.registry or 0))
+
+    local bad = SS.Violations()
+    tck(#bad == 0, "ledger walk is clean")
+    for _, v in ipairs(bad) do realprint("         VIOLATION: " .. v) end
+
+    -- The two rules, asserted directly as well, so a Violations() that stopped checking
+    -- would not read as clean.
+    local touchedSecureRead, replacedOutsideRoster = {}, {}
+    for _, e in ipairs(SS.entries) do
+        if SECURE_READS[e.name] then touchedSecureRead[#touchedSecureRead + 1] = e.name end
+        if e.kind == "replace" and not SS.REPLACE_ALLOWED[e.name] then
+            replacedOutsideRoster[#replacedOutsideRoster + 1] = e.name
+        end
+    end
+    tck(#touchedSecureRead == 0,
+        "nothing in the ledger is a global the secure container click path reads" ..
+        (#touchedSecureRead > 0 and (" — " .. table.concat(touchedSecureRead, ", ")) or ""))
+    tck(#replacedOutsideRoster == 0,
+        "every outright takeover is one of the nine bag-toggle globals" ..
+        (#replacedOutsideRoster > 0 and (" — " .. table.concat(replacedOutsideRoster, ", ")) or ""))
+    tck(SECURE_READS.C_Container and SECURE_READS.BankFrame and true or false,
+        "the read set names C_Container and BankFrame (the two on line 1341)")
+
+    -- Every securehook the installers claimed really went in through hooksecurefunc, and
+    -- the nine takeovers really replaced their globals. A ledger that is merely a list of
+    -- good intentions is not a gate.
+    local hookedNames = 0
+    for _, e in ipairs(SS.entries) do
+        if e.kind == "securehook" then
+            hookedNames = hookedNames + 1
+            if (hooked[e.name] or 0) < 1 then
+                taintFails = taintFails + 1
+                realprint("  [FAIL] ledger claims a securehook on " .. e.name ..
+                          " but hooksecurefunc was never called with that name")
+            end
+        end
+    end
+    tck(hookedNames >= 6, "…and all " .. hookedNames .. " securehook entries really went " ..
+        "through hooksecurefunc")
+
+    ------------------------------------------------------------ SOURCE SCAN
+    -- Every `_G.<Name> = ` in the shipping tree, classified. RUNTIME names are the ones the
+    -- addon writes in a live client (they must be ledger-legal); RIG names are the ones only
+    -- a self-test simulator writes (legal only under the ownership beacon, which is exactly
+    -- what leg 1 pins). A name in neither list fails the gate until someone classifies it.
+    local RUNTIME_WRITES = {
+        -- the nine bag toggles (ledger kind `replace`)
+        ToggleBackpack = true, ToggleAllBags = true, ToggleBag = true, OpenAllBags = true,
+        OpenBackpack = true, OpenBag = true, CloseAllBags = true, CloseBackpack = true,
+        CloseBag = true,
+        -- keybinding display strings (ledger kind `binding`)
+        BINDING_HEADER_DASEEKIBAGS2 = true, BINDING_CATEGORY_DASEEKIBAGS2 = true,
+        BINDING_NAME_DASEEKIBAGS2_TOGGLE = true, BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE = true,
+        BINDING_NAME_DASEEKIBAGS2_FIND = true, BINDING_NAME_DASEEKIBAGS_TOGGLE = true,
+        BINDING_NAME_DASEEKIBAGS_BANK_TOGGLE = true,
+        -- Blizzard registry tables we add one entry to, under our own key (ledger `registry`)
+        SlashCmdList = true, StaticPopupDialogs = true,
+        -- our own namespace: saved variables and the binding handler globals
+        DaseekiBags2DB = true, DaseekiBags2Data = true,
+        DaseekiBags2_ToggleBags = true, DaseekiBags2_ToggleBank = true,
+        DaseekiBags2_ToggleFind = true,
+    }
+    -- Only a self-test rig may write these, and only under the ownership beacon — which is
+    -- the property leg 1 pins. Every name here is a real game global (or a saved-variable
+    -- table) that a simulator swaps for a fake and puts back.
+    local RIG_WRITES = {
+        C_Container = true, C_Timer = true, C_Item = true, CreateFrame = true, GetTime = true,
+        GetMoney = true, GetInventoryItemID = true, GetInventoryItemLink = true,
+        InCombatLockdown = true, CursorHasItem = true, ClearCursor = true, bit = true,
+        BankFrame = true, Enum = true, geterrorhandler = true, hooksecurefunc = true,
+        OpenCoinPickupFrame = true, CloseBankFrame = true,
+        UnitName = true, UnitSex = true, UnitLevel = true, UnitFactionGroup = true,
+        GetRealmName = true, CooldownFrame_Set = true, TEXTURE_ITEM_QUEST_BANG = true,
+        DaseekiUI = true, UIParent = true, GameTooltip = true, GetScreenWidth = true,
+        CursorUpdate = true, C_NewItems = true, BankButtonIDToInvSlotID = true,
+        ContainerIDToInventoryID = true, IsAddOnLoaded = true, IsKeyRingEnabled = true,
+        DaseekiBagsSets = true, DaseekiBagsAccount = true, DaseekiBagsMesh = true,
+        DaseekiNexusData = true, DaseekiNexusDB = true,
+    }
+    local unclassified, seenRuntime = {}, {}
+    for _, rel in ipairs(TOC_ORDER) do
+        local src = readFile(P(rel)) or ""
+        -- Lua 5.1: gmatch("[^\r\n]*") yields an empty match after every line, which doubles
+        -- the count and makes every reported line number wrong. Split explicitly.
+        local lines, lineNo = {}, 0
+        for chunk in (src .. "\n"):gmatch("(.-)\r?\n") do lines[#lines + 1] = chunk end
+        for _, line in ipairs(lines) do
+            lineNo = lineNo + 1
+            -- `function _G.Name(` is a write too.
+            for name in line:gmatch("function%s+_G%.([%w_]+)") do
+                if not (RUNTIME_WRITES[name] or RIG_WRITES[name]) then
+                    unclassified[#unclassified + 1] = rel .. ":" .. lineNo .. " " .. name
+                end
+                if RUNTIME_WRITES[name] then seenRuntime[name] = true end
+            end
+            -- assignment: take the text left of the first assignment `=`
+            local eq = line:find("[^=~<>]=[^=]")
+            if eq then
+                local lhs = line:sub(1, eq)
+                if not lhs:find("^%s*%-%-") then
+                    -- `_G.Name(` is a CALL and can never be an assignment target; the `=`
+                    -- that made this line look like an assignment is inside its arguments.
+                    -- `_G.Name[` IS a target (StaticPopupDialogs[k] = ...), so only "(" goes.
+                    for name, nextch in lhs:gmatch("_G%.([%w_]+)(.?)") do
+                      if nextch ~= "(" then
+                        if not (RUNTIME_WRITES[name] or RIG_WRITES[name]) then
+                            unclassified[#unclassified + 1] = rel .. ":" .. lineNo .. " " .. name
+                        end
+                        if RUNTIME_WRITES[name] then seenRuntime[name] = true end
+                      end
+                    end
+                end
+            end
+        end
+    end
+    tck(#unclassified == 0,
+        "every `_G.<Name> =` in the shipping tree is classified runtime-or-rig")
+    for i = 1, math.min(#unclassified, 12) do
+        realprint("         unclassified global write: " .. unclassified[i])
+    end
+    if #unclassified > 0 then
+        realprint("         Add it to RUNTIME_WRITES (and to ns.StockSurface, with a kind)")
+        realprint("         or to RIG_WRITES (and make sure the rig is beacon-gated).")
+    end
+
+    -- Every RUNTIME name must be one the ledger knows about, or one of ours.
+    local unledgered = {}
+    for name in pairs(seenRuntime) do
+        if not name:match("^Daseeki") and not SS.byName[name] then
+            unledgered[#unledgered + 1] = name
+        end
+    end
+    table.sort(unledgered)
+    tck(#unledgered == 0, "every Blizzard-owned runtime write is declared in the ledger" ..
+        (#unledgered > 0 and (" — missing: " .. table.concat(unledgered, ", ")) or ""))
+end
+
+local taintPass = (taintFails == 0)
+realprint(string.format("=== taint / stock-surface gate: %s (%d failure(s)) ===",
+    taintPass and "PASS" or "FAIL", taintFails))
+
+local overall = pass and rosterPass and timerPass and taintPass
 realprint("")
 realprint("############################################################")
 realprint("# toc parse gate (compiles)   : PASS (else we exited 1 above)")
 realprint("# expected-suite roster       : " .. (rosterPass and "PASS" or "FAIL"))
 realprint("# queue-and-pump timer gate   : " .. (timerPass and "PASS" or "FAIL"))
 realprint("# registered self-test suites : " .. (pass and "PASS" or "FAIL"))
+realprint("# taint / stock-surface gate  : " .. (taintPass and "PASS" or "FAIL") ..
+          string.format("  (%d failure(s))", taintFails))
 realprint("# Daseeki-Bags 2.0 self-tests : " .. (overall and "ALL PASS" or "RED (see above)"))
 realprint("############################################################")
 os.exit(overall and 0 or 1)

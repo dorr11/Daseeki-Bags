@@ -774,8 +774,18 @@ local function confirmRemoveOwner(key, name, onDone)
             if data and Owner.RemoveOwner(data.key) and data.onDone then data.onDone() end
         end,
     }
+    -- 2026-08-12: an entry added to a Blizzard REGISTRY table under our own key — the same class
+    -- of touch as SlashCmdList, and declared for the same reason (see core.lua's
+    -- stock-surface banner). Nothing here is read by the secure container click path.
+    if ns.StockSurface then
+        ns.StockSurface.Record("StaticPopupDialogs", "registry",
+            "one entry under our own key (" .. REMOVE_POPUP .. ") — the delete confirmation")
+    end
     _G.StaticPopup_Show(REMOVE_POPUP, name or key, nil, { key = key, onDone = onDone })
 end
+-- Published for the stock-surface gate: it drives this path under a stub client so the
+-- ledger's StaticPopupDialogs entry is written by the shipping code, not asserted in prose.
+Owner._ConfirmRemoveOwner = confirmRemoveOwner
 
 -- Where this file finds the addon's own glyph art. Resolved at CALL time off ns.Frame so
 -- the two files cannot disagree about the folder, with the literal path as the fallback

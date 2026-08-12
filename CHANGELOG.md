@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Right-clicking an item to use it works again — and the diagnostic that broke it is gone
+
+If you ever typed `/bags debug` or `/bags debug selftest` in game, everything after that
+went subtly wrong: right-clicking an item in your bags to eat it, drink it, open it or
+equip it stopped doing anything, and the game put up "AddOn 'Daseeki-Bags' tried to call
+the protected function 'UseContainerItem()'". Left-clicking to pick an item up still
+worked, which is what made it look random rather than caused. It lasted until you reloaded,
+and it came back the moment you ran the command again.
+
+That command ran the addon's own test suite. The suite is written to stand in a fake game —
+it swaps out the real game's functions for pretend ones, runs its checks, and puts the real
+ones back. That is exactly right on a developer's machine with no game running, and exactly
+wrong inside the actual client: WoW keeps track of which parts of itself an addon has
+touched, and it will not let a touched code path run a protected action. Two of the things
+the suite swaps are read by the game's own item-click code on the very line that uses an
+item. Putting them back afterwards does not undo the mark.
+
+The self-tests now refuse to run in game and say so in one line, pointing at the harness
+that is meant to run them. The same command was also quietly resetting your saved bag data
+to defaults — the suite starts from a blank store and never put yours back — so that is
+fixed by the same refusal. Everything the command was actually useful for is still there
+under the other `debug` subcommands.
+
+### A new answer to "what is this addon doing to my UI?"
+
+`/bags debug surface` lists every part of the standard interface Bags touches, how it
+touches it, and whether that touch is one the game's item-click path could ever notice. It
+is the question `debug selftest` was being used to answer, asked in a way that is safe to
+ask while you are playing.
+
+Under the hood the addon now keeps that list as a real record rather than as documentation,
+and the test harness walks it: nothing Bags touches may be something the item-click path
+reads, and the only wholesale takeovers allowed are the nine bag open/close functions that
+make your bag key open the Bags window. A new touch that broke either rule would fail the
+build. The harness also models the exact line of the game's code that blocked the click, so
+the fault this release fixes is now something the test suite can reproduce rather than
+something a changelog remembers.
+
+Also in this release: the Blizzard bank window, which Bags parks out of sight so its own
+bank window can take over, no longer carries a value belonging to Bags. Nothing about the
+bank behaves differently; it is one less thing of ours attached to a frame the game reads.
+
 ## 2.0.8 — 2026-08-11
 
 ### A trimmed update from another computer can no longer blank an alt

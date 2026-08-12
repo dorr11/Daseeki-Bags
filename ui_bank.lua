@@ -1339,14 +1339,31 @@ local function hiddenHost()
     return h
 end
 
+-- WHERE THE CAPTURED OnHide LIVES (2026-08-12 — the container-click taint fix).
+--
+-- This used to be `panel.__dsOnHide`, i.e. a field written by insecure code INTO Blizzard's
+-- own BankFrame table. That is one table too far. ContainerFrame_Shared.lua:1341 — the line
+-- the client blocked when it accused us of calling UseContainerItem — reads `BankFrame`
+-- twice on its way to the protected call:
+--
+--   C_Container.UseContainerItem(..., BankFrame:IsShown() and (BankFrame.selectedTab == 2));
+--
+-- Our field was never the one that line reads, so this was not the vector that fired (that
+-- was the self-test rigs overwriting the GLOBAL — see core.lua's stock-surface banner). But
+-- "we write into an object the blocked line reads" is not a position to defend, and the
+-- parallel state costs nothing: a weak-keyed side table we own, keyed by panel. Behaviour is
+-- identical, including the `false` marker for "captured, and there wasn't one"; the only
+-- change is that Blizzard's frame no longer carries a value of ours.
+Bank._panelOnHide = setmetatable({}, { __mode = "k" })
+
 -- Apply (or lift) the override on one panel. Idempotent in both directions.
 function Bank.ApplyOverride(panel, suppress)
     if not (panel and panel.SetParent and panel.SetScript) then return false end
     -- Capture the panel's OWN OnHide exactly once, before we ever null it. `false` is the
     -- "captured, and there wasn't one" marker so a second capture can never overwrite the
     -- real script with our own nil.
-    if panel.__dsOnHide == nil then
-        panel.__dsOnHide = (panel.GetScript and panel:GetScript("OnHide")) or false
+    if Bank._panelOnHide[panel] == nil then
+        Bank._panelOnHide[panel] = (panel.GetScript and panel:GetScript("OnHide")) or false
     end
     if suppress then
         local host = hiddenHost()
@@ -1354,11 +1371,16 @@ function Bank.ApplyOverride(panel, suppress)
         panel:SetScript("OnHide", nil)        -- never let this path fire CloseBankFrame
         panel:SetParent(host)                 -- shown, but rendered nowhere
     else
-        panel:SetScript("OnHide", panel.__dsOnHide or nil)
+        panel:SetScript("OnHide", Bank._panelOnHide[panel] or nil)
         panel:SetParent(_G.UIParent)
     end
     return true
 end
+
+-- What we captured for a panel (nil = never captured, false = captured and there was none).
+-- Published so the self-test can assert the capture-once rule without reaching into a
+-- Blizzard frame, which is the whole point of moving it.
+function Bank.CapturedOnHide(panel) return Bank._panelOnHide[panel] end
 
 -- End the SERVER's bank session. Ours to call now that the panel's own OnHide is muted.
 function Bank.EndBankSession()
@@ -1389,6 +1411,10 @@ function Bank.InstallOverride()
         if Bank.Enabled() and Bank.IsShown() then Bank.Close() end
     end)
 
+    ns.StockSurface.Record("ShowUIPanel", "securehook",
+        "post-hook: reparent BankFrame onto our hidden host so ours is the bank window")
+    ns.StockSurface.Record("HideUIPanel", "securehook",
+        "post-hook: the client closing the panel closes our window too")
     return true
 end
 
@@ -1759,7 +1785,11 @@ local function testBankOverride(fails)
 
     -- The captured script survives, and a second suppress cannot clobber it with nil.
     Bank.ApplyOverride(panel, true)
-    ck(panel.__dsOnHide == origOnHide, "the panel's own OnHide is captured exactly once")
+    ck(Bank.CapturedOnHide(panel) == origOnHide, "the panel's own OnHide is captured exactly once")
+    -- 2026-08-12: and it is captured in OUR table, not in Blizzard's frame. The blocked line
+    -- (ContainerFrame_Shared.lua:1341) reads BankFrame; we leave nothing of ours on it.
+    ck(rawget(panel, "__dsOnHide") == nil,
+       "…and nothing of ours is written onto the Blizzard panel itself")
 
     -- RESTORE: back to UIParent with its own script — "turn the option off" with no reload.
     ck(Bank.ApplyOverride(panel, false) == true, "restore applied")
@@ -1770,7 +1800,7 @@ local function testBankOverride(fails)
     -- A panel with no OnHide at all round-trips cleanly (the `false` capture marker).
     local bare = fakePanel(); bare.scripts.OnHide = nil
     Bank.ApplyOverride(bare, true)
-    ck(bare.__dsOnHide == false, "a panel with no OnHide records the `false` marker")
+    ck(Bank.CapturedOnHide(bare) == false, "a panel with no OnHide records the `false` marker")
     Bank.ApplyOverride(bare, false)
     ck(bare.scripts.OnHide == nil, "…and restoring leaves it without one (not with `false`)")
 

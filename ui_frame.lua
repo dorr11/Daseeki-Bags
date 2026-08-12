@@ -2788,6 +2788,20 @@ function Frame.HookBagToggles()
     _G.CloseAllBags   = function() closeOurs() end
     _G.CloseBackpack  = closeOurs
     _G.CloseBag       = function() closeOurs() end
+
+    -- 2026-08-12: declare the takeover in the stock-surface ledger. These nine are the ONLY
+    -- Blizzard-owned names this addon replaces outright, and core.lua's REPLACE_ALLOWED is
+    -- the closed roster that says so. The rule the ledger walk enforces is that none of them
+    -- may be a global the secure container click path reads — these are insecure FrameXML
+    -- toggle helpers and none of them is. (ContainerFrame_Shared.lua:1341 reads C_Container
+    -- and BankFrame; touching either of those is what earned this addon an
+    -- ADDON_ACTION_BLOCKED, and the walk is what keeps that from happening again.)
+    for _, n in ipairs({ "ToggleBackpack", "ToggleAllBags", "ToggleBag",
+                         "OpenAllBags", "OpenBackpack", "OpenBag",
+                         "CloseAllBags", "CloseBackpack", "CloseBag" }) do
+        ns.StockSurface.Record(n, "replace",
+            "FrameXML bag toggle -> our window (originals kept in Frame._orig)")
+    end
 end
 
 ----------------------------------------------------------------------
