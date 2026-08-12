@@ -118,6 +118,148 @@ function ns:Fire(name, ...)
     end
 end
 
+-- =====================================================================
+-- STOCK-SURFACE LEDGER  (2026-08-12 — the container-click taint defect)
+--
+-- THE LIVE DEFECT, read exactly. BugGrabber, Era 11509:
+--
+--   [ADDON_ACTION_BLOCKED] AddOn 'Daseeki-Bags' tried to call the protected
+--   function 'UseContainerItem()'.
+--   [C]: in function 'UseContainerItem'
+--   [Blizzard_UIPanels_Game/Classic/ContainerFrame_Shared.lua]:1341: in function <...1288>
+--   [C]: in function 'ContainerFrameItemButton_OnClick'
+--   [*ContainerFrame.xml:163_OnClick]:13
+--
+-- Those two line numbers are not decoration; they name the code. Against the shipped
+-- Classic-Era source, line 1288 is `function ContainerFrameItemButton_OnClick(self, button)`
+-- and line 1341 -- the frame that was blocked -- is, character for character:
+--
+--   C_Container.UseContainerItem(self:GetParent():GetID(), self:GetID(), nil, nil,
+--                                BankFrame:IsShown() and (BankFrame.selectedTab == 2));
+--
+-- That is the RIGHT-BUTTON branch: right-click an item to USE it. (The left-button branch
+-- calls PickupContainerItem, which is not protected -- which is why picking items up never
+-- broke and only "use" did.) It is reached from the stock template's own OnClick, which OUR
+-- live cells deliberately inherit, so no Blizzard container frame has to be on screen for
+-- this line to run: every right-click-to-use inside our own bag window ends here, by design.
+--
+-- WHAT LINE 1341 READS. Only five things: `self` and its parent (widgets we create -- every
+-- bag replacement in the ecosystem creates those and none of them is blocked for it), the
+-- two GetID() numbers, and the two GLOBAL VARIABLES `C_Container` and `BankFrame`. The
+-- wiki's rule is short: "When code sets global values, the resulting value has the taint of
+-- the execution path", and "when code accesses tainted values ... the execution path is also
+-- tainted". So the reachable question is exactly one question: does this addon ever WRITE
+-- the globals `C_Container` or `BankFrame`?
+--
+-- It does. Not in the bag code -- in the SELF-TEST RIGS. sort.lua's simulator installs its
+-- fake client over the real one (`_G.C_Container`, `_G.BankFrame = nil`, plus GetTime,
+-- CreateFrame, InCombatLockdown, ClearCursor, CursorHasItem, C_Item, C_Timer, bit, Enum),
+-- ui_bank's rig overwrites `_G.BankFrame`, capture's rig overwrites `_G.C_Container`, and
+-- store's rig nils the SavedVariables globals outright. They restore afterwards -- but a
+-- restore is itself a write by tainted code, so the global carries OUR taint from the first
+-- assignment until the next /reload. And those rigs are reachable IN THE CLIENT: core's own
+-- help text advertises `/bags debug selftest`, and `/bags debug` with no subcommand runs
+-- them too. One diagnostic command, and every right-click-to-use in the session is blocked,
+-- with our name on it. (Same command also blew the owner's SavedVariables away: store's rig
+-- nils DaseekiBags2Data/DB and re-inits defaults, which the client then writes to disk at
+-- logout. One root cause, two defects.)
+--
+-- THE RULE THAT REPLACES IT. A test rig's contract is "I own the global table". That is true
+-- headless and false in a client, and it must be PROVEN rather than assumed -- so the proof
+-- is a positive beacon the harness plants (ns.HARNESS_BEACON) and the client never has.
+-- Absence of the beacon means live; live means the rigs do not run. Fail-closed, in the
+-- shape CLIENT_ASYNC_LESSONS class 4 already demands: absence of proof is not absence.
+--
+-- THE LEDGER. Refusing the rigs fixes the vector that fired. The ledger is what stops the
+-- next one: every touch this addon makes on a Blizzard-owned NAME registers here, with its
+-- kind, at the moment it is installed. `securehook` is the sanctioned post-hook; `replace`
+-- is an outright takeover of a FrameXML global (we do exactly nine, all bag-toggle globals,
+-- all enumerated below); `binding` is the BINDING_* string table the keybinding UI reads.
+-- Two rules are then machine-checkable, in-game and headless, by walking the ledger:
+--   (1) nothing we touch may be a global the blocked secure click path READS, and
+--   (2) `replace` is only legal for the nine names REPLACE_ALLOWED lists.
+-- The harness asserts both, and cross-checks the ledger against a source scan of every
+-- `_G.<Name> =` in the shipping tree, so a new stock-surface write cannot arrive unnoticed.
+-- =====================================================================
+
+-- The GLOBAL read set of the secure container click path, with the line that reads each.
+-- Sourced from the shipped Classic-Era ContainerFrame_Shared.lua, not from memory.
+ns.SECURE_CLICK_READS = {
+    C_Container     = "ContainerFrame_Shared.lua:1341 — C_Container.UseContainerItem(...)",
+    BankFrame       = "ContainerFrame_Shared.lua:1341 — BankFrame:IsShown() and (BankFrame.selectedTab == 2)",
+    StackSplitFrame = "ContainerFrame_Shared.lua:1342/1316 — StackSplitFrame:Hide()",
+    MerchantFrame   = "ContainerFrame_Shared.lua:1303/1318 — MerchantFrame.extendedCost / :IsShown()",
+    AuctionHouseFrame = "ContainerFrame_Shared.lua:1334 — AuctionHouseFrame:IsShown()",
+    ItemLocation    = "ContainerFrame_Shared.lua:1329 — ItemLocation:CreateFromBagAndSlot(...)",
+    C_AuctionHouse  = "ContainerFrame_Shared.lua:1330 — C_AuctionHouse.IsSellItemValid(...)",
+    C_Item          = "ContainerFrame_Shared.lua:1331 — C_Item.DoesItemExist(...)",
+}
+
+ns.StockSurface = { entries = {}, byName = {} }
+
+-- The only kinds that exist. `securehook` never taints; `replace` always does and is
+-- therefore closed to the roster below; `binding` is a string the keybinding UI reads.
+ns.StockSurface.KINDS = { securehook = true, replace = true, binding = true, registry = true }
+
+-- The nine FrameXML bag-toggle globals ui_frame takes over, and nothing else. These are
+-- insecure FrameXML helpers, none is on the secure click path's read set, and taking them
+-- over is what makes the bag key open OUR window (see ui_frame.HookBagToggles).
+ns.StockSurface.REPLACE_ALLOWED = {
+    ToggleBackpack = true, ToggleAllBags = true, ToggleBag = true,
+    OpenAllBags = true, OpenBackpack = true, OpenBag = true,
+    CloseAllBags = true, CloseBackpack = true, CloseBag = true,
+}
+
+-- Record one touch. Idempotent per (name, kind): installers are guarded to run once, but a
+-- re-entry must not double the ledger and turn a clean walk into a false alarm.
+function ns.StockSurface.Record(name, kind, why)
+    if type(name) ~= "string" or type(kind) ~= "string" then return false end
+    local prev = ns.StockSurface.byName[name]
+    if prev and prev.kind == kind then return false end
+    local e = { name = name, kind = kind, why = why }
+    ns.StockSurface.entries[#ns.StockSurface.entries + 1] = e
+    ns.StockSurface.byName[name] = e
+    return true
+end
+
+-- Walk the ledger and report every entry that breaks a rule. PURE: no client needed, so
+-- the harness pins it and `/bags debug surface` can print it live.
+function ns.StockSurface.Violations()
+    local bad = {}
+    for _, e in ipairs(ns.StockSurface.entries) do
+        if not ns.StockSurface.KINDS[e.kind] then
+            bad[#bad + 1] = e.name .. ": unknown kind '" .. tostring(e.kind) .. "'"
+        end
+        if ns.SECURE_CLICK_READS[e.name] then
+            bad[#bad + 1] = e.name .. ": touched (" .. e.kind .. ") but it is READ by the " ..
+                            "secure container click path — " .. ns.SECURE_CLICK_READS[e.name]
+        end
+        if e.kind == "replace" and not ns.StockSurface.REPLACE_ALLOWED[e.name] then
+            bad[#bad + 1] = e.name .. ": replaced outright and is not one of the nine " ..
+                            "bag-toggle globals the design allows"
+        end
+    end
+    return bad
+end
+
+----------------------------------------------------------------------
+-- HARNESS OWNERSHIP OF THE GLOBAL TABLE
+--
+-- The self-test rigs swap real globals for fakes. That is correct headless and catastrophic
+-- in a client (see the banner above). The beacon is planted by harness/run-selftests.lua and
+-- exists nowhere else, so the answer is positive-evidence only: no beacon, no rigs.
+----------------------------------------------------------------------
+ns.HARNESS_BEACON = "__DaseekiBagsHarness"
+
+function ns:HarnessOwnsGlobals()
+    return _G[ns.HARNESS_BEACON] == true
+end
+
+ns.SELFTEST_REFUSAL =
+    "self-tests are headless-only: they swap real game globals (C_Container, BankFrame, " ..
+    "GetTime, CreateFrame) and the saved-variable tables for fakes, which taints the " ..
+    "container click path and would blank your saved data. Run harness/run-selftests.cmd."
+
 ----------------------------------------------------------------------
 -- Self-test registry (pure-Lua suites; the headless harness runs these).
 ----------------------------------------------------------------------
@@ -132,6 +274,15 @@ end
 -- so one crashing suite can't abort the run (its failure is reported and the
 -- overall result goes red). Returns the overall pass boolean.
 function ns:RunRegisteredSelfTests(verbose)
+    -- THE GATE (2026-08-12). Not a warning, not a "verbose" nicety: a refusal. Every suite below
+    -- installs a fake client over the real one, and the two globals the container click path
+    -- reads (C_Container, BankFrame) are both in that set. Running one suite in the client
+    -- blocks every right-click-to-use for the rest of the session and re-inits the saved
+    -- data. Nothing partial is safe here, so nothing runs.
+    if not ns:HarnessOwnsGlobals() then
+        ns:Print(ns.SELFTEST_REFUSAL)
+        return false
+    end
     local allPass = true
     for i = 1, #selfTests do
         if verbose then ns:Print("selftest: " .. selfTests[i].name) end
@@ -186,6 +337,26 @@ local function dispatch(msg)
         local sub = (rest or ""):match("^(%S*)"):lower()
         if sub == "selftest" or sub == "" then
             ns:RunRegisteredSelfTests(true)
+        elseif sub == "surface" then
+            -- 2026-08-12: print the stock-surface ledger. `debug selftest` used to be the answer
+            -- to "what is this addon doing to the game's own UI?" and that answer cost the
+            -- owner his right-click. This is the answer that is safe to ask in a client:
+            -- every Blizzard-owned name we touch, how we touch it, and the rule walk.
+            ns:Print("stock surface — every Blizzard-owned name this addon touches:")
+            for _, e in ipairs(ns.StockSurface.entries) do
+                ns:Print(string.format("  %-22s %-11s %s", e.name, e.kind, e.why or ""))
+            end
+            if #ns.StockSurface.entries == 0 then
+                ns:Print("  (nothing installed yet — hooks go in at login)")
+            end
+            local bad = ns.StockSurface.Violations()
+            if #bad == 0 then
+                ns:Print("  rule walk: clean (nothing we touch is read by the secure " ..
+                         "container click path, and every takeover is one of the nine " ..
+                         "bag-toggle globals)")
+            else
+                for _, v in ipairs(bad) do ns:Print("  VIOLATION: " .. v) end
+            end
         elseif sub == "strip" then
             if ns.Frame and ns.Frame.DebugStrip then ns.Frame.DebugStrip()
             else ns:Print("strip diagnostic unavailable") end
@@ -247,7 +418,8 @@ local function dispatch(msg)
         ns:Print("  /bags find <name>   - find an item across every character")
         ns:Print("  /bags combined|split - switch layout")
         ns:Print("  /bags sortlog [clear] - the last 50 sort runs, newest first")
-        ns:Print("  /bags debug selftest - run self-tests")
+        ns:Print("  /bags debug surface - what this addon touches in the game's own UI")
+        ns:Print("  /bags debug selftest - headless only (run harness/run-selftests.cmd)")
         ns:Print("  /bags debug strip|bankstrip|toolbar|money - diagnose the open window")
         ns:Print("  /bags debug equiptrace [clear] - what the last equip swaps did to your bag cells")
         ns:Print("  /bags debug nexus   - is the Daseeki Nexus inventory bridge active?")
@@ -263,6 +435,8 @@ if _G.SlashCmdList then
         _G["SLASH_DASEEKIBAGS" .. i] = cmdText
     end
     _G.SlashCmdList["DASEEKIBAGS"] = dispatch
+    ns.StockSurface.Record("SlashCmdList", "registry",
+        "one entry added under our own key (DASEEKIBAGS) — the sanctioned slash mechanism")
 end
 
 ----------------------------------------------------------------------
@@ -284,7 +458,10 @@ end
 -- _G.SlashCmdList so the headless harness (no SlashCmdList, no bindings UI) never sees these.
 ----------------------------------------------------------------------
 
-if _G.SlashCmdList then
+-- 2026-08-12: a NAMED function rather than a bare `if` block, so the stock-surface gate can drive
+-- the one path that writes BINDING_* and prove the ledger records what the code really does.
+-- The guard is unchanged; only the shape is.
+function ns.DeclareBindingGlobals()
     function _G.DaseekiBags2_ToggleBags() if ns.Frame and ns.Frame.Toggle then ns.Frame.Toggle() end end
     function _G.DaseekiBags2_ToggleBank() if ns.Bank and ns.Bank.Toggle then ns.Bank.Toggle() end end
     function _G.DaseekiBags2_ToggleFind()
@@ -301,7 +478,22 @@ if _G.SlashCmdList then
     -- Legacy 1.x action names kept alive for keybinding continuity at cutover.
     _G.BINDING_NAME_DASEEKIBAGS_TOGGLE       = "Toggle Bags (legacy binding)"
     _G.BINDING_NAME_DASEEKIBAGS_BANK_TOGGLE  = "Toggle Bank (legacy binding)"
+
+    -- 2026-08-12: these are Blizzard-NAMESPACE globals (the keybinding UI reads BINDING_*), so
+    -- they belong in the stock-surface ledger even though they are only display strings and
+    -- there is no other way to name a binding. None is on the secure click path's read set.
+    for _, n in ipairs({ "BINDING_HEADER_DASEEKIBAGS2", "BINDING_CATEGORY_DASEEKIBAGS2",
+                         "BINDING_NAME_DASEEKIBAGS2_TOGGLE",
+                         "BINDING_NAME_DASEEKIBAGS2_BANK_TOGGLE",
+                         "BINDING_NAME_DASEEKIBAGS2_FIND",
+                         "BINDING_NAME_DASEEKIBAGS_TOGGLE",
+                         "BINDING_NAME_DASEEKIBAGS_BANK_TOGGLE" }) do
+        ns.StockSurface.Record(n, "binding", "keybinding display string (Bindings.xml)")
+    end
+    return true
 end
+
+if _G.SlashCmdList then ns.DeclareBindingGlobals() end
 
 ----------------------------------------------------------------------
 -- Lifecycle

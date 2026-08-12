@@ -1912,6 +1912,12 @@ local function installArtHooks()
     end
     -- The SetItemButtonCount hook is GONE: the numeral is the template's own again
     -- (CELL PARITY — 1.x never restyles it), so there is nothing to re-assert.
+    if ns.StockSurface then
+        ns.StockSurface.Record("SetItemButtonTexture", "securehook",
+            "post-hook: re-kill template art on OUR cells only (btn._dsDressed)")
+        ns.StockSurface.Record("SetItemButtonQuality", "securehook",
+            "post-hook: re-kill template art on OUR cells only (btn._dsDressed)")
+    end
     Items._artHooksInstalled = true
 end
 Items._installArtHooks = installArtHooks

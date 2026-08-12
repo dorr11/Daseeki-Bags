@@ -3758,6 +3758,18 @@ local function makeSimulator(opts)
                       "BankFrame", "Enum" }
 
     function S:install()
+        -- BELT (2026-08-12, the container-click taint fix). ns:RunRegisteredSelfTests already
+        -- refuses to run any suite without the harness beacon, so in a client this is
+        -- unreachable through the slash command. It is here anyway because THIS simulator is
+        -- PUBLISHED — Sort._Simulator is a documented test hook, so it has a caller the
+        -- registry gate does not see. Two of the eleven globals below (C_Container and
+        -- BankFrame) are read by ContainerFrame_Shared.lua:1341, the line the client blocked;
+        -- writing either one in a live session taints every right-click-to-use until reload.
+        -- Fail-closed: no proof the harness owns _G means we are in a client.
+        if not ns:HarnessOwnsGlobals() then
+            ns:Print("sort simulator refused: " .. ns.SELFTEST_REFUSAL)
+            return false
+        end
         for _, g in ipairs(GLOBALS) do S.saved[g] = _G[g] end
         -- ── 2.0.2: DROP THE CACHED EVENT DRIVER ──────────────────────────────────
         -- ensureDriver() creates Sort._driver ONCE and keeps it forever (correct in
@@ -3847,6 +3859,7 @@ local function makeSimulator(opts)
             S.frames[#S.frames + 1] = f
             return f
         end
+        return true
     end
 
     function S:restore()

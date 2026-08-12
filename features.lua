@@ -590,6 +590,12 @@ function Features.HookAltClick()
             if ns.SafeCall then ns:SafeCall(Features.OnAltClickLink, src) else Features.OnAltClickLink(src) end
         end)
     end
+    if ns.StockSurface then
+        ns.StockSurface.Record("HandleModifiedItemClick", "securehook",
+            "post-hook: alt-click a link opens Find")
+        ns.StockSurface.Record("SetItemRef", "securehook",
+            "post-hook: alt-click a chat hyperlink opens Find")
+    end
 end
 
 ----------------------------------------------------------------------
