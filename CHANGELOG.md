@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.0.9 (2026-08-18)
 
 ### Right-clicking an item to use it works again — and the diagnostic that broke it is gone
 
